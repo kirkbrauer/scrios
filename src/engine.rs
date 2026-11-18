@@ -113,9 +113,9 @@ impl EngineConfig {
             clock_hz: DEFAULT_CLOCK_HZ,
             clock_source: ClockSource::Default,
             fps: DEFAULT_FPS,
-            rtcp_interval: Some(Duration::from_millis(5000)),
-            keyframe_min_interval: Duration::from_millis(2000),
-            stats_interval: Some(Duration::from_millis(5000)),
+            rtcp_interval: Some(Duration::from_secs(5)),
+            keyframe_min_interval: Duration::from_secs(2),
+            stats_interval: Some(Duration::from_secs(5)),
             visible_size: None,
             device_ssrc: None,
             rtcp_port: None,
@@ -1318,14 +1318,14 @@ mod tests {
     #[test]
     fn receiver_reports_go_out_every_interval_with_our_ssrc_and_a_block_for_the_device() {
         let mut r = Rig::with(|c| {
-            c.rtcp_interval = Some(Duration::from_millis(5000));
+            c.rtcp_interval = Some(Duration::from_secs(5));
             no_stall(c);
         });
         r.idr(0, true);
         r.delta(10);
         r.delta(20);
         assert!(r.eng.take_rtcp().is_empty());
-        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_millis(5000)));
+        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_secs(5)));
         r.eng.on_tick(r.at(4999));
         assert!(r.eng.take_rtcp().is_empty());
         r.eng.on_tick(r.at(5000));
@@ -1371,7 +1371,7 @@ mod tests {
             no_stall(c);
         });
         r.idr(0, true);
-        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_millis(5000)), "only the stats tick");
+        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_secs(5)), "only the stats tick");
         r.eng.on_tick(r.at(5000));
         assert!(r.eng.take_rtcp().is_empty());
     }
@@ -1595,7 +1595,7 @@ mod tests {
 
     #[test]
     fn stats_events_come_at_the_interval_and_count_since_start() {
-        let mut r = Rig::with(|c| c.stats_interval = Some(Duration::from_millis(5000)));
+        let mut r = Rig::with(|c| c.stats_interval = Some(Duration::from_secs(5)));
         r.idr(0, true);
         r.delta(10);
         r.frames();

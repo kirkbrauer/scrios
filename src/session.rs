@@ -506,15 +506,15 @@ mod tests {
     async fn receiver_reports_and_stats_follow_the_clock() {
         let (sock, tx) = fake();
         let mut r = rig(|c| {
-            c.rtcp_interval = Some(Duration::from_millis(5000));
-            c.stats_interval = Some(Duration::from_millis(5000));
+            c.rtcp_interval = Some(Duration::from_secs(5));
+            c.stats_interval = Some(Duration::from_secs(5));
             c.rtp_stall_keyframe = None;
             c.rtp_stall_timeout = None;
         });
         send_first_idr(&tx);
         let cmds = r.commands.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(12_000)).await;
+            tokio::time::sleep(Duration::from_secs(12)).await;
             cmds.send(Command::Stop).await.unwrap();
         });
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
@@ -540,7 +540,7 @@ mod tests {
         let mut r = rig(|c| {
             c.rtcp_interval = None;
             c.stats_interval = None;
-            c.keyframe_min_interval = Duration::from_millis(2000);
+            c.keyframe_min_interval = Duration::from_secs(2);
             c.rtp_stall_keyframe = None;
             c.rtp_stall_timeout = None;
         });
@@ -553,7 +553,7 @@ mod tests {
             cmds.send(Command::Keyframe).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
             cmds.send(Command::Keyframe).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             // At 1.3 s only the first went out.
             cmds.send(Command::Stop).await.unwrap();
         });
@@ -1286,8 +1286,8 @@ mod tests {
         // The 65 that were taken would need half a minute to time out one by one: the end does not wait
         // for them for more than the budget.
         let took = t0.elapsed();
-        assert!(took >= Duration::from_millis(1000) + HID_SHUTDOWN_BUDGET, "{took:?}");
-        assert!(took < Duration::from_millis(1000) + HID_SHUTDOWN_BUDGET + Duration::from_millis(100), "{took:?}");
+        assert!(took >= Duration::from_secs(1) + HID_SHUTDOWN_BUDGET, "{took:?}");
+        assert!(took < Duration::from_secs(1) + HID_SHUTDOWN_BUDGET + Duration::from_millis(100), "{took:?}");
         let failures = hid_failures(&r.queue.drain());
         assert!(failures.iter().any(|m| m.contains("not keeping up")), "{failures:?}");
     }

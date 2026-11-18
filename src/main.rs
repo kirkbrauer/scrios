@@ -768,12 +768,12 @@ mod tests {
         assert_eq!(o.udid, None);
         assert_eq!(o.display_id, 1);
         assert_eq!(o.visible_size, None);
-        assert_eq!(o.rtcp_interval, Some(Duration::from_millis(5000)));
-        assert_eq!(o.keyframe_min_interval, Duration::from_millis(2000));
-        assert_eq!(o.stats_interval, Some(Duration::from_millis(5000)));
-        assert_eq!(o.rtp_stall_keyframe, Some(Duration::from_millis(5000)));
-        assert_eq!(o.rtp_stall_timeout, Some(Duration::from_millis(15000)));
-        assert_eq!(o.display_poll, Some(Duration::from_millis(1000)));
+        assert_eq!(o.rtcp_interval, Some(Duration::from_secs(5)));
+        assert_eq!(o.keyframe_min_interval, Duration::from_secs(2));
+        assert_eq!(o.stats_interval, Some(Duration::from_secs(5)));
+        assert_eq!(o.rtp_stall_keyframe, Some(Duration::from_secs(5)));
+        assert_eq!(o.rtp_stall_timeout, Some(Duration::from_secs(15)));
+        assert_eq!(o.display_poll, Some(Duration::from_secs(1)));
         assert!(!o.device_hub_feedback);
         assert!(o.control);
         assert!(o.probe.is_none());
