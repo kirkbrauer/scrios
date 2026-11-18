@@ -29,7 +29,7 @@ use scrios::preflight::PreflightOptions;
 use scrios::sink::{Format, Sink};
 use scrios::stream::{EXIT_START_FAILED, Input, Item, Probe, Stream, StreamOptions};
 #[cfg(feature = "viewer")]
-use scrios::viewer::{DecoderChoice, Setup, ViewerOptions};
+use scrios::viewer::{DEFAULT_EDGE_MARGIN, DecoderChoice, Setup, ViewerOptions};
 
 /// The longest interval accepted for the millisecond options (a day); longer ones are clamped.
 const MAX_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -297,6 +297,17 @@ struct ViewerArgs {
     /// Show the frame rate and the viewer's delay (the access unit's arrival to the picture's display) in the title
     #[arg(long)]
     show_stats: bool,
+
+    /// The margin round the picture, in logical pixels (0: none): a lighter band in which a press is on the device's edge,
+    /// so that a swipe from the bottom edge (Home) or the top (Control Center) can start there, away from the window's
+    /// resize border. Cmd+G (Alt+G elsewhere) makes the swipe up from the bottom edge
+    #[arg(
+        long,
+        value_name = "PIXELS",
+        default_value_t = DEFAULT_EDGE_MARGIN,
+        value_parser = clap::value_parser!(u32).range(0..=200)
+    )]
+    edge_margin: u32,
 
     /// Let Cmd+P (Alt+P elsewhere) lock the device. Off by default: with the screen as the only way in, a lock from the
     /// keyboard is a way to lock oneself out
@@ -902,6 +913,7 @@ fn run_view(args: &StreamArgs, viewer: &ViewerArgs) -> i32 {
         window_height: viewer.window_height,
         show_stats: viewer.show_stats,
         lock_shortcut: viewer.lock_shortcut,
+        edge_margin: viewer.edge_margin,
         record: args.record.clone(),
     };
     // The decoder and the recording come first: a failure there should not cost a run on the device.
@@ -1389,6 +1401,7 @@ mod tests {
         assert_eq!(viewer.window_title, "scrios");
         assert_eq!((viewer.window_width, viewer.window_height), (None, None));
         assert!(!viewer.show_stats && !viewer.lock_shortcut, "no lock shortcut, no overlay, unless asked for");
+        assert_eq!(viewer.edge_margin, 24, "an edge margin of 24 logical pixels");
         assert!(stream.control(), "touch and keys are on");
         assert_eq!(stream.check_viewer(), Ok(()));
         assert_eq!(stream.check(), Ok(()));
@@ -1412,6 +1425,8 @@ mod tests {
             "700",
             "--show-stats",
             "--lock-shortcut",
+            "--edge-margin",
+            "40",
             "-n",
             "--record",
             "out.h264",
@@ -1423,6 +1438,10 @@ mod tests {
         assert_eq!(viewer.window_title, "My phone");
         assert_eq!((viewer.window_width, viewer.window_height), (Some(900), Some(700)));
         assert!(viewer.show_stats && viewer.lock_shortcut);
+        assert_eq!(viewer.edge_margin, 40);
+        assert_eq!(view_args(&["--edge-margin", "0"]).1.edge_margin, 0, "0 turns the margin off");
+        assert!(Cli::try_parse_from(["scrios", "--edge-margin", "500"]).is_err());
+        assert!(Cli::try_parse_from(["scrios", "--edge-margin", "-1"]).is_err());
         assert!(!stream.control(), "--no-control is view only");
         assert_eq!(stream.record.as_deref(), Some(Path::new("out.h264")), "--record works with the window");
         assert_eq!(stream.udid.as_deref(), Some("U"));

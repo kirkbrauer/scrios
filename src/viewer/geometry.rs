@@ -142,22 +142,108 @@ pub fn letterbox(window: (u32, u32), upright: (u32, u32)) -> Option<Rect> {
     Some(Rect { x: ((ww - w) / 2.0).floor(), y: ((wh - h) / 2.0).floor(), w, h })
 }
 
-/// The point of the window `(x, y)` (physical pixels) on the upright picture, in pixels of it, or `None` in the bars.
-#[must_use]
-pub fn window_to_device(window: (u32, u32), upright: (u32, u32), at: (f64, f64)) -> Option<(f64, f64)> {
-    let r = letterbox(window, upright)?;
-    if !r.contains(at.0, at.1) {
-        return None;
-    }
-    Some(scale_into(&r, upright, at))
+/// How the window is laid out: the picture letterboxed inside the window less a margin, and the margin around it.
+///
+/// The **margin** is a band `margin` pixels wide on every side of the picture (drawn a little lighter than the bars).
+/// A press that starts in it is on the device's edge: it is what makes an edge swipe (up from the bottom for Home, down
+/// from the top for the Control Center) easy with a mouse, because the device's edge is then not the window's edge, where
+/// a drag grabs the window's resize border instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// The window's size in physical pixels.
+    pub window: (u32, u32),
+    /// The upright picture's size.
+    pub upright: (u32, u32),
+    /// The margin in physical pixels (0: none).
+    pub margin: u32,
 }
 
-/// The same, with a point in the bars (or outside the window) taken to the nearest point of the picture's edge: what a
-/// drag that leaves the picture is, until the finger lifts. `None` only when there is no picture to point at.
-#[must_use]
-pub fn window_to_device_clamped(window: (u32, u32), upright: (u32, u32), at: (f64, f64)) -> Option<(f64, f64)> {
-    let r = letterbox(window, upright)?;
-    Some(scale_into(&r, upright, at))
+impl Layout {
+    /// The margin that is used: never more than a sixth of the window's shorter side, so that a small window keeps its
+    /// picture.
+    #[must_use]
+    pub fn margin(&self) -> u32 {
+        self.margin.min(self.window.0.min(self.window.1) / 6)
+    }
+
+    /// Where the picture is: letterboxed in the window less the margin. `None` when there is no area.
+    #[must_use]
+    pub fn picture(&self) -> Option<Rect> {
+        let m = self.margin();
+        let inner = (self.window.0.saturating_sub(2 * m), self.window.1.saturating_sub(2 * m));
+        let r = letterbox(inner, self.upright)?;
+        Some(Rect { x: r.x + f64::from(m), y: r.y + f64::from(m), ..r })
+    }
+
+    /// The picture and its margin: where a press is on the device.
+    #[must_use]
+    pub fn zone(&self) -> Option<Rect> {
+        let p = self.picture()?;
+        let m = f64::from(self.margin());
+        Some(Rect { x: p.x - m, y: p.y - m, w: p.w + 2.0 * m, h: p.h + 2.0 * m })
+    }
+
+    /// A press at `at` (physical pixels of the window) as a point of the upright picture, in pixels of it. Inside the
+    /// picture it is the matching point. In the margin it is **on the edge** of the device, on each side of the picture
+    /// that the press is beyond: the first column or row (0) on the left and top, the last on the right and bottom (the
+    /// digitizer's very edge); along the other axis it is the matching point. `None` in the bars and outside the window.
+    #[must_use]
+    pub fn press(&self, at: (f64, f64)) -> Option<(f64, f64)> {
+        let (p, zone) = (self.picture()?, self.zone()?);
+        if !zone.contains(at.0, at.1) {
+            return None;
+        }
+        let (x, y) = scale_into(&p, self.upright, at);
+        if p.contains(at.0, at.1) {
+            return Some((x, y));
+        }
+        let edge = |at: f64, start: f64, len: f64, last: f64, matched: f64| {
+            if at < start {
+                0.0
+            } else if at >= start + len {
+                last
+            } else {
+                matched
+            }
+        };
+        Some((edge(at.0, p.x, p.w, last_pixel(self.upright.0), x), edge(at.1, p.y, p.h, last_pixel(self.upright.1), y)))
+    }
+
+    /// A point of the window as a point of the upright picture once a finger is down: the same mapping, with a point in
+    /// the margin, the bars or outside the window taken to the nearest point of the picture's edge. `None` only when there
+    /// is no picture.
+    #[must_use]
+    pub fn follow(&self, at: (f64, f64)) -> Option<(f64, f64)> {
+        Some(scale_into(&self.picture()?, self.upright, at))
+    }
+
+    /// Whether `at` is in the margin below the picture (the band an upward swipe from the bottom edge starts in).
+    #[must_use]
+    pub fn in_bottom_margin(&self, at: (f64, f64)) -> bool {
+        match (self.picture(), self.zone()) {
+            (Some(p), Some(zone)) => zone.contains(at.0, at.1) && at.1 >= p.y + p.h,
+            _ => false,
+        }
+    }
+
+    /// The hint that shows while the pointer is in the bottom margin: a short bar, like iOS's home indicator, in the
+    /// middle of the band. `None` when the margin is too thin for it.
+    #[must_use]
+    pub fn hint(&self) -> Option<Rect> {
+        let m = self.margin();
+        if m < 8 {
+            return None;
+        }
+        let p = self.picture()?;
+        let h = f64::from(m / 6).clamp(3.0, 8.0);
+        let w = (p.w / 4.0).clamp(48.0, 240.0).min(p.w).floor();
+        Some(Rect { x: (p.x + (p.w - w) / 2.0).floor(), y: (p.y + p.h + (f64::from(m) - h) / 2.0).floor(), w, h })
+    }
+}
+
+/// The last pixel of an axis of `size` pixels: where the device's edge is.
+fn last_pixel(size: u32) -> f64 {
+    f64::from(size.saturating_sub(1))
 }
 
 fn scale_into(r: &Rect, upright: (u32, u32), at: (f64, f64)) -> (f64, f64) {
@@ -167,23 +253,60 @@ fn scale_into(r: &Rect, upright: (u32, u32), at: (f64, f64)) -> (f64, f64) {
 }
 
 /// The size to open the window at: the picture's shape at the largest size within `max` (logical pixels), and within
-/// `limit_w` and `limit_h` when the user gave them. Never below 1x1, never larger than the picture itself (a window
-/// that magnifies a picture is not a better view of it).
+/// `limit_w` and `limit_h` when the user gave them, plus the `margin` on each side (the limits and `max` are for the
+/// whole window). Never below 1x1, never larger than the picture itself (a window that magnifies a picture is not a
+/// better view of it).
 #[must_use]
-pub fn fit_size(upright: (u32, u32), max: (u32, u32), limit_w: Option<u32>, limit_h: Option<u32>) -> (u32, u32) {
+pub fn fit_size(
+    upright: (u32, u32),
+    max: (u32, u32),
+    limit_w: Option<u32>,
+    limit_h: Option<u32>,
+    margin: u32,
+) -> (u32, u32) {
+    let pad = margin.saturating_mul(2);
+    let room = |v: u32| f64::from(v.saturating_sub(pad).max(1));
     let (pw, ph) = (f64::from(upright.0.max(1)), f64::from(upright.1.max(1)));
-    let mut bound_w = f64::from(max.0.max(1));
-    let mut bound_h = f64::from(max.1.max(1));
-    if let Some(w) = limit_w {
-        bound_w = f64::from(w.max(1));
-    }
-    if let Some(h) = limit_h {
-        bound_h = f64::from(h.max(1));
-    }
+    let bound_w = limit_w.map_or_else(|| room(max.0), room);
+    let bound_h = limit_h.map_or_else(|| room(max.1), room);
     // The user's own limit is what they asked for: it may exceed the picture. The screen's is only a bound.
     let scale = (bound_w / pw).min(bound_h / ph);
     let scale = if limit_w.is_some() || limit_h.is_some() { scale } else { scale.min(1.0) };
-    (whole_pixels(pw * scale), whole_pixels(ph * scale))
+    (whole_pixels(pw * scale) + pad, whole_pixels(ph * scale) + pad)
+}
+
+/// What the window was last sized for: the shape the stream's `config` gave it. A picture that arrives before its
+/// config does not count (it only shows what it is), so a config that follows still sizes the window.
+#[derive(Debug, Default)]
+pub struct Fitter {
+    fitted: Option<(u32, u32)>,
+}
+
+/// Why the window is to be sized again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refit {
+    /// The first shape the stream has given: size the window for it as for the first window.
+    First,
+    /// The shape changed (the device turned): size the window for it from its present size.
+    Turned,
+}
+
+impl Fitter {
+    /// The stream says the upright picture is `upright`: whether the window is to be sized, and how.
+    pub fn shape(&mut self, upright: (u32, u32)) -> Option<Refit> {
+        let before = self.fitted.replace(upright);
+        match before {
+            None => Some(Refit::First),
+            Some(old) if old != upright => Some(Refit::Turned),
+            Some(_) => None,
+        }
+    }
+
+    /// The shape the window was sized for, if the stream has given one.
+    #[must_use]
+    pub fn shape_known(&self) -> Option<(u32, u32)> {
+        self.fitted
+    }
 }
 
 /// The size the window takes when the picture's shape changes (the first `config`, a turn of the device): the new
@@ -196,14 +319,27 @@ pub fn refit_size(
     max: (u32, u32),
     limit_w: Option<u32>,
     limit_h: Option<u32>,
+    margin: u32,
 ) -> (u32, u32) {
     match current {
-        None => fit_size(upright, max, limit_w, limit_h),
+        None => fit_size(upright, max, limit_w, limit_h, margin),
         Some((w, h)) => {
             let long = w.max(h).max(1);
-            fit_size(upright, (long.min(max.0.max(1)), long.min(max.1.max(1))), None, None)
+            fit_size(upright, (long.min(max.0.max(1)), long.min(max.1.max(1))), None, None, margin)
         }
     }
+}
+
+/// A length of `logical` logical pixels on a display of `scale` physical pixels to each, in physical pixels (0 stays 0).
+#[must_use]
+pub fn scaled_pixels(logical: u32, scale: f64) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped into the range of a u32 first"
+    )]
+    let pixels = (f64::from(logical) * scale).round().clamp(0.0, f64::from(u32::MAX)) as u32;
+    pixels
 }
 
 /// A length in pixels as a whole number of them: rounded, and at least 1.
@@ -221,6 +357,15 @@ pub fn whole_pixels(v: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A press and a drag with no margin: the picture's whole shape in the window and nothing around it.
+    fn window_to_device(window: (u32, u32), upright: (u32, u32), at: (f64, f64)) -> Option<(f64, f64)> {
+        Layout { window, upright, margin: 0 }.press(at)
+    }
+
+    fn window_to_device_clamped(window: (u32, u32), upright: (u32, u32), at: (f64, f64)) -> Option<(f64, f64)> {
+        Layout { window, upright, margin: 0 }.follow(at)
+    }
 
     fn config(width: u32, height: u32, rotation: Option<u16>) -> Event {
         Event::Config {
@@ -419,42 +564,242 @@ mod tests {
     fn a_turn_of_the_device_turns_the_window_and_keeps_its_size_within_the_screen() {
         let screen = (1300, 800);
         // The first window has no current size: it is the first fit.
-        assert_eq!(refit_size((1206, 2622), None, screen, None, None), fit_size((1206, 2622), screen, None, None));
+        assert_eq!(
+            refit_size((1206, 2622), None, screen, None, None, 0),
+            fit_size((1206, 2622), screen, None, None, 0)
+        );
         // A tall window of 368x800 (the longer side 800), the device turns: wide, 800 across, within the screen.
-        let (w, h) = refit_size((2622, 1206), Some((368, 800)), screen, None, None);
+        let (w, h) = refit_size((2622, 1206), Some((368, 800)), screen, None, None, 0);
         assert_eq!(w, 800);
         assert!((f64::from(h) - 800.0 * 1206.0 / 2622.0).abs() <= 1.0, "{h}");
         // A wide window turned back is tall again, as long as before.
-        let (w, h) = refit_size((1206, 2622), Some((800, 368)), screen, None, None);
+        let (w, h) = refit_size((1206, 2622), Some((800, 368)), screen, None, None, 0);
         assert_eq!(h, 800);
         assert!((f64::from(w) - 368.0).abs() <= 1.0, "{w}");
         // The window is never made larger than the screen allows, nor than the picture.
-        assert_eq!(refit_size((2622, 1206), Some((5000, 3000)), screen, None, None).0, 1300);
-        assert_eq!(refit_size((300, 600), Some((1000, 2000)), screen, None, None), (300, 600));
+        assert_eq!(refit_size((2622, 1206), Some((5000, 3000)), screen, None, None, 0).0, 1300);
+        assert_eq!(refit_size((300, 600), Some((1000, 2000)), screen, None, None, 0), (300, 600));
     }
 
     #[test]
     fn the_first_window_fits_the_screen_and_the_picture() {
         // A tall device on a 1440x900 screen with room for 800 pixels of height: the height limits.
-        let (w, h) = fit_size((1206, 2622), (1400, 800), None, None);
+        let (w, h) = fit_size((1206, 2622), (1400, 800), None, None, 0);
         assert_eq!(h, 800);
         assert!((f64::from(w) - 800.0 * 1206.0 / 2622.0).abs() <= 1.0, "{w}");
         // A wide one: the width limits.
-        let (w, h) = fit_size((2622, 1206), (1000, 800), None, None);
+        let (w, h) = fit_size((2622, 1206), (1000, 800), None, None, 0);
         assert_eq!(w, 1000);
         assert!((f64::from(h) - 1000.0 * 1206.0 / 2622.0).abs() <= 1.0, "{h}");
         // A screen larger than the picture does not magnify it.
-        assert_eq!(fit_size((300, 600), (4000, 4000), None, None), (300, 600));
+        assert_eq!(fit_size((300, 600), (4000, 4000), None, None, 0), (300, 600));
         // The user's own height wins over the screen's, and it keeps the shape.
-        let (w, h) = fit_size((1206, 2622), (1400, 800), None, Some(1000));
+        let (w, h) = fit_size((1206, 2622), (1400, 800), None, Some(1000), 0);
         assert_eq!(h, 1000);
         assert!((f64::from(w) - 460.0).abs() <= 1.0, "{w}");
         // Both limits: the one that bites first.
-        let (w, h) = fit_size((1206, 2622), (1400, 800), Some(200), Some(1000));
+        let (w, h) = fit_size((1206, 2622), (1400, 800), Some(200), Some(1000), 0);
         assert_eq!(w, 200);
         assert!((f64::from(h) - 435.0).abs() <= 1.0, "{h}");
         // Nothing is ever zero.
-        assert_eq!(fit_size((1206, 2622), (0, 0), None, None).0.min(fit_size((1206, 2622), (0, 0), None, None).1), 1);
-        assert_eq!(fit_size((0, 0), (100, 100), None, None), (1, 1));
+        assert_eq!(
+            fit_size((1206, 2622), (0, 0), None, None, 0).0.min(fit_size((1206, 2622), (0, 0), None, None, 0).1),
+            1
+        );
+        assert_eq!(fit_size((0, 0), (100, 100), None, None, 0), (1, 1));
+    }
+
+    /// A 500x1000 window, a 24-pixel margin and the 1206x2622 picture: it is 438x952 at (31, 24), the margin band is 486
+    /// wide from x = 7 and the whole 1000 high.
+    fn margined() -> Layout {
+        Layout { window: (500, 1000), upright: (1206, 2622), margin: 24 }
+    }
+
+    #[test]
+    fn the_picture_is_letterboxed_in_the_window_less_the_margin() {
+        let l = margined();
+        assert_eq!(l.margin(), 24);
+        let p = l.picture().unwrap();
+        assert_eq!((p.x, p.y, p.w, p.h), (31.0, 24.0, 438.0, 952.0));
+        // The height limits it, so the margin band reaches the window's top and bottom edge: the window's own border
+        // (where a drag resizes it) is outside the band that is the device's edge, on the sides, and is the band's far end
+        // above and below.
+        let z = l.zone().unwrap();
+        assert_eq!((z.x, z.y, z.w, z.h), (7.0, 0.0, 486.0, 1000.0));
+        // With no margin there is none: the picture is the window's letterbox and the zone is the picture.
+        let none = Layout { margin: 0, ..l };
+        assert_eq!(none.picture(), letterbox((500, 1000), (1206, 2622)));
+        assert_eq!(none.zone(), none.picture());
+        // A window of the picture's own shape plus the margin: the band is the whole border of the window.
+        let exact = Layout { window: (438 + 48, 952 + 48), upright: (1206, 2622), margin: 24 };
+        let p = exact.picture().unwrap();
+        assert_eq!((p.x, p.y, p.w, p.h), (24.0, 24.0, 438.0, 952.0));
+        let z = exact.zone().unwrap();
+        assert_eq!((z.x, z.y, z.w, z.h), (0.0, 0.0, 486.0, 1000.0));
+    }
+
+    #[test]
+    fn a_wide_window_keeps_the_bars_outside_the_margin() {
+        // 1000 wide, 1000 high: the picture is 438x952 as before; the bars left and right are beyond the margin band.
+        let l = Layout { window: (1000, 1000), upright: (1206, 2622), margin: 24 };
+        let p = l.picture().unwrap();
+        let z = l.zone().unwrap();
+        assert_eq!((p.y, p.h), (24.0, 952.0));
+        assert!(z.x > 200.0 && z.x + z.w < 800.0, "{z:?}");
+        // A press in the bar, well away from the picture, is nothing, and so is one just outside the band.
+        assert_eq!(l.press((50.0, 500.0)), None);
+        assert_eq!(l.press((z.x - 1.0, 500.0)), None);
+        assert!(l.press((z.x + 1.0, 500.0)).is_some(), "the band's first column is the margin");
+    }
+
+    #[test]
+    #[expect(clippy::float_cmp, reason = "the device's edge is exactly a pixel of it, or 0")]
+    fn a_press_is_snapped_to_the_edge_it_is_beyond() {
+        let l = margined();
+        let up = l.upright;
+        let (right_edge, bottom_edge) = (f64::from(up.0 - 1), f64::from(up.1 - 1));
+        // Bottom: the last row exactly, the matching column (the middle of the picture is the middle of the device).
+        let (x, y) = l.press((250.0, 990.0)).unwrap();
+        assert_eq!(y, bottom_edge);
+        assert!((x - 603.0 * (250.0 - 31.0) / 219.0).abs() < 1.0, "{x}");
+        // Top: row 0. Left: column 0. Right: the last column.
+        assert_eq!(l.press((250.0, 10.0)).unwrap().1, 0.0);
+        assert_eq!(l.press((15.0, 500.0)).unwrap().0, 0.0);
+        assert_eq!(l.press((485.0, 500.0)).unwrap().0, right_edge);
+        // Each along-the-edge coordinate is the ordinary one, so a corner press is the corner of the device.
+        assert_eq!(l.press((10.0, 10.0)), Some((0.0, 0.0)));
+        assert_eq!(l.press((490.0, 10.0)), Some((right_edge, 0.0)));
+        assert_eq!(l.press((10.0, 990.0)), Some((0.0, bottom_edge)));
+        assert_eq!(l.press((490.0, 990.0)), Some((right_edge, bottom_edge)));
+        // The press just inside the picture is the ordinary mapping, not a snap.
+        let inside = l.press((250.0, 900.0)).unwrap();
+        assert!(inside.1 < bottom_edge - 100.0, "{inside:?}");
+        // The band's four outer edges are the margin; one pixel beyond is not.
+        assert_eq!(l.press((6.0, 500.0)), None);
+        assert_eq!(l.press((493.0, 500.0)), None);
+        assert_eq!(l.press((250.0, -1.0)), None);
+        assert_eq!(l.press((250.0, 1000.0)), None);
+    }
+
+    #[test]
+    #[expect(clippy::float_cmp, reason = "the device's edge is exactly a pixel of it, or 0")]
+    fn the_edge_is_the_uprights_edge_for_each_rotation() {
+        // The device is 1206x2622. Turned a quarter, its upright picture is 2622x1206 and its "bottom" is the upright
+        // picture's: the last row of the upright picture, 1205.
+        for degrees in [0u16, 90, 180, 270] {
+            let g = PictureGeometry::from_event(&config(1206, 2622, Some(degrees))).unwrap();
+            let up = g.upright();
+            // A window of the picture's shape at about 1/3 size, with a margin, its picture at (30, 30).
+            let size = (up.0 / 3 + 60, up.1 / 3 + 60);
+            let l = Layout { window: size, upright: up, margin: 30 };
+            let p = l.picture().unwrap();
+            let mid_x = p.x + p.w / 2.0;
+            let mid_y = p.y + p.h / 2.0;
+            // Bottom, top, left, right margins.
+            let bottom = l.press((mid_x, p.y + p.h + 15.0)).unwrap();
+            assert_eq!(bottom.1, f64::from(up.1 - 1), "rotation {degrees}: bottom");
+            assert_eq!(l.press((mid_x, p.y - 15.0)).unwrap().1, 0.0, "rotation {degrees}: top");
+            assert_eq!(l.press((p.x - 15.0, mid_y)).unwrap().0, 0.0, "rotation {degrees}: left");
+            assert_eq!(l.press((p.x + p.w + 15.0, mid_y)).unwrap().0, f64::from(up.0 - 1), "rotation {degrees}: right");
+            // And the middle of the picture is the middle of the device, whatever the rotation.
+            let (cx, cy) = l.press((mid_x, mid_y)).unwrap();
+            assert!((cx - f64::from(up.0) / 2.0).abs() < 4.0 && (cy - f64::from(up.1) / 2.0).abs() < 4.0, "{cx} {cy}");
+        }
+    }
+
+    #[test]
+    #[expect(clippy::float_cmp, reason = "the device's edge is exactly a pixel of it, or 0")]
+    fn after_a_press_the_pointer_is_taken_to_the_pictures_edge_wherever_it_goes() {
+        let l = margined();
+        // At the picture's last row, below it in the margin, outside the window: the bottom; the column is the pointer's.
+        for y in [976.0, 990.0, 999.0, 1500.0] {
+            let (_, dy) = l.follow((250.0, y)).unwrap();
+            assert!((dy - 2622.0).abs() < 1e-9, "{y} -> {dy}");
+        }
+        assert_eq!(l.follow((-300.0, 500.0)).unwrap().0, 0.0);
+        assert_eq!(l.follow((9000.0, 500.0)).unwrap().0, 1206.0);
+        assert_eq!(Layout { window: (0, 0), ..l }.follow((1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn the_margin_gives_way_in_a_small_window() {
+        // Never more than a sixth of the shorter side from each edge.
+        let l = Layout { window: (60, 600), upright: (1206, 2622), margin: 24 };
+        assert_eq!(l.margin(), 10);
+        let p = l.picture().unwrap();
+        assert!(p.x >= 10.0 && p.y >= 10.0 && p.x + p.w <= 50.0 && p.y + p.h <= 590.0, "{p:?}");
+        // A window of a few pixels has none, and still has a picture.
+        let tiny = Layout { window: (5, 5), upright: (1206, 2622), margin: 24 };
+        assert_eq!(tiny.margin(), 0);
+        assert!(tiny.picture().is_some());
+        assert_eq!(Layout { window: (0, 600), ..tiny }.picture(), None);
+    }
+
+    #[test]
+    fn the_hint_is_a_short_bar_in_the_middle_of_the_bottom_margin() {
+        let l = margined();
+        let (p, h) = (l.picture().unwrap(), l.hint().unwrap());
+        assert!(h.y >= p.y + p.h && h.y + h.h <= p.y + p.h + 24.0, "inside the band below the picture: {h:?}");
+        assert!(h.w >= 48.0 && h.w <= p.w / 2.0);
+        assert!((h.x + h.w / 2.0 - (p.x + p.w / 2.0)).abs() <= 1.0, "centred");
+        assert!(h.h >= 3.0 && h.h <= 8.0);
+        // The pointer is in the bottom margin where a swipe up would start, and not elsewhere.
+        assert!(l.in_bottom_margin((250.0, 990.0)));
+        assert!(l.in_bottom_margin((10.0, 999.0)), "a bottom corner too");
+        assert!(!l.in_bottom_margin((250.0, 900.0)), "in the picture");
+        assert!(!l.in_bottom_margin((250.0, 10.0)), "the top margin");
+        assert!(!l.in_bottom_margin((3.0, 990.0)), "the bar beyond the band");
+        // No hint where the margin is too thin to hold it, or where there is none.
+        assert_eq!(Layout { margin: 6, ..l }.hint(), None);
+        assert_eq!(Layout { margin: 0, ..l }.hint(), None);
+        assert!(!Layout { margin: 0, ..l }.in_bottom_margin((250.0, 999.0)));
+    }
+
+    #[test]
+    fn the_window_is_sized_by_the_config_and_again_when_the_shape_changes() {
+        let mut f = Fitter::default();
+        assert_eq!(f.shape_known(), None);
+        assert_eq!(f.shape((1206, 2622)), Some(Refit::First));
+        assert_eq!(f.shape((1206, 2622)), None, "a config that says the same changes nothing");
+        assert_eq!(f.shape((2622, 1206)), Some(Refit::Turned));
+        assert_eq!(f.shape((2622, 1206)), None);
+        assert_eq!(f.shape((1206, 2622)), Some(Refit::Turned));
+        assert_eq!(f.shape_known(), Some((1206, 2622)));
+    }
+
+    #[test]
+    fn a_margin_in_logical_pixels_is_the_same_on_a_sharper_display() {
+        assert_eq!(scaled_pixels(24, 1.0), 24);
+        assert_eq!(scaled_pixels(24, 2.0), 48);
+        assert_eq!(scaled_pixels(24, 1.25), 30);
+        assert_eq!(scaled_pixels(0, 2.0), 0, "none stays none");
+        assert_eq!(scaled_pixels(24, -1.0), 0);
+    }
+
+    #[test]
+    fn the_window_is_the_picture_plus_the_margin_on_each_side() {
+        // A tall device on a screen with room for 1400x800: the picture gets 800 less 2x24, and the window is 800 high.
+        let (w, h) = fit_size((1206, 2622), (1400, 800), None, None, 24);
+        assert_eq!(h, 800);
+        let picture_h = f64::from(h - 48);
+        assert!((f64::from(w - 48) - picture_h * 1206.0 / 2622.0).abs() <= 1.0, "{w}");
+        // The user's limits are for the whole window.
+        let (w, h) = fit_size((1206, 2622), (1400, 800), Some(300), Some(1000), 24);
+        assert!(w <= 300 && h <= 1000, "{w}x{h}");
+        assert!(w == 300 || h == 1000);
+        // A window never larger than the picture and its margin when there is room.
+        assert_eq!(fit_size((300, 600), (4000, 4000), None, None, 24), (348, 648));
+        // A turn keeps the longer side.
+        let (w, h) = refit_size((2622, 1206), Some((400, 800)), (1300, 800), None, None, 24);
+        assert_eq!(w, 800);
+        assert!(h < 400);
+        // No margin is what it was.
+        assert_eq!(
+            fit_size((1206, 2622), (1400, 800), None, None, 0),
+            fit_size((1206, 2622), (1400, 800), None, None, 0)
+        );
+        // A margin larger than the room is not a size of zero.
+        let (w, h) = fit_size((1206, 2622), (30, 30), None, None, 24);
+        assert!(w >= 49 && h >= 49);
     }
 }

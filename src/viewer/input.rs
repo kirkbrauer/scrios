@@ -10,15 +10,18 @@
 //!   layout), with auto-repeat left to the device. A key with no usage that yields text types that text.
 //! * The **shortcuts** are the keys pressed while the *shortcut modifier* is held: Cmd on macOS, Alt elsewhere (as
 //!   scrcpy's MOD is). They are the viewer's and are not sent to the device, and neither is the modifier key itself:
-//!   `MOD+H` Home, `MOD+S` App Switcher, `MOD+Up` and `MOD+Down` volume, `MOD+W` closes the window. `MOD+P`
-//!   locks the device only when the user asked for it (`--lock-shortcut`): a lock from the keyboard while the
-//!   screen is the only way in is a way to lock oneself out.
+//!   `MOD+H` Home, `MOD+S` App Switcher, `MOD+Up` and `MOD+Down` volume, `MOD+G` the swipe up from the bottom edge (the
+//!   gesture that goes Home or unlocks), `MOD+W` closes the window. `MOD+P` locks the device only when the user asked for
+//!   it (`--lock-shortcut`): a lock from the keyboard while the screen is the only way in is a way to lock oneself out.
+//! * The **margin** around the picture (see [`Layout`]) makes the device's edges easy to start a drag at: a press in it is
+//!   on the device's edge, so an upward drag from the bottom margin is the edge swipe that goes Home.
+
+use std::time::Duration;
 
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 use crate::commands::{Command, Kb, Key as HwKey, Press, Touch, TouchPhase};
-use crate::viewer::geometry::window_to_device;
-use crate::viewer::geometry::window_to_device_clamped;
+use crate::viewer::geometry::Layout;
 
 /// Which host modifier is the viewer's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,8 @@ pub enum Action {
     Send(Command),
     /// Close the window (and with it stop the stream).
     Close,
+    /// Swipe up from the device's bottom edge (what [`swipe_up`] plays).
+    SwipeUp,
 }
 
 /// A key event, as much of a winit `KeyEvent` as the rules need (a `KeyEvent` cannot be built outside winit, so the
@@ -177,6 +182,7 @@ impl Keyboard {
             Shortcut::VolumeDown => Action::Send(Command::Key(HwKey::VolumeDown, Press::Short)),
             Shortcut::Lock => Action::Send(Command::Key(HwKey::Lock, Press::Short)),
             Shortcut::Close => Action::Close,
+            Shortcut::SwipeUp => Action::SwipeUp,
         })
     }
 
@@ -205,6 +211,7 @@ enum Shortcut {
     VolumeDown,
     Lock,
     Close,
+    SwipeUp,
 }
 
 impl Shortcut {
@@ -215,6 +222,7 @@ impl Shortcut {
             Key::Character(c) if c.eq_ignore_ascii_case("h") => Some(Shortcut::Home),
             Key::Character(c) if c.eq_ignore_ascii_case("s") => Some(Shortcut::AppSwitcher),
             Key::Character(c) if c.eq_ignore_ascii_case("w") => Some(Shortcut::Close),
+            Key::Character(c) if c.eq_ignore_ascii_case("g") => Some(Shortcut::SwipeUp),
             Key::Character(c) if lock_enabled && c.eq_ignore_ascii_case("p") => Some(Shortcut::Lock),
             _ => None,
         }
@@ -269,32 +277,26 @@ pub struct Pointer {
     finger: Option<(f64, f64)>,
 }
 
-/// The window's and the picture's sizes in pixels: what a point of the window is measured against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct View {
-    pub window: (u32, u32),
-    pub upright: (u32, u32),
-}
-
 fn touch(phase: TouchPhase, at: (f64, f64)) -> Command {
     Command::Touch(Touch { phase, x: at.0, y: at.1, id: 0 })
 }
 
 impl Pointer {
-    /// The left button went down at `at` (physical pixels of the window). A press in the bars is no touch.
-    pub fn pressed(&mut self, view: View, at: (f64, f64)) -> Option<Command> {
+    /// The left button went down at `at` (physical pixels of the window). A press in the bars is no touch; a press in the
+    /// margin is on the device's edge ([`Layout::press`]).
+    pub fn pressed(&mut self, layout: Layout, at: (f64, f64)) -> Option<Command> {
         if self.finger.is_some() {
             return None;
         }
-        let point = window_to_device(view.window, view.upright, at)?;
+        let point = layout.press(at)?;
         self.finger = Some(point);
         Some(touch(TouchPhase::Down, point))
     }
 
     /// The pointer moved. With the finger down this is a move, kept on the picture.
-    pub fn moved(&mut self, view: View, at: (f64, f64)) -> Option<Command> {
+    pub fn moved(&mut self, layout: Layout, at: (f64, f64)) -> Option<Command> {
         let last = self.finger?;
-        let point = window_to_device_clamped(view.window, view.upright, at)?;
+        let point = layout.follow(at)?;
         if point == last {
             return None;
         }
@@ -303,9 +305,9 @@ impl Pointer {
     }
 
     /// The left button went up: the finger lifts where the pointer is (kept on the picture).
-    pub fn released(&mut self, view: View, at: (f64, f64)) -> Option<Command> {
+    pub fn released(&mut self, layout: Layout, at: (f64, f64)) -> Option<Command> {
         let last = self.finger.take()?;
-        let point = window_to_device_clamped(view.window, view.upright, at).unwrap_or(last);
+        let point = layout.follow(at).unwrap_or(last);
         Some(touch(TouchPhase::Up, point))
     }
 
@@ -319,6 +321,29 @@ impl Pointer {
     pub fn is_down(&self) -> bool {
         self.finger.is_some()
     }
+}
+
+/// How far the swipe from the bottom edge rises, as a fraction of the picture's height.
+const SWIPE_RISE: f64 = 0.30;
+/// How many moves it makes, and how long each step is: about a tenth of a second in all, a flick.
+const SWIPE_STEPS: u32 = 12;
+const SWIPE_STEP: Duration = Duration::from_millis(12);
+
+/// The swipe up from the bottom edge, as the finger does it: down on the device's last row in the middle, a straight
+/// run upwards, and up. Each command comes with how long to wait before it. It is the gesture that goes Home (and
+/// unlocks), made on the device's own edge, with no pointer to aim.
+#[must_use]
+pub fn swipe_up(upright: (u32, u32)) -> Vec<(Duration, Command)> {
+    let x = f64::from(upright.0) / 2.0;
+    let bottom = f64::from(upright.1.saturating_sub(1));
+    let rise = f64::from(upright.1) * SWIPE_RISE;
+    let mut plan = vec![(Duration::ZERO, touch(TouchPhase::Down, (x, bottom)))];
+    for step in 1..=SWIPE_STEPS {
+        let y = bottom - rise * f64::from(step) / f64::from(SWIPE_STEPS);
+        plan.push((SWIPE_STEP, touch(TouchPhase::Move, (x, y))));
+    }
+    plan.push((SWIPE_STEP, touch(TouchPhase::Up, (x, bottom - rise))));
+    plan
 }
 
 #[cfg(test)]
@@ -347,7 +372,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 Action::Send(c) => Some(c.clone()),
-                Action::Close => None,
+                Action::Close | Action::SwipeUp => None,
             })
             .collect()
     }
@@ -703,8 +728,8 @@ mod tests {
         assert_eq!(seen.len(), all.len());
     }
 
-    fn view() -> View {
-        View { window: (2001, 1311), upright: (1206, 2622) }
+    fn view() -> Layout {
+        Layout { window: (2001, 1311), upright: (1206, 2622), margin: 0 }
     }
 
     #[test]
@@ -768,8 +793,100 @@ mod tests {
         let mut p = Pointer::default();
         p.pressed(view(), (1000.5, 655.5)).unwrap();
         // The window is now half the size: the same pointer position is elsewhere on the picture, and still on it.
-        let small = View { window: (1000, 655), upright: (1206, 2622) };
+        let small = Layout { window: (1000, 655), upright: (1206, 2622), margin: 0 };
         let moved = p.moved(small, (500.0, 400.0)).unwrap();
         assert!(matches!(moved, Command::Touch(Touch { phase: TouchPhase::Move, .. })));
+    }
+
+    #[test]
+    fn mod_g_is_the_swipe_up_from_the_bottom_edge() {
+        let mut kb = mac();
+        let g = ch("g");
+        assert_eq!(kb.key(&press(code(KeyCode::KeyG), &g, ModifiersState::SUPER)), vec![Action::SwipeUp]);
+        // Held, it is made once; the release says nothing.
+        let first = press(code(KeyCode::KeyG), &g, ModifiersState::SUPER);
+        assert!(kb.key(&KeyPress { repeat: true, ..first }).is_empty());
+        assert!(kb.key(&release(code(KeyCode::KeyG), &g, ModifiersState::SUPER)).is_empty());
+        // Without the modifier G is a letter.
+        assert_eq!(sent(&kb.key(&press(code(KeyCode::KeyG), &g, NONE))), vec![Command::Kb(Kb::Down(0x0A))]);
+        // And Cmd+Up is still the volume, Cmd+H the Home button, Cmd+S the App Switcher.
+        let mut kb = mac();
+        let up = Key::Named(NamedKey::ArrowUp);
+        assert_eq!(
+            sent(&kb.key(&press(code(KeyCode::ArrowUp), &up, ModifiersState::SUPER))),
+            vec![Command::Key(HwKey::VolumeUp, Press::Short)]
+        );
+        assert_eq!(
+            sent(&kb.key(&press(code(KeyCode::KeyH), &ch("h"), ModifiersState::SUPER))),
+            vec![Command::Key(HwKey::Home, Press::Short)]
+        );
+    }
+
+    #[test]
+    fn the_swipe_starts_on_the_bottom_edge_and_runs_straight_up() {
+        for upright in [(1206, 2622), (2622, 1206), (1668, 2388)] {
+            let plan = swipe_up(upright);
+            let points: Vec<(TouchPhase, f64, f64)> = plan
+                .iter()
+                .map(|(_, c)| match c {
+                    Command::Touch(Touch { phase, x, y, id: 0 }) => (*phase, *x, *y),
+                    other => panic!("not a touch: {other:?}"),
+                })
+                .collect();
+            // Down on the last row (the digitizer's edge), in the middle; up where the run ended.
+            let bottom = f64::from(upright.1 - 1);
+            assert_eq!(points[0], (TouchPhase::Down, f64::from(upright.0) / 2.0, bottom));
+            let last = points.last().expect("an end");
+            assert_eq!(last.0, TouchPhase::Up);
+            assert!(last.2 < bottom - f64::from(upright.1) * 0.25, "it rises a good part of the screen: {last:?}");
+            // Every move is on the same column and above the one before it, and nothing leaves the picture.
+            let moves = &points[1..points.len() - 1];
+            assert!(moves.iter().all(|p| p.0 == TouchPhase::Move && (p.1 - points[0].1).abs() < 1e-9));
+            assert!(moves.windows(2).all(|w| w[1].2 < w[0].2));
+            assert!(points.iter().all(|p| p.2 >= 0.0 && p.2 <= bottom && p.1 >= 0.0 && p.1 <= f64::from(upright.0)));
+            // A flick: well under half a second, and few enough commands for the touch rate limit (a burst of 100).
+            let total: Duration = plan.iter().map(|(d, _)| *d).sum();
+            assert!(total >= Duration::from_millis(100) && total < Duration::from_millis(400), "{total:?}");
+            assert!(plan.len() < 40);
+            assert_eq!(plan[0].0, Duration::ZERO);
+        }
+    }
+
+    /// A window of 500x1000 with a 24-pixel margin, the 1206x2622 picture in it: the picture is 438x952 at (31, 24).
+    fn margined() -> Layout {
+        Layout { window: (500, 1000), upright: (1206, 2622), margin: 24 }
+    }
+
+    #[test]
+    fn a_press_in_the_margin_is_on_the_devices_edge_and_a_drag_goes_on_from_there() {
+        let mut p = Pointer::default();
+        // In the bottom margin, near the middle: the last row of the device, the matching column.
+        let down = p.pressed(margined(), (250.0, 990.0)).expect("a touch");
+        match down {
+            Command::Touch(Touch { phase: TouchPhase::Down, x, y, id: 0 }) => {
+                assert!((x - 603.0 * (250.0 - 31.0) / 219.0).abs() < 1.0, "{x}");
+                assert!((y - 2621.0).abs() < 1e-9, "{y}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Dragging up into the picture is the ordinary mapping: the finger rises.
+        let Some(Command::Touch(Touch { phase: TouchPhase::Move, y: y1, .. })) = p.moved(margined(), (250.0, 900.0))
+        else {
+            panic!("a move")
+        };
+        assert!(y1 < 2621.0 - 100.0, "{y1}");
+        // Dragging back below the picture sticks to the bottom edge; the release is there.
+        let Some(Command::Touch(Touch { phase: TouchPhase::Move, y: y2, .. })) = p.moved(margined(), (250.0, 999.0))
+        else {
+            panic!("a move")
+        };
+        assert!(y2 >= 2621.0, "{y2}");
+        assert!(matches!(
+            p.released(margined(), (250.0, 999.0)),
+            Some(Command::Touch(Touch { phase: TouchPhase::Up, .. }))
+        ));
+        // A press in the bars beyond the margin, at the window's own edge, is nothing.
+        assert_eq!(p.pressed(margined(), (3.0, 500.0)), None);
+        assert_eq!(p.pressed(margined(), (497.0, 500.0)), None);
     }
 }

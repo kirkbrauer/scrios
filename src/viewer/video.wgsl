@@ -1,4 +1,4 @@
-// Draws one decoded picture: NV12 (a luma plane and an interleaved Cb/Cr plane) to RGB, turned upright, cropped to the
+// Draws one decoded picture (and the flat bands around it): NV12 (a luma plane and an interleaved Cb/Cr plane) to RGB, turned upright, cropped to the
 // visible part of the frame. The rectangle it covers is the viewport the pass sets (the letterbox); the rest of the
 // target is whatever the pass cleared it to.
 
@@ -56,6 +56,17 @@ fn framebuffer_point(p: vec2<f32>) -> vec2<f32> {
             return p;
         }
     }
+}
+
+// The margin around the picture, a little lighter than the black bars, and the hint in it: one flat colour each.
+@fragment
+fn fs_margin(in: Out) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.11, 0.11, 0.12, 1.0);
+}
+
+@fragment
+fn fs_hint(in: Out) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.55, 0.55, 0.58, 1.0);
 }
 
 @fragment

@@ -10,7 +10,7 @@ use bytemuck::{Pod, Zeroable};
 use winit::window::Window;
 
 use crate::viewer::decode::{ColorMatrix, ColorRange, Picture};
-use crate::viewer::geometry::{PictureGeometry, Rect, Rotation, letterbox};
+use crate::viewer::geometry::{Layout, PictureGeometry, Rect, Rotation};
 
 const SHADER: &str = include_str!("video.wgsl");
 
@@ -58,6 +58,8 @@ pub struct Draw {
 #[derive(Debug)]
 pub struct Video {
     pipeline: wgpu::RenderPipeline,
+    margin_pipeline: wgpu::RenderPipeline,
+    hint_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     params: wgpu::Buffer,
@@ -68,6 +70,10 @@ pub struct Video {
 impl Video {
     /// A pipeline that draws to targets of `format`.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the description of the pipelines and their bindings, one after the other"
+    )]
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Video {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scrios video"),
@@ -132,6 +138,41 @@ impl Video {
             multiview_mask: None,
             cache: None,
         });
+        // The flat bands use no resource: a layout of their own, with no bindings.
+        let flat_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scrios flat pipeline layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let flat = |label, entry| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&flat_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let margin_pipeline = flat("scrios margin", "fs_margin");
+        let hint_pipeline = flat("scrios hint", "fs_hint");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scrios video sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -146,7 +187,7 @@ impl Video {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Video { pipeline, layout, sampler, params, textures: None, uploaded: None }
+        Video { pipeline, margin_pipeline, hint_pipeline, layout, sampler, params, textures: None, uploaded: None }
     }
 
     /// Whether a picture was uploaded: until then there is nothing to draw.
@@ -207,6 +248,18 @@ impl Video {
             ],
         });
         Textures { size, luma, chroma, bind_group }
+    }
+
+    /// Draws the margin band (a flat colour a little lighter than the bars) over `zone`, and the hint over `hint`. The
+    /// picture goes on top of the band, so the band may be the picture's rectangle with the margin added.
+    pub fn draw_margin(&self, pass: &mut wgpu::RenderPass<'_>, zone: Rect, hint: Option<Rect>) {
+        for (pipeline, rect) in [(&self.margin_pipeline, Some(zone)), (&self.hint_pipeline, hint)] {
+            if let Some(rect) = rect.filter(|r| r.w >= 1.0 && r.h >= 1.0) {
+                pass.set_viewport(single(rect.x), single(rect.y), single(rect.w), single(rect.h), 0.0, 1.0);
+                pass.set_pipeline(pipeline);
+                pass.draw(0..3, 0..1);
+            }
+        }
     }
 
     /// Draws the last picture into `pass`, in the viewport of `draw.rect`. Nothing is drawn before the first upload.
@@ -393,12 +446,13 @@ impl Renderer {
     }
 
     /// Draws a frame: black, and the last picture letterboxed in it if the stream has said what it looks like
-    /// (`geometry`) and sent one.
+    /// (`geometry`) and sent one, with a margin of `margin` pixels around it (a lighter band) and, if `hint`, the hint
+    /// that a swipe from the bottom edge starts there.
     ///
     /// # Errors
     ///
     /// The surface was lost.
-    pub fn render(&mut self, geometry: Option<&PictureGeometry>) -> Result<(), RenderError> {
+    pub fn render(&mut self, geometry: Option<&PictureGeometry>, margin: u32, hint: bool) -> Result<(), RenderError> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated => {
@@ -431,13 +485,19 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let Some(g) = geometry
-                && let Some(rect) = letterbox((self.config.width, self.config.height), g.upright())
+                && self.video.has_picture()
             {
-                self.video.draw(
-                    &self.queue,
-                    &mut pass,
-                    &Draw { visible: (g.width, g.height), rotation: g.rotation, rect },
-                );
+                let layout = Layout { window: self.size(), upright: g.upright(), margin };
+                if let (Some(rect), Some(zone)) = (layout.picture(), layout.zone()) {
+                    if layout.margin() > 0 {
+                        self.video.draw_margin(&mut pass, zone, hint.then(|| layout.hint()).flatten());
+                    }
+                    self.video.draw(
+                        &self.queue,
+                        &mut pass,
+                        &Draw { visible: (g.width, g.height), rotation: g.rotation, rect },
+                    );
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -467,6 +527,7 @@ mod tests {
     use super::*;
     use crate::viewer::decode::testing::*;
     use crate::viewer::decode::{Decoder, software::Software};
+    use crate::viewer::geometry::letterbox;
 
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -484,6 +545,16 @@ mod tests {
 
     /// Draws `picture` into a target of `size` and returns its RGBA pixels, row by row.
     fn render(gpu: &Gpu, picture: &Picture, size: (u32, u32), draw: &Draw) -> Vec<[u8; 4]> {
+        render_with(gpu, picture, size, &|video, queue, pass| video.draw(queue, pass, draw))
+    }
+
+    /// The same, drawing whatever `scene` draws.
+    fn render_with(
+        gpu: &Gpu,
+        picture: &Picture,
+        size: (u32, u32),
+        scene: &dyn Fn(&Video, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
+    ) -> Vec<[u8; 4]> {
         let mut video = Video::new(&gpu.device, FORMAT);
         video.upload(&gpu.device, &gpu.queue, picture);
         assert!(video.has_picture());
@@ -523,7 +594,7 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            video.draw(&gpu.queue, &mut pass, draw);
+            scene(&video, &gpu.queue, &mut pass);
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -565,6 +636,12 @@ mod tests {
             last = decoder.decode(unit).expect("decodes");
         }
         last.expect("a picture")
+    }
+
+    /// A position inside the target as a pixel index.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a small positive position in a test")]
+    fn px(v: f64) -> u32 {
+        v as u32
     }
 
     fn at(pixels: &[[u8; 4]], width: u32, x: u32, y: u32) -> [u8; 4] {
@@ -692,5 +769,41 @@ mod tests {
         let full = Uploaded { range: ColorRange::Full, matrix: ColorMatrix::Bt601, ..picture };
         assert_eq!(params_for(&draw, full).flags, 1);
         assert_eq!(std::mem::size_of::<Params>(), 48, "the WGSL struct is 48 bytes");
+    }
+
+    #[test]
+    fn the_margin_is_a_lighter_band_round_the_picture_and_the_hint_is_in_it() {
+        let Some(gpu) = gpu() else {
+            eprintln!("no graphics adapter: skipped");
+            return;
+        };
+        // A 64x96 picture in a 140x180 window with a margin of 10: the picture is 64x96 or a little smaller, centred,
+        // and the band is 10 pixels wide on every side of it; beyond the band the window is black.
+        let size = (140, 180);
+        let layout = Layout { window: size, upright: (64, 96), margin: 10 };
+        let (rect, zone, hint) = (layout.picture().expect("a picture"), layout.zone().expect("a zone"), layout.hint());
+        assert!(hint.is_some(), "a margin of 10 holds a hint");
+        let pixels = render_with(&gpu, &picture(0), size, &|video, queue, pass| {
+            video.draw_margin(pass, zone, hint);
+            video.draw(queue, pass, &Draw { visible: (64, 96), rotation: Rotation::R0, rect });
+        });
+        let at_px = |x: f64, y: f64| at(&pixels, size.0, px(x), px(y));
+        // In the band: flat, lighter than black, much darker than the hint; in the picture: its colours.
+        let band = at_px(zone.x + 2.0, zone.y + zone.h / 2.0);
+        assert!(band[0] >= 20 && band[0] <= 40 && band[1] >= 20 && band[2] >= 20, "{band:?}");
+        assert_eq!(at_px(zone.x + zone.w / 2.0, zone.y + 2.0)[..3], band[..3], "the same on every side");
+        assert!(close(at_px(rect.x + rect.w / 4.0, rect.y + rect.h / 4.0), RED_RGB, 10));
+        // Outside the band, black.
+        assert_eq!(at_px(1.0, 1.0)[..3], [0, 0, 0]);
+        assert_eq!(at_px(f64::from(size.0) - 2.0, f64::from(size.1) / 2.0)[..3], [0, 0, 0]);
+        // The hint is brighter than the band, below the picture; the same place without the hint is the band.
+        let h = hint.expect("a hint");
+        let on_hint = at_px(h.x + h.w / 2.0, h.y + h.h / 2.0);
+        assert!(on_hint[0] >= 120 && on_hint[0] <= 160, "{on_hint:?}");
+        let without = render_with(&gpu, &picture(0), size, &|video, queue, pass| {
+            video.draw_margin(pass, zone, None);
+            video.draw(queue, pass, &Draw { visible: (64, 96), rotation: Rotation::R0, rect });
+        });
+        assert_eq!(at(&without, size.0, px(h.x + h.w / 2.0), px(h.y + h.h / 2.0))[..3], band[..3]);
     }
 }

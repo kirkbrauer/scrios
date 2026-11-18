@@ -207,8 +207,16 @@ with `--show-stats` (the delay is the viewer's own: from the moment the stream h
 drawn; it does not include the device's encoder or the USB link).
 
 **Mouse.** The left button is one finger (touch 0): press, drag and release on the picture are `touch down`, `move`
-and `up` at the matching point of the device's screen. A press in the black bars does nothing; a drag that leaves the
-picture stays on its edge. One finger only (there is no multi-touch yet).
+and `up` at the matching point of the device's screen. A drag that leaves the picture stays on its edge. One finger only
+(there is no multi-touch yet).
+
+**The edge margin.** The picture is inset from the window's edges by a band, 24 logical pixels wide, a little lighter than
+the black bars (`--edge-margin PIXELS`; 0 turns it off). A press that starts **in the band is on the device's edge**: in the
+bottom band it is the very bottom row of the screen, in the top band the very top row, and likewise at the sides, with the
+position along the edge as you aimed. So an upward drag that starts in the bottom band is a true bottom-edge swipe (Home, or
+unlocking), and the window's own resize border, which is at the window's edge, is outside the band: the drag no longer
+resizes the window. A short bar like iOS's home indicator shows in the bottom band while the pointer is in it. The band does
+not cost the picture any size: the first window is as large as before, plus the band.
 
 **Keyboard.** Keys are sent to the device as a hardware keyboard by their position (letters, digits, arrows, function
 keys, modifiers), so the device interprets them with its own layout (US). A key is down on the device while it is down
@@ -223,6 +231,7 @@ with the modifier held.
 | `MOD+H` | Home |
 | `MOD+S` | App Switcher |
 | `MOD+Up`, `MOD+Down` | Volume up, down (repeat while held) |
+| `MOD+G` | the swipe up from the bottom edge, made for you (the gesture that goes Home or unlocks) |
 | `MOD+W` | close the window |
 | `MOD+P` | lock the device, **only with `--lock-shortcut`** |
 
@@ -247,6 +256,7 @@ NV12 planes.
 | --- | --- |
 | `--window-title TITLE` | the window's title (default `scrios`) |
 | `--window-width PIXELS`, `--window-height PIXELS` | the first window is at most this wide / high (logical pixels) |
+| `--edge-margin PIXELS` | the margin round the picture, in which a press is on the device's edge (default 24; 0: none) |
 | `--show-stats` | frame rate and delay in the title |
 | `--lock-shortcut` | `MOD+P` locks the device |
 | `--decoder auto\|platform\|software` | the H.264 decoder |

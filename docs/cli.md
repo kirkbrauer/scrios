@@ -243,6 +243,15 @@ has the overview; the details:
 * **Mouse** = finger 0, in pixels of the upright picture (the same `touch down|move|up` as the stdin commands). A press in
   the bars is ignored; a drag that leaves the picture sticks to its edge; losing the focus or a turn of the device lifts
   the finger.
+* **Edge margin** (`--edge-margin PIXELS`, default 24 logical pixels, 0 = none). The picture is inset from the window by a
+  band a little lighter than the bars. A press that starts in the band is **on the device's edge**: in the bottom band it
+  is the last row of the upright picture (the digitizer's own edge, 65535), in the top band row 0, in the side bands
+  column 0 or the last column, with the other coordinate as aimed (a corner is the device's corner). The moves after the
+  press map as usual and stay on the picture. So an upward drag from the bottom band is a true edge swipe (Home, unlock), a
+  downward one from the top band is the top-edge swipe (Control Center, Notification Center), and the window's own resize
+  border, outside the band, is not what the drag grabs. While the pointer is in the bottom band a short bar is drawn in it.
+  The first window is the picture's size plus the band, and `--window-width`/`--window-height` are for the whole window.
+  The band is never more than a sixth of the window's shorter side.
 * **Keyboard.** A key goes down and up on the device (`kb down|up`, HID usage by the key's position) as it does on the
   host. Auto-repeat of the host is not forwarded. Losing the focus lifts every key.
 * **Shortcuts** with `MOD` = **Cmd** on macOS, **Alt** elsewhere; not sent to the device, and neither is the modifier or a
@@ -253,6 +262,7 @@ has the overview; the details:
   | `MOD+H` | `key home` |
   | `MOD+S` | `key app-switcher` |
   | `MOD+Up`, `MOD+Down` | `key volume-up`, `key volume-down` (repeat while held) |
+  | `MOD+G` | the swipe up from the bottom edge: `touch down` on the last row in the middle, a straight run up by 30% of the height in about 150 ms, `touch up` (the gesture that goes Home or unlocks); not made while a finger is down |
   | `MOD+W` | close the window |
   | `MOD+P` | `key lock`, only with `--lock-shortcut` |
 
@@ -333,7 +343,7 @@ needs an SSH server there).
 | `--no-preflight` | do not check Developer Mode and the developer disk image first, and never mount one |
 | `--ddi-dir DIR` | the developer disk image folder to mount from (see [the developer disk image](#the-developer-disk-image)) |
 | `--ddi-download-url URL`, `--ddi-sha256 HEX` | download the image (a `.tar.gz` of the folder, checked against the hash) when no folder is found; no default URL |
-| `--decoder auto\|platform\|software`, `--window-title`, `--window-width`, `--window-height`, `--show-stats`, `--lock-shortcut` | the viewer's (see above); `scrios` without a subcommand only |
+| `--decoder auto\|platform\|software`, `--window-title`, `--window-width`, `--window-height`, `--edge-margin`, `--show-stats`, `--lock-shortcut` | the viewer's (see above); `scrios` without a subcommand only |
 | `--list-devices` | the same as `scrios list` |
 
 Under **Advanced** in `--help`: `--visible-size`, the RTCP and stall intervals, `--display-poll-ms`, the touch mapping

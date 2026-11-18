@@ -205,13 +205,15 @@ pub fn coalesce(batch: Vec<Command>) -> Vec<Command> {
 #[derive(Debug, Clone)]
 pub struct Control {
     tx: Option<Sender<Command>>,
+    /// A gesture is being played: another does not start, and the mouse waits for it.
+    gesture: Arc<AtomicBool>,
 }
 
 impl Control {
     /// A control that sends nothing (`--no-control`).
     #[must_use]
     pub fn off() -> Control {
-        Control { tx: None }
+        Control { tx: None, gesture: Arc::default() }
     }
 
     /// Starts the input thread, which sends what this control is given to `feed` until the stream is over.
@@ -222,13 +224,44 @@ impl Control {
     pub fn start(feed: Arc<dyn Feed>) -> std::io::Result<Control> {
         let (tx, rx) = channel();
         std::thread::Builder::new().name("scrios-viewer-input".into()).spawn(move || pump(&rx, feed.as_ref()))?;
-        Ok(Control { tx: Some(tx) })
+        Ok(Control { tx: Some(tx), gesture: Arc::default() })
     }
 
     /// Whether commands are sent at all.
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.tx.is_some()
+    }
+
+    /// Plays a gesture: its commands, each after the wait it comes with, queued for the stream from a thread of its own
+    /// (so that the window does not wait). Returns whether it started: not when commands are off, when the thread could not
+    /// start, or when another gesture is still being played.
+    #[must_use]
+    pub fn gesture(&self, plan: Vec<(Duration, Command)>) -> bool {
+        let Some(tx) = self.tx.clone() else { return false };
+        if self.gesture.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let playing = self.gesture.clone();
+        let spawned = std::thread::Builder::new().name("scrios-viewer-gesture".into()).spawn(move || {
+            for (wait, command) in plan {
+                std::thread::sleep(wait);
+                if tx.send(command).is_err() {
+                    break;
+                }
+            }
+            playing.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            self.gesture.store(false, Ordering::Release);
+        }
+        spawned.is_ok()
+    }
+
+    /// Whether a gesture is being played.
+    #[must_use]
+    pub fn gesture_active(&self) -> bool {
+        self.gesture.load(Ordering::Acquire)
     }
 
     /// Queues a command for the stream. Never blocks.
@@ -520,5 +553,34 @@ mod tests {
         let slot = FrameSlot::default();
         decode_loop(&feed, &mut decoder, &slot, Some(Recorder::new("full".into(), Full)), &|_| {});
         assert!(slot.take().is_some(), "still decoded and shown");
+    }
+
+    #[test]
+    fn a_gesture_is_played_in_order_one_at_a_time_and_the_window_is_not_kept_waiting() {
+        let feed = Arc::new(ListFeed::new(Vec::new()));
+        let control = Control::start(feed.clone()).expect("thread");
+        let plan = vec![
+            (Duration::ZERO, touch(TouchPhase::Down, 1.0)),
+            (Duration::from_millis(30), touch(TouchPhase::Move, 2.0)),
+            (Duration::from_millis(30), touch(TouchPhase::Up, 3.0)),
+        ];
+        let started = Instant::now();
+        assert!(control.gesture(plan.clone()));
+        assert!(started.elapsed() < Duration::from_millis(25), "the call returns at once");
+        assert!(control.gesture_active());
+        assert!(!control.gesture(plan.clone()), "one at a time");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (feed.sent.lock().unwrap().len() < 3 || control.gesture_active()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *feed.sent.lock().unwrap(),
+            vec![touch(TouchPhase::Down, 1.0), touch(TouchPhase::Move, 2.0), touch(TouchPhase::Up, 3.0)]
+        );
+        assert!(!control.gesture_active());
+        // After it is over another can be played; and with commands off nothing is.
+        assert!(control.gesture(vec![(Duration::ZERO, Command::Keyframe)]));
+        assert!(!Control::off().gesture(plan));
+        assert!(!Control::off().gesture_active());
     }
 }

@@ -16,8 +16,10 @@ use winit::window::{Window, WindowId};
 use crate::commands::Command;
 use crate::frame::Event;
 use crate::stream::{EXIT_FAILED, EXIT_START_FAILED};
-use crate::viewer::geometry::{PictureGeometry, Rotation, fit_size, refit_size, whole_pixels};
-use crate::viewer::input::{Action, KeyPress, Keyboard, Pointer, ShortcutModifier, View};
+use crate::viewer::geometry::{
+    Fitter, Layout, PictureGeometry, Refit, Rotation, fit_size, refit_size, scaled_pixels, whole_pixels,
+};
+use crate::viewer::input::{Action, KeyPress, Keyboard, Pointer, ShortcutModifier, swipe_up};
 use crate::viewer::pipeline::{Control, Feed, FrameSlot, Wake};
 use crate::viewer::render::Renderer;
 use crate::viewer::stats::{Meter, Status, stats_line, title};
@@ -42,6 +44,8 @@ pub struct WindowOptions {
     pub show_stats: bool,
     pub control: bool,
     pub lock_shortcut: bool,
+    /// The margin around the picture, in logical pixels (0: none).
+    pub edge_margin: u32,
     /// How the decoder is named in the log (it is on another thread).
     pub decoder: &'static str,
 }
@@ -73,11 +77,15 @@ struct App {
     renderer: Option<Renderer>,
     /// What the last `config` said (or, until one does, what the first picture is).
     geometry: Option<PictureGeometry>,
+    /// What the window was sized for.
+    fitter: Fitter,
     keyboard: Keyboard,
     pointer: Pointer,
     modifiers: ModifiersState,
     /// The pointer's last position in the window, physical pixels.
     cursor: PhysicalPosition<f64>,
+    /// The pointer is in the margin below the picture and the hint of the edge swipe is shown.
+    hint: bool,
     status: Status,
     stats: Option<String>,
     note: Option<String>,
@@ -104,10 +112,12 @@ impl App {
             window: None,
             renderer: None,
             geometry: None,
+            fitter: Fitter::default(),
             keyboard,
             pointer: Pointer::default(),
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
+            hint: false,
             status: Status::Connecting,
             stats: None,
             note,
@@ -129,10 +139,28 @@ impl App {
         }
     }
 
-    /// The window's and the picture's sizes, for the mouse.
-    fn view(&self) -> Option<View> {
+    /// The margin round the picture in physical pixels: `--edge-margin` is in logical ones.
+    fn margin(&self) -> u32 {
+        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+        scaled_pixels(self.options.edge_margin, scale)
+    }
+
+    /// How the window is laid out, for the mouse and the drawing.
+    fn layout(&self) -> Option<Layout> {
         let renderer = self.renderer.as_ref()?;
-        Some(View { window: renderer.size(), upright: self.geometry?.upright() })
+        Some(Layout { window: renderer.size(), upright: self.geometry?.upright(), margin: self.margin() })
+    }
+
+    /// Shows the hint while the pointer is in the margin below the picture and no finger is down.
+    fn update_hint(&mut self) {
+        let hint = !self.pointer.is_down()
+            && self.layout().is_some_and(|l| l.in_bottom_margin((self.cursor.x, self.cursor.y)));
+        if hint != self.hint {
+            self.hint = hint;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
     }
 
     /// Sends the actions a key made.
@@ -141,6 +169,15 @@ impl App {
             match action {
                 Action::Send(command) => self.control.send(command),
                 Action::Close => self.close(event_loop),
+                Action::SwipeUp => {
+                    // Not over a finger that is down, nor over another gesture; with no picture there is no edge.
+                    if let Some(g) = self.geometry
+                        && !self.pointer.is_down()
+                    {
+                        // Best effort: not started if one is playing already.
+                        let _ = self.control.gesture(swipe_up(g.upright()));
+                    }
+                }
             }
         }
     }
@@ -202,23 +239,31 @@ impl App {
 
     /// What the stream's `config` says: the picture's size and turn.
     fn on_config(&mut self, geometry: PictureGeometry) {
-        let before = self.geometry.map(|g| g.upright());
-        let changed = before != Some(geometry.upright());
-        if changed {
+        let upright = geometry.upright();
+        if self.geometry.map(|g| g.upright()) != Some(upright) {
             // The same point of the window is another point of the picture now.
             if let Some(command) = self.pointer.cancel() {
                 self.control.send(command);
             }
         }
         self.geometry = Some(geometry);
-        if changed && let Some(window) = &self.window {
-            let scale = window.scale_factor();
-            let current = (before.is_some()).then(|| {
-                let size = window.inner_size().to_logical::<f64>(scale);
+        // The window is sized by the config, not by a picture that came first (which only shows what it is). Without a
+        // window yet it will be sized from this geometry when it opens.
+        let refit = self.fitter.shape(upright);
+        if let (Some(refit), Some(window)) = (refit, &self.window) {
+            let current = (refit == Refit::Turned).then(|| {
+                let size = window.inner_size().to_logical::<f64>(window.scale_factor());
                 (whole_pixels(size.width), whole_pixels(size.height))
             });
-            let (w, h) = refit_size(geometry.upright(), current, self.screen, self.options.width, self.options.height);
-            debug!("the picture is {:?} upright: window {w}x{h}", geometry.upright());
+            let (w, h) = refit_size(
+                upright,
+                current,
+                self.screen,
+                self.options.width,
+                self.options.height,
+                self.options.edge_margin,
+            );
+            debug!("the picture is {upright:?} upright: window {w}x{h}");
             let _ = window.request_inner_size(LogicalSize::new(w, h));
         }
         if let Some(window) = &self.window {
@@ -255,6 +300,7 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let margin = self.margin();
         let Some(renderer) = self.renderer.as_mut() else { return };
         let frame = self.slot.take();
         self.meter.stale(self.slot.take_stale());
@@ -271,7 +317,7 @@ impl App {
             renderer.upload(&frame.picture);
             timing = Some((frame.arrived, frame.decode));
         }
-        if let Err(e) = renderer.render(self.geometry.as_ref()) {
+        if let Err(e) = renderer.render(self.geometry.as_ref(), margin, self.hint) {
             error!("cannot draw: {e}");
             self.exit = Some(EXIT_FAILED);
             event_loop.exit();
@@ -310,15 +356,18 @@ impl App {
     }
 
     fn mouse(&mut self, state: ElementState) {
-        let Some(view) = self.view() else { return };
+        let Some(layout) = self.layout() else { return };
         let at = (self.cursor.x, self.cursor.y);
         let command = match state {
-            ElementState::Pressed => self.pointer.pressed(view, at),
-            ElementState::Released => self.pointer.released(view, at),
+            // A gesture of the keyboard is being played: the mouse waits for it.
+            ElementState::Pressed if self.control.gesture_active() => None,
+            ElementState::Pressed => self.pointer.pressed(layout, at),
+            ElementState::Released => self.pointer.released(layout, at),
         };
         if let Some(command) = command {
             self.control.send(command);
         }
+        self.update_hint();
     }
 }
 
@@ -335,7 +384,7 @@ impl ApplicationHandler<Wake> for App {
         self.screen = (whole_pixels(screen.0 * SCREEN_SHARE.0), whole_pixels(screen.1 * SCREEN_SHARE.1));
         // The stream may have said what the picture is before there was a window to size.
         let picture = self.geometry.map_or(FIRST_PICTURE, |g| g.upright());
-        let (w, h) = fit_size(picture, self.screen, self.options.width, self.options.height);
+        let (w, h) = fit_size(picture, self.screen, self.options.width, self.options.height, self.options.edge_margin);
         let attributes = Window::default_attributes()
             .with_title(title(&self.options.title, &Status::Connecting))
             .with_inner_size(LogicalSize::new(w, h))
@@ -395,11 +444,17 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::Focused(false) => self.release_inputs(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
-                if let Some(view) = self.view()
-                    && let Some(command) = self.pointer.moved(view, (position.x, position.y))
+                if let Some(layout) = self.layout()
+                    && let Some(command) = self.pointer.moved(layout, (position.x, position.y))
                 {
                     self.control.send(command);
                 }
+                self.update_hint();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // Far outside: nowhere to be in the margin.
+                self.cursor = PhysicalPosition::new(-1.0, -1.0);
+                self.update_hint();
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.mouse(state),
             // Keys the window held when it got the focus are not presses of its own.

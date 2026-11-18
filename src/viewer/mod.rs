@@ -37,6 +37,9 @@ pub use pipeline::{Feed, Recorder};
 
 use pipeline::{Control, FrameSlot, Wake, decode_loop};
 
+/// The margin round the picture unless asked otherwise: wide enough to aim at with a mouse, narrow enough to be no loss.
+pub const DEFAULT_EDGE_MARGIN: u32 = 24;
+
 /// What the viewer is asked for.
 #[derive(Debug, Clone)]
 pub struct ViewerOptions {
@@ -53,6 +56,9 @@ pub struct ViewerOptions {
     pub show_stats: bool,
     /// `MOD+P` locks the device (off by default: locking from the keyboard is a way to lock oneself out).
     pub lock_shortcut: bool,
+    /// The margin around the picture, in logical pixels (0: none). A press in it is on the device's edge, so that an edge
+    /// swipe can start there, away from the window's own border.
+    pub edge_margin: u32,
     /// Record the stream, as it comes, to this file (raw Annex-B).
     pub record: Option<PathBuf>,
 }
@@ -68,6 +74,7 @@ impl Default for ViewerOptions {
             window_height: None,
             show_stats: false,
             lock_shortcut: false,
+            edge_margin: DEFAULT_EDGE_MARGIN,
             record: None,
         }
     }
@@ -166,6 +173,7 @@ impl Setup {
             show_stats: options.show_stats,
             control: options.control,
             lock_shortcut: options.lock_shortcut,
+            edge_margin: options.edge_margin,
             decoder: decoder_name,
         };
         app::run(window, feed, slot, control, events)
