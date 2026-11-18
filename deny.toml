@@ -1,0 +1,43 @@
+# cargo-deny: what scrios may depend on. `cargo deny check` runs in CI (.github/workflows/ci.yml).
+
+[graph]
+# Every platform the release builds for, so that platform-only crates are checked too.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Compatible with distributing scrios under Apache-2.0. An expression with OR passes when one side is here.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# idevice, pinned by commit in Cargo.toml and Cargo.lock.
+allow-git = ["https://github.com/jkcoxson/idevice"]

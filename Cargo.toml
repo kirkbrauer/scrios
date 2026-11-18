@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 # The CoreDevice display service, tunnel and usbmuxd client (MIT). Pinned by commit; see BUILD.md for
 # building against a local checkout when GitHub is not reachable.
-idevice = { git = "https://github.com/jkcoxson/idevice", rev = "2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132", default-features = false, features = [
+idevice = { git = "https://github.com/jkcoxson/idevice", rev = "2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132", version = "0.1.68", default-features = false, features = [
   "aws-lc",
   "display_stream",
   "core_device_proxy",
