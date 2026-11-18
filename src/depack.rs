@@ -18,6 +18,16 @@
 //! sequence handling, the unit grouping, the loss rules and the parameter-set insertion, is one
 //! implementation, [`UnitAssembler`], used with either format.
 
+// The parser modules read untrusted bytes: a malformed input is an error, never a panic, so the lints that find the
+// panics are denied here (the tests below may use them).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::marker::PhantomData;
 
 pub const NAL_VPS: u8 = 32;
@@ -163,38 +173,41 @@ impl NalFormat for Hevc {
     }
 
     fn check_nal(nal: &[u8]) -> NalCheck {
-        if nal.len() < 2 {
+        let [b0, b1, ..] = *nal else {
             return NalCheck::Malformed;
-        }
-        let layer_id = ((nal[0] & 1) << 5) | (nal[1] >> 3);
-        let typ = nal_type(nal[0]);
+        };
+        let layer_id = ((b0 & 1) << 5) | (b1 >> 3);
+        let typ = nal_type(b0);
         if layer_id != 0 || typ >= 41 {
             return NalCheck::Skip; // enhancement layers, reserved and unspecified types
         }
-        if nal[1] & 7 == 0 {
+        if b1 & 7 == 0 {
             return NalCheck::Malformed; // nuh_temporal_id_plus1 is never 0
         }
         NalCheck::Ok(typ)
     }
 
     fn parse<'a>(p: &'a [u8], out: &mut Vec<Item<'a>>) {
-        if p.len() < 2 || p[0] & 0x80 != 0 {
+        let &[b0, b1, ref rest @ ..] = p else {
+            out.push(Item::Malformed);
+            return;
+        };
+        if b0 & 0x80 != 0 {
             out.push(Item::Malformed);
             return;
         }
-        match nal_type(p[0]) {
+        match nal_type(b0) {
             NAL_AP => {
                 // [PayloadHdr][ u16 size, NAL unit ]+ (no DONL: not negotiated)
                 out.push(Item::EndsFragment);
-                let mut off = 2;
-                while off < p.len() {
-                    let Some(size) = p.get(off..off + 2) else {
+                let mut rest = rest;
+                while !rest.is_empty() {
+                    let Some((size, tail)) = rest.split_first_chunk::<2>() else {
                         out.push(Item::Malformed);
                         return;
                     };
-                    let size = usize::from(u16::from_be_bytes([size[0], size[1]]));
-                    off += 2;
-                    let Some(nal) = p.get(off..off + size) else {
+                    let size = usize::from(u16::from_be_bytes(*size));
+                    let Some((nal, tail)) = tail.split_at_checked(size) else {
                         out.push(Item::Malformed);
                         return;
                     };
@@ -203,22 +216,21 @@ impl NalFormat for Hevc {
                         return;
                     }
                     out.push(Item::Nal(nal));
-                    off += size;
+                    rest = tail;
                 }
             }
             NAL_FU => {
                 // [PayloadHdr][FU header: S|E|type(6)][fragment]; the NAL header is rebuilt from
                 // the PayloadHdr (layer id, TID) with the FU type.
-                if p.len() < 3 {
+                let [fu, fragment @ ..] = rest else {
                     out.push(Item::Malformed);
                     return;
-                }
-                let layer_id = ((p[0] & 1) << 5) | (p[1] >> 3);
+                };
+                let layer_id = ((b0 & 1) << 5) | (b1 >> 3);
                 if layer_id != 0 {
                     out.push(Item::Ignore); // not the base layer
                     return;
                 }
-                let fu = p[2];
                 let (start, end, fu_type) = (fu & 0x80 != 0, fu & 0x40 != 0, fu & 0x3f);
                 if (start && end) || fu_type >= NAL_AP {
                     out.push(Item::Malformed);
@@ -226,7 +238,7 @@ impl NalFormat for Hevc {
                 }
                 // The NAL header the unit is rebuilt with is judged as a whole NAL unit's is: reserved and
                 // unspecified types are left out, a zero temporal id is malformed.
-                let header = [(p[0] & 0x81) | (fu_type << 1), p[1]];
+                let header = [(b0 & 0x81) | (fu_type << 1), b1];
                 match Self::check_nal(&header) {
                     NalCheck::Ok(_) => {}
                     NalCheck::Skip => {
@@ -240,7 +252,7 @@ impl NalFormat for Hevc {
                 }
                 out.push(Item::Fragment {
                     start: start.then_some(FragmentStart { header, header_len: 2, typ: fu_type }),
-                    fragment: &p[3..],
+                    fragment,
                     end,
                 });
             }
@@ -331,10 +343,11 @@ impl NalFormat for H264 {
     }
 
     fn parse<'a>(p: &'a [u8], out: &mut Vec<Item<'a>>) {
-        let Some(&b0) = p.first() else {
+        let [b0, rest @ ..] = p else {
             out.push(Item::Malformed);
             return;
         };
+        let b0 = *b0;
         // The display stream's configuration packet starts with 0x92: its forbidden bit is set, so it
         // has to be recognised before that bit is checked.
         if b0 & 0x80 != 0 && crate::avc::nal_type(b0) != H264_CONFIG_KIND {
@@ -384,15 +397,14 @@ impl NalFormat for H264 {
             crate::avc::NAL_STAP_A => {
                 // [STAP-A header][ u16 size, NAL unit ]+
                 out.push(Item::EndsFragment);
-                let mut off = 1;
-                while off < p.len() {
-                    let Some(size) = p.get(off..off + 2) else {
+                let mut rest = rest;
+                while !rest.is_empty() {
+                    let Some((size, tail)) = rest.split_first_chunk::<2>() else {
                         out.push(Item::Malformed);
                         return;
                     };
-                    let size = usize::from(u16::from_be_bytes([size[0], size[1]]));
-                    off += 2;
-                    let Some(nal) = p.get(off..off + size) else {
+                    let size = usize::from(u16::from_be_bytes(*size));
+                    let Some((nal, tail)) = tail.split_at_checked(size) else {
                         out.push(Item::Malformed);
                         return;
                     };
@@ -401,16 +413,17 @@ impl NalFormat for H264 {
                         return;
                     }
                     out.push(Item::Nal(nal));
-                    off += size;
+                    rest = tail;
                 }
             }
             crate::avc::NAL_FU_A => {
                 // [FU indicator][FU header: S|E|R|type(5)][fragment]; the NAL header is rebuilt from the
                 // indicator's F and NRI and the FU header's type.
-                let Some(&fu) = p.get(1) else {
+                let [fu, fragment @ ..] = rest else {
                     out.push(Item::Malformed);
                     return;
                 };
+                let fu = *fu;
                 let (start, end, fu_type) = (fu & 0x80 != 0, fu & 0x40 != 0, fu & 0x1f);
                 if (start && end) || fu_type == 0 || fu_type >= crate::avc::NAL_STAP_A {
                     out.push(Item::Malformed);
@@ -418,8 +431,9 @@ impl NalFormat for H264 {
                 }
                 // The NAL header the unit is rebuilt with is judged as a whole NAL unit's is: the types that
                 // are not part of the base stream (prefix, extension and reserved ones) are left out.
-                let header = [(b0 & 0xE0) | fu_type, 0];
-                match Self::check_nal(&header[..1]) {
+                let first = (b0 & 0xE0) | fu_type;
+                let header = [first, 0];
+                match Self::check_nal(&[first]) {
                     NalCheck::Ok(_) => {}
                     NalCheck::Skip => {
                         out.push(Item::Ignore);
@@ -432,7 +446,7 @@ impl NalFormat for H264 {
                 }
                 out.push(Item::Fragment {
                     start: start.then_some(FragmentStart { header, header_len: 1, typ: fu_type }),
-                    fragment: &p[2..],
+                    fragment,
                     end,
                 });
             }
@@ -476,6 +490,18 @@ struct NalRef {
     /// Offset one past its last byte; 0 while a fragmented NAL unit is still open.
     end: usize,
     typ: u8,
+}
+
+impl NalRef {
+    /// The NAL unit's bytes in `buf` (the buffer of the unit it is in); `None` if it is not all there.
+    fn bytes<'b>(&self, buf: &'b [u8]) -> Option<&'b [u8]> {
+        buf.get(self.start..self.end)
+    }
+
+    /// The bytes it takes with a 4-byte start code.
+    fn len_with_start_code(&self) -> usize {
+        self.end.saturating_sub(self.start).saturating_add(START_CODE.len())
+    }
 }
 
 #[derive(Debug)]
@@ -582,7 +608,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             let diff = meta.seq.wrapping_sub(exp);
             if diff >= 0x8000 {
                 // Behind the cursor: a duplicate or a reordered packet whose place has passed ...
-                self.late += 1;
+                self.late = self.late.saturating_add(1);
                 if diff > 0u16.wrapping_sub(NEAR_LATE) {
                     return; // ... and close behind it: nothing more to it
                 }
@@ -598,12 +624,12 @@ impl<F: NalFormat> UnitAssembler<F> {
                     return;
                 }
                 self.late_run = None;
-                self.lost += 1;
+                self.lost = self.lost.saturating_add(1);
                 gap = true;
             } else {
                 self.late_run = None;
                 if diff != 0 {
-                    self.lost += u64::from(diff);
+                    self.lost = self.lost.saturating_add(u64::from(diff));
                     gap = true;
                 }
             }
@@ -688,7 +714,7 @@ impl<F: NalFormat> UnitAssembler<F> {
     fn fragment(&mut self, start: Option<FragmentStart>, fragment: &[u8], end: bool) {
         let max = self.max_unit_bytes;
         let Some(cur) = self.cur.as_mut() else { return };
-        if cur.buf.len() + fragment.len() + 6 > max {
+        if cur.buf.len().saturating_add(fragment.len()).saturating_add(6) > max {
             cur.mark(DropReason::TooLarge);
             cur.fu_open = false;
             return;
@@ -700,7 +726,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             }
             cur.buf.extend_from_slice(&START_CODE);
             let at = cur.buf.len();
-            cur.buf.extend_from_slice(&s.header[..s.header_len]);
+            cur.buf.extend(s.header.iter().take(s.header_len));
             cur.buf.extend_from_slice(fragment);
             cur.nals.push(NalRef { start: at, end: 0, typ: s.typ });
             cur.fu_open = true;
@@ -713,22 +739,29 @@ impl<F: NalFormat> UnitAssembler<F> {
 
         if end && cur.fu_open {
             cur.fu_open = false;
-            let n = cur.nals.last_mut().expect("an open fragment has an entry");
+            // An open fragment has an entry, and the buffer holds its bytes; if not, the unit is not to be trusted.
+            let Some(n) = cur.nals.last_mut() else {
+                cur.mark(DropReason::Malformed);
+                return;
+            };
             n.end = cur.buf.len();
             let (s, t) = (n.start, n.typ);
             // The finished NAL unit may be replaced (an SPS gets its restriction): it is the tail of the buffer.
-            if let Some(new) = F::transform_nal(t, &cur.buf[s..]) {
+            if let Some(new) = cur.buf.get(s..).and_then(|nal| F::transform_nal(t, nal)) {
                 cur.buf.truncate(s);
                 cur.buf.extend_from_slice(&new);
                 n.end = cur.buf.len();
             }
-            let e = n.end;
-            if F::is_b_slice(t, &cur.buf[s..e]) {
-                self.b_slices += 1;
+            let Some(whole) = n.bytes(&cur.buf) else {
+                cur.mark(DropReason::Malformed);
+                return;
+            };
+            if F::is_b_slice(t, whole) {
+                self.b_slices = self.b_slices.saturating_add(1);
                 note_b_slice(&mut self.b_warned);
             }
-            if let Some(i) = F::PARAM_TYPES.iter().position(|p| *p == t) {
-                cur.params[i] = Some(cur.buf[s..e].to_vec());
+            if let Some(slot) = F::PARAM_TYPES.iter().position(|p| *p == t).and_then(|i| cur.params.get_mut(i)) {
+                *slot = Some(whole.to_vec());
             }
         }
     }
@@ -744,7 +777,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             }
         };
         if F::is_b_slice(typ, nal) {
-            self.b_slices += 1;
+            self.b_slices = self.b_slices.saturating_add(1);
             note_b_slice(&mut self.b_warned);
         }
         // An SPS may be rewritten on its way in; the unit and the cache get the same bytes.
@@ -752,7 +785,7 @@ impl<F: NalFormat> UnitAssembler<F> {
         let nal = replaced.as_deref().unwrap_or(nal);
         let max = self.max_unit_bytes;
         let Some(cur) = self.cur.as_mut() else { return };
-        if cur.buf.len() + nal.len() + 4 > max {
+        if cur.buf.len().saturating_add(nal.len()).saturating_add(START_CODE.len()) > max {
             cur.mark(DropReason::TooLarge);
             return;
         }
@@ -760,8 +793,8 @@ impl<F: NalFormat> UnitAssembler<F> {
         let start = cur.buf.len();
         cur.buf.extend_from_slice(nal);
         cur.nals.push(NalRef { start, end: cur.buf.len(), typ });
-        if let Some(i) = F::PARAM_TYPES.iter().position(|p| *p == typ) {
-            cur.params[i] = Some(nal.to_vec());
+        if let Some(slot) = F::PARAM_TYPES.iter().position(|p| *p == typ).and_then(|i| cur.params.get_mut(i)) {
+            *slot = Some(nal.to_vec());
         }
     }
 
@@ -785,7 +818,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             return;
         }
         if !by_marker {
-            self.units_without_marker += 1;
+            self.units_without_marker = self.units_without_marker.saturating_add(1);
         }
         match self.build_unit(b) {
             Ok(unit) => out.push(Output::Unit(unit)),
@@ -812,38 +845,41 @@ impl<F: NalFormat> UnitAssembler<F> {
         };
 
         // An access unit delimiter, if the unit starts with one, stays the first NAL unit.
-        let aud = usize::from(b.nals.first().is_some_and(|n| n.typ == F::AUD));
+        let aud = b.nals.first().filter(|n| n.typ == F::AUD);
+        let after_aud = b.nals.get(usize::from(aud.is_some())..).unwrap_or_default();
         let n_params = F::PARAM_TYPES.len();
-        let already_first = b.nals.len() >= aud + n_params
-            && F::PARAM_TYPES.iter().enumerate().all(|(i, t)| b.nals[aud + i].typ == *t)
-            && !b.nals[aud + n_params..].iter().any(|n| is_param(n.typ));
+        let already_first = after_aud.len() >= n_params
+            && F::PARAM_TYPES.iter().zip(after_aud).all(|(t, n)| n.typ == *t)
+            && !after_aud.iter().skip(n_params).any(|n| is_param(n.typ));
+        // What cannot happen (a NAL unit that is not in the buffer, no SPS among the sets) drops the unit.
+        let (malformed, ts) = (DropReason::Malformed, b.ts);
         let payload = if already_first {
             b.buf
         } else {
-            let rest = |i: &usize, n: &&NalRef| *i >= aud && !is_param(n.typ);
-            let rest_len: usize =
-                b.nals.iter().enumerate().filter(|(i, n)| rest(i, n)).map(|(_, n)| 4 + n.end - n.start).sum();
-            let aud_len = if aud == 1 { 4 + b.nals[0].end - b.nals[0].start } else { 0 };
-            let sets_len: usize = sets.iter().map(|s| 4 + s.len()).sum();
-            let mut p = Vec::with_capacity(sets_len + rest_len + aud_len);
-            if aud == 1 {
+            let rest = || after_aud.iter().filter(|n| !is_param(n.typ));
+            let rest_len: usize = rest().map(NalRef::len_with_start_code).sum();
+            let aud_len = aud.map_or(0, NalRef::len_with_start_code);
+            let sets_len: usize = sets.iter().map(|s| s.len().saturating_add(START_CODE.len())).sum();
+            let mut p = Vec::with_capacity(sets_len.saturating_add(rest_len).saturating_add(aud_len));
+            if let Some(n) = aud {
                 p.extend_from_slice(&START_CODE);
-                p.extend_from_slice(&b.buf[b.nals[0].start..b.nals[0].end]);
+                p.extend_from_slice(n.bytes(&b.buf).ok_or((ts, malformed))?);
             }
             for set in &sets {
                 p.extend_from_slice(&START_CODE);
                 p.extend_from_slice(set);
             }
-            for (_, n) in b.nals.iter().enumerate().filter(|(i, n)| rest(i, n)) {
+            for n in rest() {
                 p.extend_from_slice(&START_CODE);
-                p.extend_from_slice(&b.buf[n.start..n.end]);
+                p.extend_from_slice(n.bytes(&b.buf).ok_or((ts, malformed))?);
             }
             p
         };
         if payload.len() > crate::frame::MAX_PAYLOAD {
-            return Err((b.ts, DropReason::TooLarge));
+            return Err((ts, DropReason::TooLarge));
         }
-        Ok(AccessUnit { timestamp: b.ts, key, params: true, payload, sps: Some(sets[F::SPS_INDEX].clone()) })
+        let sps = sets.get(F::SPS_INDEX).cloned().ok_or((ts, malformed))?;
+        Ok(AccessUnit { timestamp: ts, key, params: true, payload, sps: Some(sps) })
     }
 }
 
@@ -874,6 +910,14 @@ impl<F: NalFormat> Depacketizer for UnitAssembler<F> {
 /// RTP payload builders shared by the tests of this crate.
 #[cfg(test)]
 pub mod testutil {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::*;
 
     pub const VPS: [u8; 6] = [0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
@@ -951,6 +995,14 @@ pub mod testutil {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::testutil::*;
     use super::*;
 
@@ -1403,6 +1455,14 @@ mod tests {
 
 #[cfg(test)]
 mod h264_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::*;
     use crate::avc::NAL_FU_A;
     use crate::avc::testutil::*;

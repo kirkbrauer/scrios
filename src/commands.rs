@@ -11,6 +11,16 @@
 //! * End of input is `stop`.
 //! * Anything else is logged and ignored; a `touch` or `key` that is malformed is reported.
 
+// The parser modules read untrusted bytes: a malformed input is an error, never a panic, so the lints that find the
+// panics are denied here (the tests below may use them).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::future::Future;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -203,8 +213,9 @@ fn parse_usage(s: &str) -> Result<u8, String> {
     if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("usage {} is not a hex number", quoted(s)));
     }
-    match u16::from_str_radix(hex, 16) {
-        Ok(v) if (1..=u16::from(MAX_KEY_USAGE)).contains(&v) => Ok(v as u8),
+    match u8::from_str_radix(hex, 16) {
+        Ok(v) if (1..=MAX_KEY_USAGE).contains(&v) => Ok(v),
+        // Out of range, and a number over 0xFF is out of range too (`from_str_radix` fails on it).
         _ => Err(format!("usage {} is out of range (01 to {MAX_KEY_USAGE:02x})", quoted(s))),
     }
 }
@@ -281,12 +292,11 @@ pub async fn read_commands<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Comm
         if buf.is_empty() {
             break; // end of input
         }
-        let (chunk, found_newline) = match buf.iter().position(|b| *b == b'\n') {
-            Some(i) => (&buf[..i], true),
-            None => (buf, false),
-        };
-        let consumed = chunk.len() + usize::from(found_newline);
-        if line.len() + chunk.len() > MAX_LINE {
+        // The bytes up to the first newline (all of them if there is none).
+        let chunk = buf.split(|b| *b == b'\n').next().unwrap_or(buf);
+        let found_newline = chunk.len() < buf.len();
+        let consumed = chunk.len().saturating_add(usize::from(found_newline));
+        if line.len().saturating_add(chunk.len()) > MAX_LINE {
             too_long = true;
         } else if !too_long {
             line.extend_from_slice(chunk);
@@ -342,6 +352,14 @@ async fn dispatch(line: &[u8], too_long: bool, tx: &mpsc::Sender<Command>) -> bo
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::*;
 
     async fn run(input: &[u8]) -> Vec<Command> {
