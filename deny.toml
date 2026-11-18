@@ -39,5 +39,5 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# idevice, pinned by commit in Cargo.toml and Cargo.lock.
-allow-git = ["https://github.com/jkcoxson/idevice"]
+# No git dependencies: everything comes from crates.io.
+allow-git = []

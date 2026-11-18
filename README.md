@@ -28,7 +28,7 @@ publicly documented. **No jailbreak is needed**; the device only needs:
 scrios never changes a setting of the device, writes a pair record or mounts an image itself.
 
 The CoreDevice, RemoteXPC, usbmuxd and lockdown protocols come from the [idevice](https://github.com/jkcoxson/idevice)
-crate by Jackson Coxson (MIT), pinned by commit. scrios adds the display stream on top: the offer, the RTP
+crate by Jackson Coxson (MIT), pinned to one release. scrios adds the display stream on top: the offer, the RTP
 depacketizer (RFC 6184 for H.264, RFC 7798 for HEVC), parameter-set handling, an H.264 SPS rewrite so that
 browsers' hardware decoders do not buffer frames, RTCP, keyframe requests, display size/orientation tracking, and
 the touch mapping onto the device's digitizer. Details: [docs/internals.md](docs/internals.md).
@@ -38,7 +38,13 @@ device --RTP H.264/HEVC over the CoreDevice tunnel--> scrios --Annex-B or framed
        <-------------- HID touch / keys / text -------------- stdin: one command per line
 ```
 
+### Compatibility
+
+Built against **idevice 0.1.68** (pinned exactly; see [BUILD.md](BUILD.md#idevice)).
+
 ### Tested on
+
+The display stream and touch were tested, on an earlier build of scrios, with:
 
 - iPhone 16 Pro, iOS 27.2
 - iPad (iPad14,3), iOS 27.0.1

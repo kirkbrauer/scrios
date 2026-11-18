@@ -29,31 +29,21 @@ About 6.5 MB (aarch64) and 8 MB (x86_64). A glibc build (`--target <arch>-unknow
 
 ## Mirrors and offline builds
 
-`Cargo.lock` names crates.io and GitHub only; the repository has no Cargo configuration. To build through a mirror
-of crates.io, configure it in `$CARGO_HOME/config.toml` (`[source.crates-io] replace-with = ...`); `--locked`
-still works, since source replacement does not change the lock. A CA bundle for a TLS-intercepting proxy goes in
-`CARGO_HTTP_CAINFO` (and `GIT_SSL_CAINFO` for the git dependency).
+`Cargo.lock` names crates.io only; the repository has no Cargo configuration. To build through a mirror of
+crates.io, configure it in `$CARGO_HOME/config.toml` (`[source.crates-io] replace-with = ...`); `--locked` still
+works, since source replacement does not change the lock. A CA bundle for a TLS-intercepting proxy goes in
+`CARGO_HTTP_CAINFO`. For a fully offline tree, `cargo vendor`.
 
 ### `idevice`
 
-`idevice` is a git dependency, pinned by commit in `Cargo.toml` and `Cargo.lock`:
+`idevice` (the CoreDevice, RemoteXPC, usbmuxd and lockdown client) is pinned **exactly**, `version = "=0.1.68"`,
+because its API changes between releases. A bump is deliberate: change it in `Cargo.toml` and in the README's
+"Compatibility" line, run the tests, and smoke-test against a real device. Only the features scrios uses are on:
+`aws-lc` (TLS for the lockdown session), `display_stream` (the display service client, offers, RTP/RTCP helpers),
+`core_device_proxy` and `tunnel_tcp_stack` (the CoreDevice tunnel with its userspace TCP/UDP stack), `usbmuxd`,
+`rsd` and `xpc`.
 
-```toml
-idevice = { git = "https://github.com/jkcoxson/idevice", rev = "2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132", version = "0.1.68", default-features = false, features = [
-  "aws-lc", "display_stream", "core_device_proxy", "tunnel_tcp_stack", "usbmuxd", "rsd", "xpc",
-] }
-```
+## Releases
 
-Without access to GitHub, build against a local checkout of it at that commit, with a patch on the command line (the
-tree does not change):
-
-```
-cargo --config "patch.'https://github.com/jkcoxson/idevice'.idevice.path='/path/to/idevice/idevice'" build --release
-```
-
-The patch changes how `Cargo.lock` names `idevice`: leave out `--locked`, and restore the lock afterwards
-(`git checkout -- Cargo.lock`). `cargo vendor` also works, for a fully offline tree.
-
-Only the `idevice` features scrios uses are on: `aws-lc` (TLS for the lockdown session), `display_stream` (the
-display service client, offers, RTP/RTCP helpers), `core_device_proxy` and `tunnel_tcp_stack` (the CoreDevice tunnel
-with its userspace TCP/UDP stack), `usbmuxd`, `rsd` and `xpc`.
+A tag `vX.Y.Z` (it must equal `version` in `Cargo.toml`) runs `.github/workflows/release.yml`: the static musl
+binaries and the macOS one, `SHA256SUMS`, a GitHub release, and `cargo publish` to crates.io.

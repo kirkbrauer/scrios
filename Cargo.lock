@@ -474,7 +474,8 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "idevice"
 version = "0.1.68"
-source = "git+https://github.com/jkcoxson/idevice?rev=2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132#2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5d7799c8497cef60ddfd38f7d92e267b9fa5d0b18e7691d31041453007400ca"
 dependencies = [
  "async-stream",
  "base64 0.22.1",

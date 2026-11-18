@@ -5,9 +5,9 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 It includes or links the third-party Rust crates listed below, each under its own licence (the licences each
 crate offers, as declared in its Cargo.toml; where a crate offers a choice, scrios uses it under any one of them).
-Their licence texts ship with their sources on crates.io (or, for idevice, on GitHub).
+Their licence texts ship with their sources on crates.io.
 
-idevice (https://github.com/jkcoxson/idevice), the implementation of Apple's CoreDevice, RemoteXPC, usbmuxd and
+idevice 0.1.68 (https://github.com/jkcoxson/idevice, https://crates.io/crates/idevice), the implementation of Apple's CoreDevice, RemoteXPC, usbmuxd and
 lockdown protocols that scrios is built on, is:
 
     Copyright 2026 Jackson Coxson

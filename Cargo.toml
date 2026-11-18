@@ -9,7 +9,8 @@ repository = "https://github.com/kirkbrauer/scrios"
 readme = "README.md"
 keywords = ["ios", "screen", "h264", "hevc", "coredevice"]
 categories = ["multimedia::video", "command-line-utilities"]
-publish = false
+# What goes into the crates.io package: the sources and the documents, not the CI, the fuzz harnesses or the scripts.
+include = ["/src/**/*.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/NOTICE", "/BUILD.md", "/docs/*.md"]
 
 [lib]
 name = "scrios"
@@ -20,9 +21,10 @@ name = "scrios"
 path = "src/main.rs"
 
 [dependencies]
-# The CoreDevice display service, tunnel and usbmuxd client (MIT). Pinned by commit; see BUILD.md for
-# building against a local checkout when GitHub is not reachable.
-idevice = { git = "https://github.com/jkcoxson/idevice", rev = "2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132", version = "0.1.68", default-features = false, features = [
+# The CoreDevice display service, tunnel and usbmuxd client (MIT). Pinned EXACTLY (`=`): its API changes between
+# releases, so `cargo update` and downstream resolution must not move it. Bumping it is a deliberate change: update
+# the version here and in the README's "Compatibility" line, run the tests, and smoke-test against a real device.
+idevice = { version = "=0.1.68", default-features = false, features = [
   "aws-lc",
   "display_stream",
   "core_device_proxy",
