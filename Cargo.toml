@@ -10,7 +10,24 @@ readme = "README.md"
 keywords = ["ios", "screen", "h264", "hevc", "coredevice"]
 categories = ["multimedia::video", "command-line-utilities"]
 # What goes into the crates.io package: the sources and the documents, not the CI, the fuzz harnesses or the scripts.
-include = ["/src/**/*.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/NOTICE", "/BUILD.md", "/docs/*.md"]
+include = ["/src/**/*.rs", "/src/**/*.wgsl", "/src/viewer/testdata/*", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/NOTICE", "/BUILD.md", "/docs/*.md"]
+
+[features]
+# The viewer window: `scrios` without a subcommand opens it. On by default for desktop builds; the static Linux
+# release binaries are built `--no-default-features` and stay headless (no window system, no GPU, no video decoder
+# in the binary).
+default = ["viewer"]
+viewer = [
+  "dep:winit",
+  "dep:wgpu",
+  "dep:pollster",
+  "dep:bytemuck",
+  "dep:openh264",
+  "dep:objc2-core-foundation",
+  "dep:objc2-core-media",
+  "dep:objc2-core-video",
+  "dep:objc2-video-toolbox",
+]
 
 [lib]
 name = "scrios"
@@ -52,6 +69,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
+# The viewer (feature `viewer`).
+winit = { version = "0.30", optional = true }
+wgpu = { version = "30", optional = true, default-features = false, features = ["std", "parking_lot", "wgsl", "metal", "vulkan", "gles", "dx12"] }
+pollster = { version = "1", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+# The software H.264 decoder (Cisco's OpenH264, built from source; BSD-2-Clause). To load Cisco's own prebuilt binary
+# at run time instead (it carries Cisco's H.264 patent licence, a build from source does not), see `api()` in
+# src/viewer/decode/software.rs: this line becomes `default-features = false, features = ["libloading"]`.
+openh264 = { version = "0.9", optional = true }
+
 # Platform-only: nothing below is built for the other platform.
 [target.'cfg(unix)'.dependencies]
 # `dup` and `dup2`, to keep the stream's own copy of stdout (see `take_stdout` in main.rs).
@@ -61,6 +88,37 @@ libc = "0.2"
 # `SetStdHandle`, the Windows form of the same (see `take_stdout` in main.rs). Already in the tree through tokio, mio
 # and socket2, at this version: it adds no crate.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+# The macOS hardware decoder: VideoToolbox, through the objc2 project's bindings (generated from Apple's headers).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "CMBase",
+  "CMBlockBuffer",
+  "CMFormatDescription",
+  "CMSampleBuffer",
+  "CMTime",
+  "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "CVBase",
+  "CVBuffer",
+  "CVImageBuffer",
+  "CVPixelBuffer",
+  "CVReturn",
+] }
+objc2-video-toolbox = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "VTBase",
+  "VTDecompressionProperties",
+  "VTDecompressionSession",
+  "VTErrors",
+  "VTSession",
+  "objc2-core-media",
+  "objc2-core-video",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

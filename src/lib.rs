@@ -38,6 +38,8 @@ pub mod session;
 pub mod sink;
 pub mod sps;
 pub mod stream;
+#[cfg(feature = "viewer")]
+pub mod viewer;
 
 #[cfg(test)]
 mod testdir;
