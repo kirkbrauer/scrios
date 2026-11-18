@@ -272,6 +272,7 @@ enum SourceCheck {
     Switch(Vec<(Instant, u16, Vec<u8>)>),
 }
 
+#[derive(Debug)]
 pub struct Engine {
     cfg: EngineConfig,
     queue: Arc<OutQueue>,

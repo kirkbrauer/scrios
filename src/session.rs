@@ -2,6 +2,7 @@
 //! clock. The socket and the clock are traits, so the loop runs against fakes in the tests.
 
 use std::convert::Infallible;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -74,14 +75,31 @@ pub struct DisplayLink<'a> {
     pub pending: Option<DisplayQuery>,
 }
 
+// By hand: the source and the query in flight are `dyn` values, which have no `Debug`.
+impl fmt::Debug for DisplayLink<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DisplayLink")
+            .field("poll_interval", &self.poll_interval)
+            .field("pending", &self.pending.as_ref().map(|_| "a query in flight"))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Touch and keys: the controller and where its actions go.
 pub struct HidLink<'a> {
     pub hid: &'a mut Hid,
     pub backend: &'a mut dyn HidBackend,
 }
 
+// By hand: the backend is a `dyn` value, which has no `Debug`.
+impl fmt::Debug for HidLink<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HidLink").field("hid", &self.hid).finish_non_exhaustive()
+    }
+}
+
 /// What the loop is connected to besides the socket.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Links<'a> {
     pub display: Option<DisplayLink<'a>>,
     pub hid: Option<HidLink<'a>>,

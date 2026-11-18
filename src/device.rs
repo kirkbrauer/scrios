@@ -3,6 +3,7 @@
 //! the device's answer) are plain functions with tests.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -303,6 +304,7 @@ async fn timed<T, F: Future<Output = T>>(what: &str, limit: Duration, fut: F) ->
 // ---- display info ----------------------------------------------------------------------------
 
 /// The CoreDevice `deviceinfo` service: read-only queries about the device.
+#[derive(Debug)]
 pub struct DeviceInfoClient {
     inner: CoreDeviceServiceClient<Box<dyn ReadWrite>>,
 }
@@ -330,6 +332,7 @@ impl DeviceInfoClient {
 }
 
 /// Display queries over one `deviceinfo` connection, one at a time.
+#[derive(Debug)]
 pub struct DisplayInfoClient {
     inner: Arc<tokio::sync::Mutex<Option<DeviceInfoClient>>>,
 }
@@ -363,6 +366,7 @@ impl DisplayInfoSource for DisplayInfoClient {
 // ---- the stream -------------------------------------------------------------------------------
 
 /// The tunnel's UDP socket for the video stream.
+#[derive(Debug)]
 pub struct VideoSocket(UdpSocketHandle);
 
 impl DatagramSocket for VideoSocket {
@@ -403,6 +407,25 @@ pub struct Session {
     first_display: Option<Result<Vec<DisplayInfo>, String>>,
     /// That query, if it is still waiting for its answer.
     pending_display: Option<DisplayQuery>,
+}
+
+// By hand: a query in flight is a `dyn Future`, which has no `Debug`.
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("client", &self.client)
+            .field("adapter", &self.adapter)
+            .field("video", &self.video)
+            .field("audio_drain", &self.audio_drain)
+            .field("stream_requested", &self.stream_requested)
+            .field("our_ssrc", &self.our_ssrc)
+            .field("info", &self.info)
+            .field("handshake", &self.handshake)
+            .field("display", &self.display)
+            .field("first_display", &self.first_display)
+            .field("pending_display", &self.pending_display.as_ref().map(|_| "a query in flight"))
+            .finish()
+    }
 }
 
 impl Session {
@@ -674,7 +697,7 @@ impl Session {
 }
 
 /// The device's HID services: touch reports and hardware buttons.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DeviceHid {
     touch: Option<UniversalHidServiceClient<Box<dyn ReadWrite>>>,
     buttons: Option<IndigoHidClient<Box<dyn ReadWrite>>>,

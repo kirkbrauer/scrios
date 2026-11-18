@@ -24,6 +24,7 @@ pub enum Format {
 }
 
 /// One output: a format and a writer.
+#[derive(Debug)]
 pub struct Sink<W: Write> {
     format: Format,
     out: BufWriter<W>,

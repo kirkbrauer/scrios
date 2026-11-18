@@ -136,7 +136,7 @@ pub enum NalCheck {
 }
 
 /// How a codec splits RTP payloads into NAL units, and which NAL units matter.
-pub trait NalFormat {
+pub trait NalFormat: std::fmt::Debug {
     /// The parameter-set NAL types, in the order they go in front of a key unit.
     const PARAM_TYPES: &'static [u8];
     /// Which of them is the SPS.
@@ -161,6 +161,7 @@ pub trait NalFormat {
 }
 
 /// HEVC, RFC 7798: single NAL unit, aggregation packets (48), fragmentation units (49).
+#[derive(Debug)]
 pub struct Hevc;
 
 impl NalFormat for Hevc {
@@ -267,6 +268,7 @@ impl NalFormat for Hevc {
 /// H.264, RFC 6184 (packetization mode 1): single NAL unit (1..=23), STAP-A (24), FU-A (28). The
 /// interleaved types (STAP-B, MTAP, FU-B) are not supported. A payload of the proprietary kind 18 that
 /// the iPad's display stream sends first is read as a configuration packet (see [`crate::avc::find_avc_config`]).
+#[derive(Debug)]
 pub struct H264;
 
 /// The NAL type the display stream's configuration packet carries (provisional: read off a capture).
@@ -464,7 +466,7 @@ fn note_b_slice(warned: &mut bool) {
 }
 
 /// What a depacketizer offers the engine, whichever the codec.
-pub trait Depacketizer {
+pub trait Depacketizer: std::fmt::Debug {
     /// Feeds one RTP packet; finished units and drops are appended to `out`.
     fn push(&mut self, meta: PacketMeta, payload: &[u8], out: &mut Vec<Output>);
     /// RTP packets declared lost (gaps in the sequence numbers).

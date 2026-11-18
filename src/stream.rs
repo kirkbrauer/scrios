@@ -225,11 +225,12 @@ impl Outcome {
 
 /// A running stream. Cheap to clone: the clones are the same stream, so that one thread can read it while another
 /// waits for its end. Dropping the last one stops the stream.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Stream {
     shared: Arc<Shared>,
 }
 
+#[derive(Debug)]
 struct Shared {
     queue: Arc<OutQueue>,
     gone: Arc<Notify>,
@@ -328,7 +329,7 @@ impl Stream {
 /// connected; otherwise a `hid` event with `ok: false` says so for each. Every method returns whether the command
 /// was queued: `false` means the stream is over (or, from inside an async task, that the command queue is full).
 /// From a thread that is not an async task, sending waits while the queue (64 commands) is full.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Input {
     tx: mpsc::Sender<Command>,
 }

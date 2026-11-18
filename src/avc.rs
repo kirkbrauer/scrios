@@ -828,7 +828,7 @@ pub mod testutil {
     }
 
     /// The HRD parameters of a VUI.
-    #[derive(Clone, Default)]
+    #[derive(Debug, Clone, Default)]
     pub struct HrdSpec {
         pub cpb_cnt_minus1: u32,
         pub bit_rate_scale: u32,
@@ -841,7 +841,7 @@ pub mod testutil {
 
     /// The VUI of an SPS, field by field.
     #[allow(clippy::type_complexity)]
-    #[derive(Clone, Default)]
+    #[derive(Debug, Clone, Default)]
     pub struct VuiSpec {
         /// aspect_ratio_idc, and the SAR for 255.
         pub aspect: Option<(u8, Option<(u16, u16)>)>,
@@ -994,7 +994,7 @@ pub mod testutil {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     pub struct AvcSpsSpec {
         pub sps_id: u32,
         pub profile_idc: u8,

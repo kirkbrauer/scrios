@@ -361,6 +361,7 @@ pub mod testutil {
 
     pub(crate) use super::{BitWriter, escape_rbsp};
 
+    #[derive(Debug)]
     pub struct SpsSpec {
         pub profile_idc: u8,
         pub compat_flags: u32,

@@ -454,6 +454,7 @@ pub trait HidBackend {
 }
 
 /// The backend when control is off: every action fails with a message that says why.
+#[derive(Debug)]
 pub struct NoHid;
 
 impl HidBackend for NoHid {
@@ -509,6 +510,7 @@ struct ReplyLimit {
     held: u64,
 }
 
+#[derive(Debug)]
 pub struct Hid {
     mapping: HidMapping,
     queue: Arc<OutQueue>,
