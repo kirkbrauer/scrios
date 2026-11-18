@@ -15,7 +15,7 @@ pub enum CodecKind {
 /// What an SPS says of the stream, in the terms of the `config` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpsDescription {
-    /// The WebCodecs / RFC 6381 codec string: `hev1.*` or `avc1.PPCCLL`.
+    /// The `WebCodecs` / RFC 6381 codec string: `hev1.*` or `avc1.PPCCLL`.
     pub codec: String,
     /// The picture size the SPS codes.
     pub coded: (u32, u32),
@@ -25,6 +25,7 @@ pub struct SpsDescription {
 
 impl CodecKind {
     /// The RTP payload type the stock offer gives the codec.
+    #[must_use]
     pub fn payload_type(self) -> u8 {
         match self {
             CodecKind::Hevc => 100,
@@ -32,6 +33,7 @@ impl CodecKind {
         }
     }
 
+    #[must_use]
     pub fn depacketizer(self) -> Box<dyn Depacketizer> {
         match self {
             CodecKind::Hevc => Box::new(Assembler::new()),
@@ -40,6 +42,11 @@ impl CodecKind {
     }
 
     /// Reads an SPS NAL unit (with its NAL header, no start code).
+    ///
+    /// # Errors
+    ///
+    /// The text of the SPS parser's error: the NAL unit is not an SPS of this codec, is cut short, or holds a value that
+    /// cannot be right (see [`crate::sps::parse_sps`] and [`crate::avc::parse_avc_sps`]).
     pub fn describe_sps(self, nal: &[u8]) -> Result<SpsDescription, String> {
         match self {
             CodecKind::Hevc => {

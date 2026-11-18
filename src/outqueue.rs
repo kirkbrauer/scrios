@@ -86,10 +86,12 @@ impl Default for OutQueue {
 }
 
 impl OutQueue {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_limits(MAX_QUEUED_UNITS, MAX_QUEUED_BYTES)
     }
 
+    #[must_use]
     pub fn with_limits(max_units: usize, max_bytes: usize) -> Self {
         OutQueue {
             inner: Mutex::new(Inner::default()),
@@ -261,6 +263,10 @@ impl OutQueue {
 
 /// The writer: pops frames and writes each with one flush, until the queue is closed and empty.
 /// Returns the first write error (the reader of stdout went away).
+///
+/// # Errors
+///
+/// The first write or flush error of `out`.
 pub fn run_writer<W: Write>(queue: &OutQueue, out: W) -> io::Result<()> {
     let mut out = io::BufWriter::with_capacity(256 * 1024, out);
     while let Some(frame) = queue.pop() {
@@ -394,9 +400,6 @@ mod tests {
 
     #[test]
     fn the_writer_writes_whole_frames_in_order_from_many_producers() {
-        let q = Arc::new(OutQueue::with_limits(10_000, 1 << 28));
-        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
-
         struct Shared(Arc<Mutex<Vec<u8>>>);
         impl Write for Shared {
             fn write(&mut self, b: &[u8]) -> io::Result<usize> {
@@ -407,6 +410,9 @@ mod tests {
                 Ok(())
             }
         }
+
+        let q = Arc::new(OutQueue::with_limits(10_000, 1 << 28));
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
 
         let writer = {
             let q = q.clone();

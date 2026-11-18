@@ -5,6 +5,7 @@
 //! RTCP datagrams to send are collected for the caller ([`Engine::take_rtcp`]). That keeps all of
 //! the protocol logic testable without a socket or a phone.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,7 @@ pub enum ClockSource {
 }
 
 impl ClockSource {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ClockSource::Default => "default",
@@ -98,12 +100,14 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// For another codec: its depacketizer, its SPS and its RTP payload type.
+    #[must_use]
     pub fn for_codec(mut self, codec: CodecKind) -> Self {
         self.codec = codec;
         self.payload_type = codec.payload_type();
         self
     }
 
+    #[must_use]
     pub fn new(our_ssrc: u32) -> Self {
         EngineConfig {
             our_ssrc,
@@ -113,9 +117,9 @@ impl EngineConfig {
             clock_hz: DEFAULT_CLOCK_HZ,
             clock_source: ClockSource::Default,
             fps: DEFAULT_FPS,
-            rtcp_interval: Some(Duration::from_millis(5000)),
-            keyframe_min_interval: Duration::from_millis(2000),
-            stats_interval: Some(Duration::from_millis(5000)),
+            rtcp_interval: Some(Duration::from_secs(5)),
+            keyframe_min_interval: Duration::from_secs(2),
+            stats_interval: Some(Duration::from_secs(5)),
             visible_size: None,
             device_ssrc: None,
             rtcp_port: None,
@@ -173,13 +177,14 @@ impl PtsClock {
     fn pts_us(&mut self, timestamp: u32) -> u64 {
         if self.started {
             // Signed step, so a 32-bit wrap of the timestamp is no jump.
-            self.ticks += i64::from(timestamp.wrapping_sub(self.last) as i32);
+            self.ticks += i64::from(timestamp.wrapping_sub(self.last).cast_signed());
         } else {
             self.started = true;
             self.ticks = 0;
         }
         self.last = timestamp;
-        let pts = self.anchor_us + (self.ticks.max(0) as u128 * 1_000_000 / u128::from(self.hz)) as u64;
+        let elapsed_us = u128::try_from(self.ticks).unwrap_or(0) * 1_000_000 / u128::from(self.hz);
+        let pts = self.anchor_us + u64::try_from(elapsed_us).unwrap_or(u64::MAX);
         // A unit whose timestamp is behind the one before (a reordered or restarted sender) gets the previous
         // time, never an earlier one: a decoder or a player must not see presentation times go backwards.
         // The ticks go on from where the timestamps are, so the times follow them again once they pass.
@@ -242,14 +247,11 @@ fn clock_correction(current: u32, measured: f64) -> Option<u32> {
     if (measured - cur).abs() / cur <= 0.10 {
         return None;
     }
-    let nearest = CLOCK_CANDIDATES
-        .into_iter()
-        .min_by(|a, b| {
-            let (da, db) =
-                ((measured - f64::from(*a)).abs() / f64::from(*a), (measured - f64::from(*b)).abs() / f64::from(*b));
-            da.total_cmp(&db)
-        })
-        .expect("two candidates");
+    let nearest = CLOCK_CANDIDATES.into_iter().min_by(|a, b| {
+        let (da, db) =
+            ((measured - f64::from(*a)).abs() / f64::from(*a), (measured - f64::from(*b)).abs() / f64::from(*b));
+        da.total_cmp(&db)
+    })?; // two candidates, so there is one nearest
     (nearest != current).then_some(nearest)
 }
 
@@ -272,6 +274,11 @@ enum SourceCheck {
     Switch(Vec<(Instant, u16, Vec<u8>)>),
 }
 
+#[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the engine's state machine: each flag is its own fact (confirmed SSRC, clock checked, a key awaited, a query wanted) and they change independently"
+)]
 pub struct Engine {
     cfg: EngineConfig,
     queue: Arc<OutQueue>,
@@ -476,6 +483,7 @@ impl Engine {
 
     /// The earliest time something needs doing (an RTCP report, a held keyframe request, stats,
     /// the silence checks, the feedback timer).
+    #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         [
             self.limiter.deadline(),
@@ -497,6 +505,7 @@ impl Engine {
     }
 
     /// The port the device listens on for RTCP, once known.
+    #[must_use]
     pub fn rtcp_port(&self) -> Option<u16> {
         self.rtcp_port
     }
@@ -507,6 +516,7 @@ impl Engine {
     }
 
     /// The counters. Access units, bytes and keyframes are what the writer has written.
+    #[must_use]
     pub fn stats(&self) -> Stats {
         let w = self.queue.written();
         Stats {
@@ -522,12 +532,14 @@ impl Engine {
 
     /// The device's SSRC, once known.
     #[cfg(test)]
+    #[must_use]
     pub fn device_ssrc(&self) -> Option<u32> {
         self.device_ssrc
     }
 
     /// The RTP clock rate in use and where it comes from.
     #[cfg(test)]
+    #[must_use]
     pub fn clock(&self) -> (u32, ClockSource) {
         (self.clock_hz, self.clock_source)
     }
@@ -546,6 +558,7 @@ impl Engine {
     }
 
     /// One line for the log: the counters and what the depacketizer saw besides.
+    #[must_use]
     pub fn summary(&self) -> String {
         format!(
             "{:?}; late/duplicate packets {}, units ended without a marker bit {}, parameter sets seen: {}",
@@ -786,8 +799,8 @@ impl Engine {
     /// it is written again.
     pub fn on_display_info(&mut self, result: Result<Vec<DisplayInfo>, String>) {
         match result {
-            Ok(displays) => match primary(&displays) {
-                Some(d) => {
+            Ok(displays) => {
+                if let Some(d) = primary(&displays) {
                     let facts = DisplayFacts::from_display(d);
                     if self.display.as_ref() == Some(&facts) {
                         return; // polled again: nothing changed
@@ -802,9 +815,10 @@ impl Engine {
                         facts.native_orientation
                     );
                     self.display = Some(facts);
+                } else {
+                    warn!("display info lists no display");
                 }
-                None => warn!("display info lists no display"),
-            },
+            }
             Err(e) => {
                 warn!(
                     "display info unavailable ({e}); the picture size is {}",
@@ -906,7 +920,9 @@ impl Engine {
         if self.rtcp_port.is_none() || self.rtp.received() == 0 {
             return;
         }
-        let clock_ms = now.saturating_duration_since(self.started_at).as_millis() as u16;
+        // The report's clock is 16 bits of milliseconds: it wraps every 65.5 s.
+        let clock_ms =
+            u16::try_from(now.saturating_duration_since(self.started_at).as_millis() % 0x1_0000).unwrap_or(0);
         self.outbox.push(build_rctl(self.cfg.our_ssrc, clock_ms, self.frames_received, self.rtp.highest_since_base()));
         self.counters.rtcp += 1;
     }
@@ -934,12 +950,19 @@ const MAX_HEX_BYTES: usize = 32;
 /// The bytes in hex, the first [`MAX_HEX_BYTES`] of them, then `...` and the length if there are more (the
 /// device can send an SPS of any size up to the packet's, and the message goes to the log).
 fn hex(b: &[u8]) -> String {
-    let shown: String = b.iter().take(MAX_HEX_BYTES).map(|x| format!("{x:02x}")).collect();
+    let shown = b.iter().take(MAX_HEX_BYTES).fold(String::new(), |mut s, x| {
+        let _ = write!(s, "{x:02x}");
+        s
+    });
     if b.len() > MAX_HEX_BYTES { format!("{shown}... ({} bytes in all)", b.len()) } else { shown }
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use super::*;
     use crate::depack::testutil::*;
     use crate::frame::{FLAG_CONTROL, FLAG_KEY, FLAG_PARAMS};
@@ -1310,14 +1333,14 @@ mod tests {
     #[test]
     fn receiver_reports_go_out_every_interval_with_our_ssrc_and_a_block_for_the_device() {
         let mut r = Rig::with(|c| {
-            c.rtcp_interval = Some(Duration::from_millis(5000));
+            c.rtcp_interval = Some(Duration::from_secs(5));
             no_stall(c);
         });
         r.idr(0, true);
         r.delta(10);
         r.delta(20);
         assert!(r.eng.take_rtcp().is_empty());
-        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_millis(5000)));
+        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_secs(5)));
         r.eng.on_tick(r.at(4999));
         assert!(r.eng.take_rtcp().is_empty());
         r.eng.on_tick(r.at(5000));
@@ -1363,7 +1386,7 @@ mod tests {
             no_stall(c);
         });
         r.idr(0, true);
-        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_millis(5000)), "only the stats tick");
+        assert_eq!(r.eng.next_deadline().map(|d| d - r.t0), Some(Duration::from_secs(5)), "only the stats tick");
         r.eng.on_tick(r.at(5000));
         assert!(r.eng.take_rtcp().is_empty());
     }
@@ -1449,7 +1472,7 @@ mod tests {
     fn other_payload_types_and_junk_are_ignored() {
         let mut r = Rig::new();
         let mut other = rtp_bytes(1, 1, true, DEV, &trail(&[1; 4]));
-        other[1] = 96 | 0x80;
+        other[1] = 0x60 | 0x80;
         r.eng.on_datagram(r.at(1), PORT, &other);
         r.eng.on_datagram(r.at(2), PORT, &[1, 2, 3]);
         r.eng.on_datagram(r.at(3), PORT, &[]);
@@ -1587,7 +1610,7 @@ mod tests {
 
     #[test]
     fn stats_events_come_at_the_interval_and_count_since_start() {
-        let mut r = Rig::with(|c| c.stats_interval = Some(Duration::from_millis(5000)));
+        let mut r = Rig::with(|c| c.stats_interval = Some(Duration::from_secs(5)));
         r.idr(0, true);
         r.delta(10);
         r.frames();
@@ -2006,7 +2029,7 @@ mod tests {
             fn sent_sps() -> Vec<u8> {
                 match crate::avc::add_bitstream_restriction(&Self::sps()).unwrap() {
                     crate::avc::SpsRewrite::Patched(p) => p,
-                    other => panic!("{other:?}"),
+                    other @ crate::avc::SpsRewrite::AlreadyRestricted(_) => panic!("{other:?}"),
                 }
             }
 
@@ -2053,7 +2076,7 @@ mod tests {
             assert_eq!((s.access_units, s.keyframes, s.dropped_units), (2, 1, 0));
         }
 
-        /// A non-IDR slice with the given slice_type in its header.
+        /// A non-IDR slice with the given `slice_type` in its header.
         fn typed_slice(slice_type: u32) -> Vec<u8> {
             let mut w = crate::sps::testutil::BitWriter::default();
             w.ue(0);
@@ -2071,16 +2094,16 @@ mod tests {
         fn b_slices_are_counted_in_the_stats_and_the_stream_goes_on_unchanged() {
             let mut r = H264Rig::new();
             r.idr(0, true);
-            let b = typed_slice(1);
-            let p = typed_slice(0);
-            r.pkt(10, true, &p);
+            let b_slice = typed_slice(1);
+            let p_slice = typed_slice(0);
+            r.pkt(10, true, &p_slice);
             r.ts += 3000;
             assert_eq!(r.eng.stats().b_slices, 0);
-            r.pkt(20, true, &b);
+            r.pkt(20, true, &b_slice);
             r.ts += 3000;
             r.pkt(30, true, &typed_slice(6));
             r.ts += 3000;
-            r.pkt(40, true, &p);
+            r.pkt(40, true, &p_slice);
             let f = r.q.drain();
             let s = r.eng.stats();
             assert_eq!(s.b_slices, 2);
@@ -2088,7 +2111,7 @@ mod tests {
             assert_eq!((s.access_units, s.keyframes, s.dropped_units), (5, 1, 0));
             let units: Vec<_> = f.iter().filter(|f| !f.is_control_frame()).collect();
             assert_eq!(units.len(), 5);
-            assert_eq!(units[2].payload, [&[0u8, 0, 0, 1][..], &b[..]].concat());
+            assert_eq!(units[2].payload, [&[0u8, 0, 0, 1][..], &b_slice[..]].concat());
             assert!(units.windows(2).all(|w| w[0].pts_us <= w[1].pts_us));
             // And the stats line carries the count.
             let line = crate::frame::Frame::control(&crate::frame::Event::Stats(s));
@@ -2156,7 +2179,7 @@ mod tests {
         fn payload_types_of_the_other_codec_are_ignored() {
             let mut r = H264Rig::new();
             let mut d = rtp_bytes(1, 1, true, DEV, &slice(&[1; 4]));
-            d[1] = 100 | 0x80; // an HEVC payload type
+            d[1] = 0x64 | 0x80; // an HEVC payload type (100)
             r.eng.on_datagram(r.at(1), PORT, &d);
             assert_eq!(r.eng.stats().packets, 0);
         }

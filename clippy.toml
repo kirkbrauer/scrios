@@ -1,0 +1,4 @@
+# unwrap_used and expect_used are on in Cargo.toml ([lints.clippy]) for the code that ships; in a test a failed
+# unwrap is a failed test, which is what it is for.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

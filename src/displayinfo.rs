@@ -1,4 +1,4 @@
-//! The primary display's size and orientation, from the CoreDevice `deviceinfo` service.
+//! The primary display's size and orientation, from the `CoreDevice` `deviceinfo` service.
 //!
 //! The service answers the read-only feature `com.apple.coredevice.feature.getdisplayinfo` with a
 //! `displays` array; each display has `displayId`, `name`, `primary`, `external`, `nativeSize`
@@ -35,12 +35,14 @@ impl DisplayInfo {
     /// How far the framebuffer must be turned clockwise to be upright: the degrees of the current
     /// orientation (`rot90` means 90). Checked on an iPad by the integrator; the native orientation
     /// is not part of it (it is reported as it is).
+    #[must_use]
     pub fn rotation(&self) -> Option<u16> {
         orientation_degrees(self.current_orientation.as_deref()?)
     }
 }
 
 /// `rot0`, `rot90`, `rot180`, `rot270` (or just the number) as degrees.
+#[must_use]
 pub fn orientation_degrees(s: &str) -> Option<u16> {
     let n: u16 = s.trim().strip_prefix("rot").unwrap_or(s.trim()).parse().ok()?;
     (n.is_multiple_of(90) && n < 360).then_some(n)
@@ -48,6 +50,7 @@ pub fn orientation_degrees(s: &str) -> Option<u16> {
 
 /// The display the screen is on: the primary one that is not external, else any primary one,
 /// else the first.
+#[must_use]
 pub fn primary(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
     displays
         .iter()
@@ -56,6 +59,8 @@ pub fn primary(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
         .or_else(|| displays.first())
 }
 
+// A plist integer is read as a double; one above 2^53 is no display size and loses a few low bits.
+#[expect(clippy::cast_precision_loss, reason = "see above: display sizes and ids are small")]
 fn as_f64(v: &plist::Value) -> Option<f64> {
     match v {
         plist::Value::Real(r) => Some(*r),
@@ -85,6 +90,11 @@ fn as_string(v: &plist::Value) -> Option<String> {
 }
 
 /// `[w, h]`, or `{"width": w, "height": h}`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "both sides are checked to be in 1..=65536"
+)]
 fn as_size(v: &plist::Value) -> Option<(u32, u32)> {
     let (w, h) = match v {
         plist::Value::Array(a) if a.len() == 2 => (as_f64(&a[0])?, as_f64(&a[1])?),
@@ -111,8 +121,10 @@ fn find<'a>(v: &'a plist::Value, key: &str, depth: u32) -> Option<&'a plist::Val
 
 fn parse_display(d: &plist::Dictionary) -> Option<DisplayInfo> {
     let native_size = as_size(d.get("nativeSize")?)?;
+    #[expect(clippy::cast_possible_truncation, reason = "a float-to-int `as` saturates, and an id is a small integer")]
+    let display_id = d.get("displayId").and_then(as_f64).map(|n| n as i64);
     Some(DisplayInfo {
-        display_id: d.get("displayId").and_then(as_f64).map(|n| n as i64),
+        display_id,
         name: d.get("name").and_then(as_string).unwrap_or_default(),
         primary: d.get("primary").and_then(as_bool).unwrap_or(false),
         external: d.get("external").and_then(as_bool).unwrap_or(false),
@@ -125,6 +137,10 @@ fn parse_display(d: &plist::Dictionary) -> Option<DisplayInfo> {
 
 /// Reads the `displays` array of a `getdisplayinfo` reply. Displays without a usable `nativeSize`
 /// are skipped; no usable display at all is an error.
+///
+/// # Errors
+///
+/// A message if the reply has no `displays` array, or none of its displays has a usable `nativeSize`.
 pub fn parse_display_info(reply: &plist::Value) -> Result<Vec<DisplayInfo>, String> {
     let displays = find(reply, "displays", 0).and_then(|v| v.as_array()).ok_or("the reply has no `displays` array")?;
     let parsed: Vec<DisplayInfo> = displays.iter().filter_map(|d| d.as_dictionary().and_then(parse_display)).collect();
@@ -136,6 +152,10 @@ pub fn parse_display_info(reply: &plist::Value) -> Result<Vec<DisplayInfo>, Stri
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_precision_loss,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use super::*;
 
     fn int(n: i64) -> plist::Value {
@@ -154,7 +174,7 @@ mod tests {
         plist::Value::Dictionary(d)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "a test builder: one argument per key of the display's dictionary")]
     fn display(
         id: i64,
         name: &str,

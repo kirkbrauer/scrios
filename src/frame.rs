@@ -34,12 +34,14 @@ pub struct Frame {
 
 impl Frame {
     /// An access-unit frame.
+    #[must_use]
     pub fn unit(pts_us: u64, key: bool, params: bool, payload: Vec<u8>) -> Frame {
         Frame { pts_us, flags: unit_flags(key, params), payload }
     }
 
     /// A control frame carrying `event` as JSON (pts is 0). A `config` event carries the protocol version
     /// ([`PROTOCOL_VERSION`]) as its last field.
+    #[must_use]
     pub fn control(event: &Event) -> Frame {
         // Serializing these plain structs cannot fail; fall back to an error object anyway.
         let encoded = match event {
@@ -50,32 +52,44 @@ impl Frame {
         Frame { pts_us: 0, flags: FLAG_CONTROL, payload }
     }
 
+    #[must_use]
     pub fn is_control_frame(&self) -> bool {
         self.flags & FLAG_CONTROL != 0
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn is_control(&self) -> bool {
         self.is_control_frame()
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn is_key(&self) -> bool {
         self.flags & FLAG_KEY != 0
     }
 
     /// The 13 header bytes.
+    #[must_use]
     pub fn header(&self) -> [u8; HEADER_LEN] {
         header(self.payload.len(), self.pts_us, self.flags)
     }
 
     /// Writes header and payload with one `write_all` each (the caller buffers and flushes).
     /// A payload over [`MAX_PAYLOAD`] is an error and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// The writer's error, or `InvalidInput` for a payload over [`MAX_PAYLOAD`].
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         write_frame(w, self.pts_us, self.flags, &self.payload)
     }
 
     /// The whole frame as one buffer.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Frame::write_to`].
     #[cfg(test)]
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut v = Vec::with_capacity(HEADER_LEN + self.payload.len());
@@ -85,6 +99,7 @@ impl Frame {
 }
 
 /// The flags of an access-unit frame.
+#[must_use]
 pub fn unit_flags(key: bool, params: bool) -> u8 {
     let mut flags = 0;
     if key {
@@ -99,7 +114,8 @@ pub fn unit_flags(key: bool, params: bool) -> u8 {
 /// The 13 header bytes of a frame whose payload is `len` bytes.
 fn header(len: usize, pts_us: u64, flags: u8) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
-    h[0..4].copy_from_slice(&(len as u32).to_be_bytes());
+    // A payload is at most MAX_PAYLOAD (16 MiB): the callers refuse more.
+    h[0..4].copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes());
     h[4..12].copy_from_slice(&pts_us.to_be_bytes());
     h[12] = flags;
     h
@@ -108,6 +124,10 @@ fn header(len: usize, pts_us: u64, flags: u8) -> [u8; HEADER_LEN] {
 /// Writes one frame from its parts (what [`Frame::write_to`] does, for a payload that is not owned by a `Frame`):
 /// the header and the payload with one `write_all` each. A payload over [`MAX_PAYLOAD`] is an error and nothing
 /// is written.
+///
+/// # Errors
+///
+/// The writer's error, or `InvalidInput` for a payload over [`MAX_PAYLOAD`].
 pub fn write_frame<W: Write>(w: &mut W, pts_us: u64, flags: u8, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_PAYLOAD {
         return Err(io::Error::new(
@@ -136,7 +156,7 @@ struct Versioned<'a> {
 pub enum Event {
     /// Sent once before the first access unit, and again whenever the SPS changes.
     Config {
-        /// RFC 6381 / WebCodecs codec string built from the SPS, e.g. `hev1.1.6.L150.B0`.
+        /// RFC 6381 / `WebCodecs` codec string built from the SPS, e.g. `hev1.1.6.L150.B0`.
         codec: String,
         /// Visible size of the screen.
         width: u32,
@@ -236,22 +256,30 @@ pub struct Stats {
 }
 
 /// Decodes one frame from the front of `buf` (tests and tools): the frame and the bytes used.
+///
+/// # Errors
+///
+/// A message if `buf` is shorter than a header or than the frame it declares, or the frame is over [`MAX_PAYLOAD`].
 #[cfg(test)]
 pub fn decode(buf: &[u8]) -> Result<(Frame, usize), String> {
     if buf.len() < HEADER_LEN {
         return Err("short header".into());
     }
-    let len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if len > MAX_PAYLOAD {
         return Err("too long".into());
     }
-    let pts_us = u64::from_be_bytes(buf[4..12].try_into().unwrap());
+    let pts_us = u64::from_be_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
     let flags = buf[12];
     let payload = buf.get(HEADER_LEN..HEADER_LEN + len).ok_or("short payload")?.to_vec();
     Ok((Frame { pts_us, flags, payload }, HEADER_LEN + len))
 }
 
 /// Splits a byte stream into frames (tests).
+///
+/// # Errors
+///
+/// The first message of [`decode`]: what is left of `buf` is not a whole frame.
 #[cfg(test)]
 pub fn decode_all(mut buf: &[u8]) -> Result<Vec<Frame>, String> {
     let mut out = Vec::new();

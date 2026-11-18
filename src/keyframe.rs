@@ -23,6 +23,7 @@ pub struct KeyframeLimiter {
 }
 
 impl KeyframeLimiter {
+    #[must_use]
     pub fn new(min_interval: Duration) -> Self {
         KeyframeLimiter { min_interval, last_sent: None, pending: false }
     }
@@ -59,6 +60,7 @@ impl KeyframeLimiter {
     }
 
     /// When a coalesced request becomes due (None if nothing is waiting).
+    #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
         if !self.pending {
             return None;
@@ -72,6 +74,7 @@ impl KeyframeLimiter {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         self.pending
     }
@@ -88,7 +91,7 @@ mod tests {
     #[test]
     fn the_first_request_goes_out_at_once() {
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         assert_eq!(k.request(t0), Decision::SendNow);
         assert_eq!(k.deadline(), None);
     }
@@ -96,7 +99,7 @@ mod tests {
     #[test]
     fn a_request_inside_the_window_is_coalesced_and_released_when_it_ends() {
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         assert_eq!(k.request(t0), Decision::SendNow);
         assert_eq!(k.request(ms(t0, 100)), Decision::Coalesced);
         assert_eq!(k.deadline(), Some(ms(t0, 2000)));
@@ -111,7 +114,7 @@ mod tests {
     #[test]
     fn many_requests_in_one_window_become_one() {
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         assert_eq!(k.request(t0), Decision::SendNow);
         for i in 1..50 {
             assert_eq!(k.request(ms(t0, i * 10)), Decision::Coalesced);
@@ -128,7 +131,7 @@ mod tests {
     #[test]
     fn the_released_request_starts_a_new_window() {
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         k.request(t0);
         k.request(ms(t0, 10));
         assert!(k.poll(ms(t0, 2000)));
@@ -142,7 +145,7 @@ mod tests {
     #[test]
     fn a_request_after_a_quiet_window_is_sent_at_once() {
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         k.request(t0);
         assert_eq!(k.request(ms(t0, 2000)), Decision::SendNow);
         assert_eq!(k.request(ms(t0, 9000)), Decision::SendNow);
@@ -152,7 +155,7 @@ mod tests {
     fn never_two_sends_closer_than_the_interval() {
         // Hammer it with requests and polls at 7 ms steps and check the gaps between sends.
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         let mut sends = Vec::new();
         for step in 0..3000u64 {
             let now = ms(t0, step * 7);
@@ -165,14 +168,14 @@ mod tests {
         }
         assert!(sends.len() >= 9);
         for w in sends.windows(2) {
-            assert!(w[1] - w[0] >= Duration::from_millis(2000));
+            assert!(w[1] - w[0] >= Duration::from_secs(2));
         }
     }
 
     #[test]
     fn cancelling_drops_the_held_request_but_not_the_window() {
         let t0 = Instant::now();
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         k.request(t0);
         k.request(ms(t0, 5));
         assert!(k.is_pending());
@@ -181,7 +184,7 @@ mod tests {
         assert_eq!(k.deadline(), None);
         assert!(!k.poll(ms(t0, 3000)));
         // The window since the last send still applies to a new request.
-        let mut k = KeyframeLimiter::new(Duration::from_millis(2000));
+        let mut k = KeyframeLimiter::new(Duration::from_secs(2));
         k.request(t0);
         k.cancel_pending();
         assert_eq!(k.request(ms(t0, 1000)), Decision::Coalesced);

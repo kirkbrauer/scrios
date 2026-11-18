@@ -138,8 +138,11 @@ enum Cmd {
 
 #[derive(Args, Debug)]
 struct ListArgs {
-    /// usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)
-    #[arg(long, value_name = "PATH|HOST:PORT")]
+    #[arg(
+        long,
+        value_name = "PATH|HOST:PORT",
+        help = "usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)"
+    )]
     usbmuxd: Option<String>,
 }
 
@@ -167,8 +170,11 @@ struct StreamArgs {
     #[arg(short = 's', long, value_name = "UDID")]
     udid: Option<String>,
 
-    /// usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)
-    #[arg(long, value_name = "PATH|HOST:PORT")]
+    #[arg(
+        long,
+        value_name = "PATH|HOST:PORT",
+        help = "usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)"
+    )]
     usbmuxd: Option<String>,
 
     /// The display to stream (1 is the built-in display)
@@ -216,6 +222,10 @@ struct StreamArgs {
 }
 
 #[derive(Args, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "command-line switches: each flag is its own option, and they do not form a state"
+)]
 struct AdvancedArgs {
     /// Override of the picture's visible size, e.g. 1206x2622 (default: the primary display's size from
     /// the device, else the conformance window of the SPS, else its size)
@@ -456,10 +466,13 @@ fn init_logging() {
 /// Takes stdout for the stream: the descriptor is duplicated and fd 1 is pointed at stderr,
 /// so a stray print anywhere in the process cannot corrupt the stream.
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "dup, dup2 and a File from the descriptor dup returned: no safe API does this")]
 fn take_stdout() -> std::io::Result<File> {
     use std::os::fd::FromRawFd;
-    // SAFETY: dup and dup2 on this process's own standard descriptors; the new descriptor is
-    // handed to exactly one File.
+    // SAFETY: `dup(1)` returns a new descriptor that nothing else owns, or -1, which is checked before it is used.
+    // `dup2(2, 1)` only points descriptor 1, which the process owns, at descriptor 2. `close` is called on the new
+    // descriptor once, on the path where it is not given to a `File`. `File::from_raw_fd` takes that open descriptor
+    // over exactly once, so it is closed exactly once (when the `File` is dropped).
     unsafe {
         let fd = libc::dup(1);
         if fd < 0 {
@@ -518,12 +531,9 @@ fn consume(stream: &Stream, mut outputs: Vec<Output>) {
 /// SIGTERM and SIGINT are a `stop`.
 async fn stop_on_signals(tx: mpsc::Sender<Command>) {
     use tokio::signal::unix::{SignalKind, signal};
-    let (mut term, mut int) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
-        (Ok(t), Ok(i)) => (t, i),
-        _ => {
-            warn!("cannot install the signal handlers");
-            return;
-        }
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        warn!("cannot install the signal handlers");
+        return;
     };
     loop {
         tokio::select! {
@@ -668,10 +678,10 @@ mod tests {
     use scrios::offer::{Codec, OfferFlags};
 
     fn stream_args(args: &[&str]) -> StreamArgs {
-        let argv = std::iter::once("scrios").chain(args.iter().copied());
-        match Cli::parse_from(argv).action() {
+        let command_line = std::iter::once("scrios").chain(args.iter().copied());
+        match Cli::parse_from(command_line).action() {
             Action::Stream(a) => *a,
-            other => panic!("not a stream: {other:?}"),
+            other @ Action::List { .. } => panic!("not a stream: {other:?}"),
         }
     }
 
@@ -726,18 +736,18 @@ mod tests {
                 assert_eq!(a.udid.as_deref(), Some("U"));
                 assert_eq!(a.format(), Format::Framed);
             }
-            other => panic!("{other:?}"),
+            other @ Action::List { .. } => panic!("{other:?}"),
         }
         assert!(matches!(Cli::parse_from(["scrios", "list"]).action(), Action::List { usbmuxd: None }));
         match Cli::parse_from(["scrios", "list", "--usbmuxd", "127.0.0.1:27015"]).action() {
             Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("127.0.0.1:27015")),
-            other => panic!("{other:?}"),
+            other @ Action::Stream(_) => panic!("{other:?}"),
         }
         // --list-devices is `list` (and takes --usbmuxd).
         assert!(matches!(Cli::parse_from(["scrios", "--list-devices"]).action(), Action::List { usbmuxd: None }));
         match Cli::parse_from(["scrios", "--list-devices", "--usbmuxd", "/tmp/mux"]).action() {
             Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("/tmp/mux")),
-            other => panic!("{other:?}"),
+            other @ Action::Stream(_) => panic!("{other:?}"),
         }
         // The stream's options do not mix with a subcommand's position, and a stranger is refused.
         assert!(Cli::try_parse_from(["scrios", "--udid", "U", "list"]).is_err());
@@ -768,12 +778,12 @@ mod tests {
         assert_eq!(o.udid, None);
         assert_eq!(o.display_id, 1);
         assert_eq!(o.visible_size, None);
-        assert_eq!(o.rtcp_interval, Some(Duration::from_millis(5000)));
-        assert_eq!(o.keyframe_min_interval, Duration::from_millis(2000));
-        assert_eq!(o.stats_interval, Some(Duration::from_millis(5000)));
-        assert_eq!(o.rtp_stall_keyframe, Some(Duration::from_millis(5000)));
-        assert_eq!(o.rtp_stall_timeout, Some(Duration::from_millis(15000)));
-        assert_eq!(o.display_poll, Some(Duration::from_millis(1000)));
+        assert_eq!(o.rtcp_interval, Some(Duration::from_secs(5)));
+        assert_eq!(o.keyframe_min_interval, Duration::from_secs(2));
+        assert_eq!(o.stats_interval, Some(Duration::from_secs(5)));
+        assert_eq!(o.rtp_stall_keyframe, Some(Duration::from_secs(5)));
+        assert_eq!(o.rtp_stall_timeout, Some(Duration::from_secs(15)));
+        assert_eq!(o.display_poll, Some(Duration::from_secs(1)));
         assert!(!o.device_hub_feedback);
         assert!(o.control);
         assert!(o.probe.is_none());

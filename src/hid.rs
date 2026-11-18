@@ -73,6 +73,7 @@ pub struct Axes {
 }
 
 impl Axes {
+    #[must_use]
     pub fn apply(self, (a, b): (f64, f64)) -> (f64, f64) {
         let (mut x, mut y) = if self.swap_xy { (b, a) } else { (a, b) };
         if self.flip_x {
@@ -91,6 +92,7 @@ impl Axes {
     }
 
     /// `self` first, then `other`, as one transform in the same form.
+    #[must_use]
     pub fn then(self, other: Axes) -> Axes {
         let first = self.terms();
         let second = other.terms();
@@ -110,6 +112,7 @@ impl Axes {
 /// The automatic mapping: the framebuffer point turned clockwise by `(360 - native) % 360` to the
 /// digitizer's point, as swaps and flips. `None` if the native orientation is unknown or not a right
 /// angle.
+#[must_use]
 pub fn auto_axes(native_degrees: Option<u16>) -> Option<Axes> {
     Some(match native_degrees? {
         0 => Axes::default(),
@@ -170,6 +173,7 @@ fn axis_fraction(p: f64, size: u32) -> f64 {
 /// turned to be upright; `upright_w` x `upright_h` is the upright picture. The first pixel of an
 /// axis is 0.0 and the last (size - 1) is 1.0; positions outside the picture are clamped to its edge;
 /// a rotation that is not a right angle counts as 0.
+#[must_use]
 pub fn panel_position(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) -> (f64, f64) {
     let (ux, uy) = (axis_fraction(x, upright_w), axis_fraction(y, upright_h));
     // Turning the framebuffer clockwise by r gives the upright picture; this is the inverse.
@@ -181,6 +185,11 @@ pub fn panel_position(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: 
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 0..=AXIS_MAX, which is a u16's range"
+)]
 fn to_axis(f: f64) -> u16 {
     (f * AXIS_MAX).round().clamp(0.0, AXIS_MAX) as u16
 }
@@ -205,6 +214,7 @@ fn picture_edges(px: f64, py: f64, upright_w: u32, upright_h: u32) -> Option<Str
 /// The log line for a touch `down` that lands on the very edge of the digitizer (its mapped x or y
 /// is 0 or 65535), or `None` for a touch that does not. `px` and `py` are the upright picture
 /// position as it came; the edge named is the picture's own (a corner names both sides).
+#[must_use]
 pub fn edge_down_message(x: u16, y: u16, px: f64, py: f64, upright_w: u32, upright_h: u32) -> Option<String> {
     let at_limit = |v: u16| v == 0 || f64::from(v) == AXIS_MAX;
     if !at_limit(x) && !at_limit(y) {
@@ -216,6 +226,7 @@ pub fn edge_down_message(x: u16, y: u16, px: f64, py: f64, upright_w: u32, uprig
 
 /// Maps an upright picture position (pixels) to the digitizer's normalized 0..=65535 space, in the
 /// framebuffer's own axes: the inverse of turning the framebuffer clockwise by `rotation`.
+#[must_use]
 pub fn map_touch(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) -> (u16, u16) {
     let (fx, fy) = panel_position(x, y, upright_w, upright_h, rotation);
     (to_axis(fx), to_axis(fy))
@@ -223,6 +234,7 @@ pub fn map_touch(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) 
 
 impl HidMapping {
     /// The mapping in effect, given the display's native orientation in degrees (if known).
+    #[must_use]
     pub fn effective(&self, native_degrees: Option<u16>) -> Effective {
         let user = Axes { swap_xy: self.swap_xy, flip_x: self.flip_x, flip_y: self.flip_y };
         match self.space {
@@ -237,6 +249,7 @@ impl HidMapping {
 
     /// An upright picture position (pixels) to the digitizer's 0..=65535 axes.
     /// `native_degrees` is the primary display's native orientation, if the device said.
+    #[must_use]
     pub fn map(
         &self,
         x: f64,
@@ -269,6 +282,7 @@ pub struct View {
 
 impl View {
     /// The size of the upright picture: the framebuffer's, with the sides swapped for 90 and 270.
+    #[must_use]
     pub fn upright_size(&self) -> (u32, u32) {
         match self.rotation % 360 {
             90 | 270 => (self.height, self.width),
@@ -278,6 +292,7 @@ impl View {
 }
 
 /// A `hid` event that carries the mapping in effect (and, for `ready`, the state of the service).
+#[must_use]
 pub fn mapping_event(ready: Option<bool>, message: Option<String>, effective: &Effective) -> Event {
     Event::Hid(HidEvent {
         ready,
@@ -309,6 +324,7 @@ pub enum Action {
 
 impl Action {
     /// How long the backend may take to perform it.
+    #[must_use]
     pub fn timeout(self) -> Duration {
         match self {
             // Taking the keyboard down asks the device to list its surfaces to confirm it is gone.
@@ -319,6 +335,7 @@ impl Action {
 
     /// Whether it lets go of something (a lift, a button or key up, the keyboard released or removed). These
     /// are never refused by a full [`ActionQueue`]: what is held down must come up.
+    #[must_use]
     pub fn is_release(self) -> bool {
         match self {
             Action::Touch { down, .. } | Action::Button { down, .. } | Action::Key { down, .. } => !down,
@@ -391,10 +408,12 @@ impl ActionQueue {
         before - self.items.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -402,12 +421,14 @@ impl ActionQueue {
 
 /// The US keyboard layout: the usage of the key that types `c`, and whether Shift is needed. Letters,
 /// digits, the printable ASCII punctuation, space, newline (Return) and tab; nothing else.
+#[must_use]
 pub fn us_layout(c: char) -> Option<(u8, bool)> {
-    let n = c as u32;
+    // Only ASCII has a usage (the arms below), so a character that is not a byte has none.
+    let n = u8::try_from(c).ok()?;
     Some(match c {
-        'a'..='z' => (0x04 + (n - 'a' as u32) as u8, false),
-        'A'..='Z' => (0x04 + (n - 'A' as u32) as u8, true),
-        '1'..='9' => (0x1E + (n - '1' as u32) as u8, false),
+        'a'..='z' => (0x04 + (n - b'a'), false),
+        'A'..='Z' => (0x04 + (n - b'A'), true),
+        '1'..='9' => (0x1E + (n - b'1'), false),
         '0' => (0x27, false),
         '\n' => (0x28, false), // Return
         '\t' => (0x2B, false), // Tab
@@ -454,6 +475,7 @@ pub trait HidBackend {
 }
 
 /// The backend when control is off: every action fails with a message that says why.
+#[derive(Debug)]
 pub struct NoHid;
 
 impl HidBackend for NoHid {
@@ -509,6 +531,7 @@ struct ReplyLimit {
     held: u64,
 }
 
+#[derive(Debug)]
 pub struct Hid {
     mapping: HidMapping,
     queue: Arc<OutQueue>,
@@ -573,6 +596,7 @@ impl Hid {
     }
 
     /// The mapping this controller uses for a display with the given native orientation.
+    #[must_use]
     pub fn effective(&self, native_degrees: Option<u16>) -> Effective {
         self.mapping.effective(native_degrees)
     }
@@ -582,6 +606,7 @@ impl Hid {
     }
 
     /// When a held move or a key release is due.
+    #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         let move_due = self.pending_move.and(self.last_touch_sent).map(|t| t + MOVE_INTERVAL);
         let key_due = self.keys_down.iter().map(|k| k.at).chain(self.button_steps.front().map(|s| s.at)).min();
@@ -591,6 +616,7 @@ impl Hid {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn finger_down(&self) -> bool {
         self.finger.is_some()
     }
@@ -733,8 +759,8 @@ impl Hid {
                 self.typing.iter_mut().for_each(|s| s.at += lag);
             }
         }
-        while self.typing.front().is_some_and(|s| s.at <= now) {
-            let step = self.typing.pop_front().expect("checked");
+        while let Some(step) = self.typing.front().filter(|s| s.at <= now).copied() {
+            self.typing.pop_front();
             self.kb_last = Some(now);
             match step.op {
                 TypeOp::ShiftDown => {
@@ -918,7 +944,7 @@ impl Hid {
             self.actions.push(Action::Button { page: step.page, code: step.code, down: step.down });
         }
         while let Some(i) = self.keys_down.iter().position(|k| k.at <= now) {
-            let k = self.keys_down.remove(i).expect("position is in range");
+            let Some(k) = self.keys_down.remove(i) else { break }; // `i` is a position, so in range
             self.actions.push(Action::Button { page: k.page, code: k.code, down: false });
         }
     }
@@ -947,6 +973,12 @@ impl Hid {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use super::*;
 
     fn ms(t0: Instant, n: u64) -> Instant {
@@ -2072,7 +2104,7 @@ mod tests {
         [(0.0, ly / 2.0), (lx, ly / 2.0), (lx / 2.0, 0.0), (lx / 2.0, ly), (0.0, 0.0), (lx, 0.0), (0.0, ly), (lx, ly)]
     }
 
-    fn mapped(m: &HidMapping, w: u32, h: u32, rotation: u16, native: Option<u16>) -> [(u16, u16); 8] {
+    fn mapped(m: HidMapping, w: u32, h: u32, rotation: u16, native: Option<u16>) -> [(u16, u16); 8] {
         edge_points(w, h).map(|(x, y)| m.map(x, y, w, h, rotation, native))
     }
 
@@ -2091,7 +2123,7 @@ mod tests {
         for (rotation, want) in expected {
             // The iPad's framebuffer is 2388x1668; upright it is that, or turned a quarter, 1668x2388.
             let (w, h) = if rotation % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
-            assert_eq!(mapped(&panel, w, h, rotation, None), want, "rotation {rotation}");
+            assert_eq!(mapped(panel, w, h, rotation, None), want, "rotation {rotation}");
             assert_eq!(
                 map_touch(0.0, 0.0, w, h, rotation),
                 want[4],
@@ -2108,18 +2140,18 @@ mod tests {
         // becomes (1 - fy, fx); with it turned 90 (the picture portrait, 1668x2388) the two turns
         // cancel and the digitizer's axes are the upright ones.
         assert_eq!(
-            mapped(&auto, 2388, 1668, 0, Some(270)),
+            mapped(auto, 2388, 1668, 0, Some(270)),
             [(mid, 0), (mid, m), (m, mid), (0, mid), (m, 0), (m, m), (0, 0), (0, m)]
         );
         assert_eq!(
-            mapped(&auto, 1668, 2388, 90, Some(270)),
+            mapped(auto, 1668, 2388, 90, Some(270)),
             [(0, mid), (m, mid), (mid, 0), (mid, m), (0, 0), (m, 0), (0, m), (m, m)]
         );
         // Whatever the rotation: an edge is a limit on exactly one axis (the other is the middle), a
         // corner is a limit on both.
         for rotation in [0, 90, 180, 270] {
             let (w, h) = if rotation % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
-            let got = mapped(&auto, w, h, rotation, Some(270));
+            let got = mapped(auto, w, h, rotation, Some(270));
             let limit = |v: u16| v == 0 || v == m;
             for (i, (x, y)) in got.into_iter().enumerate() {
                 if i < 4 {

@@ -11,6 +11,16 @@
 //! * End of input is `stop`.
 //! * Anything else is logged and ignored; a `touch` or `key` that is malformed is reported.
 
+// The parser modules read untrusted bytes: a malformed input is an error, never a panic, so the lints that find the
+// panics are denied here (the tests below may use them).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::future::Future;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -89,6 +99,7 @@ impl Key {
     pub const NAMES: &'static str =
         "home, app-switcher (or switcher), lock, power, sleep, volume-up, volume-down, mute, siri";
 
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Key> {
         Some(match name {
             "home" => Key::Home,
@@ -106,6 +117,7 @@ impl Key {
 
     /// (HID usage page, usage code) of the button, from the reference tool's named buttons. Power,
     /// lock and sleep are the same button.
+    #[must_use]
     pub fn usage(self) -> (u64, u64) {
         match self {
             Key::Home | Key::AppSwitcher => (0x0C, 0x40),
@@ -120,6 +132,11 @@ impl Key {
     /// How long the button is held down in ms. The short hold is the reference tool's; a long
     /// press is held about twice as long or more (a held press, not a repeated one). The App
     /// Switcher is two short Home presses whatever `press` says.
+    #[must_use]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "a table of one arm per button and press: each hold time can be changed on its own"
+    )]
     pub fn hold_ms(self, press: Press) -> u64 {
         match (self, press) {
             (Key::AppSwitcher, _) => 80,
@@ -185,8 +202,7 @@ fn parse_touch(args: &[&str]) -> Result<Touch, String> {
 
 fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
     let (name, press) = match args {
-        [name] => (name, Press::Short),
-        [name, "short"] => (name, Press::Short),
+        [name] | [name, "short"] => (name, Press::Short),
         [name, "long"] => (name, Press::Long),
         [_, other] => return Err(format!("key press {} is not short or long", quoted(other))),
         _ => {
@@ -203,8 +219,9 @@ fn parse_usage(s: &str) -> Result<u8, String> {
     if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("usage {} is not a hex number", quoted(s)));
     }
-    match u16::from_str_radix(hex, 16) {
-        Ok(v) if (1..=u16::from(MAX_KEY_USAGE)).contains(&v) => Ok(v as u8),
+    match u8::from_str_radix(hex, 16) {
+        Ok(v) if (1..=MAX_KEY_USAGE).contains(&v) => Ok(v),
+        // Out of range, and a number over 0xFF is out of range too (`from_str_radix` fails on it).
         _ => Err(format!("usage {} is out of range (01 to {MAX_KEY_USAGE:02x})", quoted(s))),
     }
 }
@@ -230,6 +247,7 @@ fn parse_kb(args: &[&str]) -> Result<Kb, String> {
     }
 }
 
+#[must_use]
 pub fn parse_line(line: &[u8]) -> Parsed {
     let text = String::from_utf8_lossy(line);
     let text = text.trim();
@@ -281,12 +299,11 @@ pub async fn read_commands<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Comm
         if buf.is_empty() {
             break; // end of input
         }
-        let (chunk, found_newline) = match buf.iter().position(|b| *b == b'\n') {
-            Some(i) => (&buf[..i], true),
-            None => (buf, false),
-        };
-        let consumed = chunk.len() + usize::from(found_newline);
-        if line.len() + chunk.len() > MAX_LINE {
+        // The bytes up to the first newline (all of them if there is none).
+        let chunk = buf.split(|b| *b == b'\n').next().unwrap_or(buf);
+        let found_newline = chunk.len() < buf.len();
+        let consumed = chunk.len().saturating_add(usize::from(found_newline));
+        if line.len().saturating_add(chunk.len()) > MAX_LINE {
             too_long = true;
         } else if !too_long {
             line.extend_from_slice(chunk);
@@ -342,6 +359,14 @@ async fn dispatch(line: &[u8], too_long: bool, tx: &mpsc::Sender<Command>) -> bo
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::*;
 
     async fn run(input: &[u8]) -> Vec<Command> {
@@ -586,6 +611,7 @@ mod tests {
 
     #[test]
     fn bad_kb_type_input_is_reported() {
+        use base64::Engine as _;
         let bad = |l: &str| match touch(l) {
             Parsed::Bad(why) => why,
             other => panic!("{l:?} parsed as {other:?}"),
@@ -597,7 +623,6 @@ mod tests {
         assert!(bad(&format!("kb type {}", b64(""))).contains("usage"), "an empty string is no text");
         assert!(bad("kb type aGk aGk").contains("usage"), "the text is one word of base64");
         // Valid base64 of bytes that are not UTF-8.
-        use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0x41]);
         assert!(bad(&format!("kb type {raw}")).contains("UTF-8"));
         // Exactly the limit passes; one more is too long.

@@ -94,12 +94,20 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, String> {
 
 fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
+        let [low, ..] = v.to_le_bytes();
+        out.push((low & 0x7f) | 0x80);
         v >>= 7;
     }
-    out.push(v as u8);
+    let [last, ..] = v.to_le_bytes(); // below 0x80
+    out.push(last);
 }
 
+/// Reads a protobuf message into its fields, in order.
+///
+/// # Errors
+///
+/// A message if a varint is cut short or runs over 64 bits, a field number does not fit 32 bits, a fixed-width or
+/// length-delimited field runs past the end, or a field has a wire type this does not read.
 pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
     let mut fields = Vec::new();
     let mut pos = 0;
@@ -109,9 +117,9 @@ pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
         let wire = match key & 7 {
             0 => Wire::Varint(read_varint(buf, &mut pos)?),
             1 => {
-                let b = buf.get(pos..pos + 8).ok_or("truncated fixed64")?;
+                let b = buf.get(pos..).and_then(<[u8]>::first_chunk::<8>).ok_or("truncated fixed64")?;
                 pos += 8;
-                Wire::Fixed64(b.try_into().expect("8 bytes"))
+                Wire::Fixed64(*b)
             }
             2 => {
                 let len = usize::try_from(read_varint(buf, &mut pos)?).map_err(|_| "length")?;
@@ -121,9 +129,9 @@ pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
                 Wire::Len(b.to_vec())
             }
             5 => {
-                let b = buf.get(pos..pos + 4).ok_or("truncated fixed32")?;
+                let b = buf.get(pos..).and_then(<[u8]>::first_chunk::<4>).ok_or("truncated fixed32")?;
                 pos += 4;
-                Wire::Fixed32(b.try_into().expect("4 bytes"))
+                Wire::Fixed32(*b)
             }
             t => return Err(format!("unsupported wire type {t}")),
         };
@@ -132,6 +140,7 @@ pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
     Ok(fields)
 }
 
+#[must_use]
 pub fn encode(fields: &[Field]) -> Vec<u8> {
     let mut out = Vec::new();
     for f in fields {
@@ -182,6 +191,11 @@ fn deflate(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Edits the raw (uncompressed) media blob.
+///
+/// # Errors
+///
+/// A message if the blob or its video settings are not well-formed protobuf, the blob has no video settings (field
+/// 5), or, for H.264, the offer has no HEVC bank to take out or no H.264 bank to keep.
 pub fn patch_blob(raw: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
     let mut top = parse(raw)?;
     let video = top
@@ -262,6 +276,11 @@ fn remove_ltr_feature(bank: &mut Field) -> Result<bool, String> {
 }
 
 /// Rewrites the stock offer (a binary plist) with `flags`.
+///
+/// # Errors
+///
+/// A message if `stock` is not a plist dictionary with the media blob, or the blob cannot be inflated, edited
+/// ([`patch_blob`]), deflated or written back.
 pub fn patch_offer(stock: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
     let mut value: plist::Value = plist::from_bytes(stock).map_err(|e| format!("the offer is not a plist: {e}"))?;
     let dict = value.as_dictionary_mut().ok_or("the offer is not a dictionary")?;
@@ -274,6 +293,10 @@ pub fn patch_offer(stock: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
 }
 
 /// The video offer with our SSRC and `flags`.
+///
+/// # Errors
+///
+/// A message if the stock offer cannot be built, or cannot be patched (see [`patch_offer`]).
 pub fn build_video_offer(
     call_id: &str,
     call_info: &CallInfoBlob,

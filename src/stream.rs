@@ -1,6 +1,6 @@
 //! The stream, as a library: start it, read what it yields, send it input.
 //!
-//! [`Stream::start`] begins a session in the background (usbmuxd, the CoreDevice tunnel, the display
+//! [`Stream::start`] begins a session in the background (usbmuxd, the `CoreDevice` tunnel, the display
 //! stream and, unless [`StreamOptions::control`] is off, the touch and key services) and returns at
 //! once. From then on:
 //!
@@ -75,6 +75,10 @@ const PANIC_CLEANUP: Duration = Duration::from_secs(8);
 /// What a stream is started with. [`Default`] is what the `scrios` binary does without options: the only device
 /// usbmuxd lists, its built-in display, H.264, touch and keys on, the intervals of the protocol.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent switches of the offer and the session (RTCP feedback, long-term references, control, display info): not a state, and a flags type would only hide them"
+)]
 pub struct StreamOptions {
     /// UDID of the device (default: the only device usbmuxd lists).
     pub udid: Option<String>,
@@ -130,13 +134,13 @@ impl Default for StreamOptions {
             control: true,
             hid_mapping: HidMapping::default(),
             visible_size: None,
-            rtcp_interval: Some(Duration::from_millis(5000)),
-            keyframe_min_interval: Duration::from_millis(2000),
-            stats_interval: Some(Duration::from_millis(5000)),
-            rtp_stall_keyframe: Some(Duration::from_millis(5000)),
-            rtp_stall_timeout: Some(Duration::from_millis(15000)),
+            rtcp_interval: Some(Duration::from_secs(5)),
+            keyframe_min_interval: Duration::from_secs(2),
+            stats_interval: Some(Duration::from_secs(5)),
+            rtp_stall_keyframe: Some(Duration::from_secs(5)),
+            rtp_stall_timeout: Some(Duration::from_secs(15)),
             device_hub_feedback: false,
-            display_poll: Some(Duration::from_millis(1000)),
+            display_poll: Some(Duration::from_secs(1)),
             probe: None,
         }
     }
@@ -155,6 +159,10 @@ pub struct Probe {
 
 impl StreamOptions {
     /// Options that do not go together.
+    ///
+    /// # Errors
+    ///
+    /// A message if the options do not go together: a probe asks for the H.264 offer.
     pub fn check(&self) -> Result<(), String> {
         match (&self.probe, self.codec) {
             (Some(_), CodecKind::Hevc) => Err("the probe is for the H.264 offer: ask for H.264, not HEVC".into()),
@@ -213,6 +221,7 @@ pub enum Outcome {
 
 impl Outcome {
     /// The exit status of the `scrios` binary: 0, [`EXIT_START_FAILED`], [`EXIT_FAILED`] or [`EXIT_INTERNAL`].
+    #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Outcome::Stopped => 0,
@@ -225,11 +234,12 @@ impl Outcome {
 
 /// A running stream. Cheap to clone: the clones are the same stream, so that one thread can read it while another
 /// waits for its end. Dropping the last one stops the stream.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Stream {
     shared: Arc<Shared>,
 }
 
+#[derive(Debug)]
 struct Shared {
     queue: Arc<OutQueue>,
     gone: Arc<Notify>,
@@ -257,6 +267,10 @@ impl Stream {
     /// Starts the stream in the background and returns at once; connecting, starting the display stream and
     /// connecting touch and keys happen behind it (a start that fails is an `error` event and an
     /// [`Outcome::StartFailed`]). Fails only if the thread cannot be spawned.
+    ///
+    /// # Errors
+    ///
+    /// The error of spawning the stream's thread.
     pub fn start(opts: StreamOptions) -> io::Result<Stream> {
         let queue = Arc::new(OutQueue::new());
         let gone = Arc::new(Notify::new());
@@ -266,7 +280,7 @@ impl Stream {
             let (queue, gone) = (queue.clone(), gone.clone());
             std::thread::Builder::new()
                 .name("scrios-stream".into())
-                .spawn(move || run_thread(opts, queue, gone, commands))?
+                .spawn(move || run_thread(opts, &queue, &gone, commands))?
         };
         Ok(Stream {
             shared: Arc::new(Shared {
@@ -282,6 +296,7 @@ impl Stream {
 
     /// The next thing the stream produced; blocks until there is one. `None` once the stream is over (or hung up
     /// on) and everything it produced was read.
+    #[must_use]
     pub fn recv(&self) -> Option<Item> {
         loop {
             let frame = self.shared.queue.pop()?;
@@ -299,6 +314,7 @@ impl Stream {
     }
 
     /// A handle for touch, keys, text, keyframe requests and stop.
+    #[must_use]
     pub fn input(&self) -> Input {
         Input { tx: self.shared.input.clone() }
     }
@@ -328,11 +344,15 @@ impl Stream {
 /// connected; otherwise a `hid` event with `ok: false` says so for each. Every method returns whether the command
 /// was queued: `false` means the stream is over (or, from inside an async task, that the command queue is full).
 /// From a thread that is not an async task, sending waits while the queue (64 commands) is full.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Input {
     tx: mpsc::Sender<Command>,
 }
 
+#[expect(
+    clippy::must_use_candidate,
+    reason = "the bool says whether the command was queued (false: the stream is over); a caller that does not care may ignore it"
+)]
 impl Input {
     /// Sends any command.
     pub fn send(&self, command: Command) -> bool {
@@ -345,6 +365,7 @@ impl Input {
 
     /// The command channel itself, for async code that wants to `send(..).await` (the stdin reader of the binary
     /// does).
+    #[must_use]
     pub fn sender(&self) -> mpsc::Sender<Command> {
         self.tx.clone()
     }
@@ -414,14 +435,14 @@ fn item_of(frame: Frame, codec: CodecKind) -> Option<Item> {
 /// so a reader of the stream sees it end.
 fn run_thread(
     opts: StreamOptions,
-    queue: Arc<OutQueue>,
-    gone: Arc<Notify>,
+    queue: &Arc<OutQueue>,
+    gone: &Arc<Notify>,
     commands: mpsc::Receiver<Command>,
 ) -> Outcome {
     let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            let outcome = start_failed(&queue, format!("cannot build the async runtime: {e}"));
+            let outcome = start_failed(queue, format!("cannot build the async runtime: {e}"));
             queue.close_discarding_units();
             return outcome;
         }
@@ -429,30 +450,31 @@ fn run_thread(
 
     // The session lives out here, so that a panic inside `run` cannot take with it the means to
     // stop the stream on the device.
-    // Shared only between this thread and the runtime's tasks it blocks on, never sent to another thread.
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "shared only between this thread and the runtime's tasks it blocks on, never sent to another thread"
+    )]
     let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
     let result = catch_unwind(AssertUnwindSafe(|| {
         rt.block_on(run(opts, queue.clone(), gone.clone(), commands, session.clone()))
     }));
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            error!("internal error (a panic); stopping the stream");
-            queue.push_control(Frame::control(&Event::Error { message: "internal error".into() }));
-            let cleanup = catch_unwind(AssertUnwindSafe(|| {
-                rt.block_on(async {
-                    let _ = tokio::time::timeout(PANIC_CLEANUP, async {
-                        session.lock().await.shutdown().await;
-                    })
-                    .await;
+    let outcome = if let Ok(outcome) = result {
+        outcome
+    } else {
+        error!("internal error (a panic); stopping the stream");
+        queue.push_control(Frame::control(&Event::Error { message: "internal error".into() }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let _ = tokio::time::timeout(PANIC_CLEANUP, async {
+                    Box::pin(session.lock().await.shutdown()).await;
                 })
-            }));
-            if cleanup.is_err() {
-                error!("the cleanup panicked too");
-            }
-            Outcome::Panicked
+                .await;
+            });
+        }));
+        if cleanup.is_err() {
+            error!("the cleanup panicked too");
         }
+        Outcome::Panicked
     };
 
     // What is queued is still read (the access units are stale now: only events are kept).
@@ -498,7 +520,7 @@ async fn run_probe(
         Some(video) => Ok(probe::collect(video, window, cmd_rx, gone, raw).await),
         None => Err("the video stream is gone".to_string()),
     };
-    sess.shutdown().await;
+    Box::pin(sess.shutdown()).await;
     let (report, outcome) = match collected {
         Ok(c) => c,
         Err(why) => return failed(queue, why),
@@ -536,6 +558,10 @@ async fn wait_for_stop(commands: &mut mpsc::Receiver<Command>) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the life of a stream, in order: start, probe, connect HID, loop, shut down; each step ends the function early its own way, so they cannot be moved out one by one without passing the whole state around"
+)]
 async fn run(
     opts: StreamOptions,
     queue: Arc<OutQueue>,
@@ -581,32 +607,32 @@ async fn run(
     // Start, but a stop (a command, the end of the input, a signal) ends it at once.
     let started = tokio::select! {
         r = sess.start(&dev) => Some(r),
-        _ = wait_for_stop(&mut cmd_rx) => None,
+        () = wait_for_stop(&mut cmd_rx) => None,
     };
     match started {
         None => {
             info!("stop requested while starting");
-            sess.shutdown().await;
+            Box::pin(sess.shutdown()).await;
             queue.push_control(Frame::control(&Event::Stopped));
             return Outcome::Stopped;
         }
         Some(Err(e)) => {
             // Whatever was started on the device is stopped before the failure is reported.
-            sess.shutdown().await;
+            Box::pin(sess.shutdown()).await;
             return start_failed(&queue, e);
         }
         Some(Ok(())) => {}
     }
 
     if let Some(probe) = &opts.probe {
-        let outcome = run_probe(
+        let outcome = Box::pin(run_probe(
             &mut sess,
             probe.window,
             &mut cmd_rx,
             &gone,
             &queue,
             raw_dump.as_mut().map(|w| w as &mut dyn std::io::Write),
-        )
+        ))
         .await;
         if let (Some(w), Some(path)) = (raw_dump.as_mut(), probe.raw_dump.as_ref()) {
             use std::io::Write as _;
@@ -626,11 +652,11 @@ async fn run(
     if opts.control {
         let connected = tokio::select! {
             h = sess.connect_hid() => Some(h),
-            _ = wait_for_stop(&mut cmd_rx) => None,
+            () = wait_for_stop(&mut cmd_rx) => None,
         };
         let Some(device_hid) = connected else {
             info!("stop requested while connecting HID");
-            sess.shutdown().await;
+            Box::pin(sess.shutdown()).await;
             queue.push_control(Frame::control(&Event::Stopped));
             return Outcome::Stopped;
         };
@@ -720,7 +746,7 @@ async fn run(
     };
     info!("done: {}", engine.summary());
 
-    sess.shutdown().await;
+    Box::pin(sess.shutdown()).await;
     match exit {
         Exit::Stopped(StopCause::Command) => {
             queue.push_control(Frame::control(&Event::Stopped));
@@ -895,7 +921,7 @@ mod tests {
         let (stream, _queue, commands) = rig();
         let input = stream.input();
         // The queue holds 64 commands; the 65th is refused here instead of waiting.
-        let queued = (0..COMMAND_QUEUE + 1).filter(|_| input.keyframe()).count();
+        let queued = (0..=COMMAND_QUEUE).filter(|_| input.keyframe()).count();
         assert_eq!(queued, COMMAND_QUEUE);
         drop(commands);
     }
@@ -924,7 +950,7 @@ mod tests {
         let items: Vec<Item> = stream.items().collect();
         match items.as_slice() {
             [Item::Event(Event::Error { message })] => {
-                assert!(message.contains("cannot connect to usbmuxd"), "{message}")
+                assert!(message.contains("cannot connect to usbmuxd"), "{message}");
             }
             other => panic!("{other:?}"),
         }

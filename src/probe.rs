@@ -41,7 +41,7 @@ pub struct OddPacket {
     pub ssrc: u32,
     /// The whole datagram's length.
     pub datagram_len: usize,
-    /// The payload's length and its first [`ODD_BYTES`] bytes.
+    /// The payload's length and its first `ODD_BYTES` (400) bytes.
     pub payload_len: usize,
     pub payload_head: Vec<u8>,
 }
@@ -74,6 +74,7 @@ pub struct ProbeReport {
 }
 
 impl ProbeReport {
+    #[must_use]
     pub fn new(window: Duration) -> Self {
         ProbeReport { window, ..Default::default() }
     }
@@ -132,6 +133,7 @@ impl ProbeReport {
     }
 
     /// The report as log lines.
+    #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!(
             "{} RTP packets in {} s ({} RTCP, {} neither); by payload type: {}",
@@ -211,17 +213,21 @@ impl ProbeReport {
     }
 
     /// Did the device send H.264? `Ok` carries a one-line summary, `Err` the reason it did not.
+    ///
+    /// # Errors
+    ///
+    /// A message that says why the device did not send H.264: no RTP packets arrived in the window, it answered with
+    /// HEVC, or the packets have another payload type and no H.264 SPS or IDR slice was seen.
     pub fn verdict(&self) -> Result<String, String> {
         let total = self.total_rtp();
-        if total == 0 {
+        let Some((&pt, &n)) = self.rtp_by_pt.iter().max_by_key(|(_, n)| **n).filter(|_| total > 0) else {
             return Err(format!(
                 "no RTP packets arrived in {} s ({} RTCP, {} other datagrams)",
                 self.window.as_secs(),
                 self.rtcp_packets,
                 self.junk
             ));
-        }
-        let (&pt, &n) = self.rtp_by_pt.iter().max_by_key(|(_, n)| **n).expect("there are packets");
+        };
         let looks_h264 = self.nal_types.contains_key(&avc::NAL_SPS) || self.nal_types.contains_key(&avc::NAL_IDR);
         match pt {
             H264_PAYLOAD_TYPE => {
@@ -269,8 +275,14 @@ pub enum Outcome {
 }
 
 /// Writes one datagram to the raw dump: its length as 4 bytes big-endian, then the bytes.
+///
+/// # Errors
+///
+/// The writer's error, or `InvalidInput` for a datagram too long for a 32-bit length.
 pub fn write_raw(out: &mut dyn Write, data: &[u8]) -> io::Result<()> {
-    out.write_all(&(data.len() as u32).to_be_bytes())?;
+    let len =
+        u32::try_from(data.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "datagram too long"))?;
+    out.write_all(&len.to_be_bytes())?;
     out.write_all(data)
 }
 
@@ -288,7 +300,7 @@ pub async fn collect<S: DatagramSocket>(
     tokio::pin!(end);
     let outcome = loop {
         tokio::select! {
-            _ = &mut end => break Outcome::Finished,
+            () = &mut end => break Outcome::Finished,
             dg = sock.recv() => match dg {
                 Ok(dg) => {
                     if let Some(out) = raw.as_deref_mut() {
@@ -311,7 +323,7 @@ pub async fn collect<S: DatagramSocket>(
                 Some(Command::Stop) | None => break Outcome::Stopped,
                 Some(_) => {} // nothing else means anything in a probe
             },
-            _ = consumer_gone.notified() => break Outcome::ConsumerGone,
+            () = consumer_gone.notified() => break Outcome::ConsumerGone,
         }
     };
     (report, outcome)
@@ -319,6 +331,10 @@ pub async fn collect<S: DatagramSocket>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use std::io;
     use std::sync::Arc;
 

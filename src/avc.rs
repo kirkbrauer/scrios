@@ -1,5 +1,15 @@
 //! H.264 (RFC 6184) helpers for the codec probe: NAL unit types and the sequence parameter set.
 
+// The parser modules read untrusted bytes: a malformed input is an error, never a panic, so the lints that find the
+// panics are denied here (the tests below may use them).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use crate::sps::{BitWriter, Bits, SpsError, escape_rbsp, unescape_rbsp};
 
 pub const NAL_IDR: u8 = 5;
@@ -9,6 +19,7 @@ pub const NAL_STAP_A: u8 = 24;
 pub const NAL_FU_A: u8 = 28;
 
 /// The type of an H.264 NAL unit (or of an RTP payload's first byte): the low 5 bits.
+#[must_use]
 pub fn nal_type(byte0: u8) -> u8 {
     byte0 & 0x1f
 }
@@ -26,6 +37,7 @@ pub struct PayloadScan {
 }
 
 /// Reads one RTP payload as H.264. Never panics on short or odd input.
+#[must_use]
 pub fn scan_payload(payload: &[u8]) -> PayloadScan {
     let mut scan = PayloadScan::default();
     let Some(&b0) = payload.first() else {
@@ -42,19 +54,20 @@ pub fn scan_payload(payload: &[u8]) -> PayloadScan {
         }
         NAL_STAP_A => {
             // [STAP-A header][u16 size, NAL unit]+
-            let mut off = 1;
-            while off + 2 <= payload.len() {
-                let size = usize::from(u16::from_be_bytes([payload[off], payload[off + 1]]));
-                off += 2;
-                let Some(nal) = payload.get(off..off + size).filter(|n| !n.is_empty()) else {
+            let mut rest = payload.get(1..).unwrap_or_default();
+            while let Some((size, tail)) = rest.split_first_chunk::<2>() {
+                let Some((nal, tail)) = tail.split_at_checked(usize::from(u16::from_be_bytes(*size))) else {
                     break;
                 };
-                let t = nal_type(nal[0]);
+                let Some(&first) = nal.first() else {
+                    break;
+                };
+                let t = nal_type(first);
                 scan.nal_types.push(t);
                 if t == NAL_SPS && scan.sps.is_none() {
                     scan.sps = Some(nal.to_vec());
                 }
-                off += size;
+                rest = tail;
             }
         }
         NAL_FU_A => {
@@ -88,15 +101,20 @@ pub struct AvcSps {
 }
 
 impl AvcSps {
-    /// The RFC 6381 codec string: `avc1.` and profile_idc, the constraint byte and level_idc in hex.
+    /// The RFC 6381 codec string: `avc1.` and `profile_idc`, the constraint byte and `level_idc` in hex.
+    #[must_use]
     pub fn codec_string(&self) -> String {
         format!("avc1.{:02X}{:02X}{:02X}", self.profile_idc, self.constraint_flags, self.level_idc)
     }
 
     /// The constraint flags that are set, by name (`set0`..`set5`).
+    #[must_use]
     pub fn constraint_names(&self) -> String {
-        let names: Vec<String> =
-            (0..6).filter(|i| self.constraint_flags & (0x80 >> i) != 0).map(|i| format!("set{i}")).collect();
+        // Flag `i` is bit `7 - i`: rotated left by `i` it is the top bit.
+        let names: Vec<String> = (0..6u32)
+            .filter(|i| self.constraint_flags.rotate_left(*i) & 0x80 != 0)
+            .map(|i| format!("set{i}"))
+            .collect();
         if names.is_empty() { "none".to_string() } else { names.join(" ") }
     }
 }
@@ -111,7 +129,7 @@ fn skip_scaling_list(b: &mut Bits<'_>, size: usize) -> Result<(), SpsError> {
     for _ in 0..size {
         if next != 0 {
             let delta = b.se()?;
-            next = (last + delta + 256).rem_euclid(256);
+            next = last.saturating_add(delta).rem_euclid(256);
         }
         if next != 0 {
             last = next;
@@ -125,22 +143,23 @@ const MAX_PICTURE_SIDE: u64 = 32768;
 
 /// Parses an H.264 SPS NAL unit (with its one-byte header, without a start code): profile, level,
 /// and the picture size with the cropping applied (ITU-T H.264 7.3.2.1.1).
+///
+/// # Errors
+///
+/// [`SpsError::NotSps`] if `nal` is not an H.264 SPS NAL unit (under 5 bytes, the forbidden bit set, or another type);
+/// [`SpsError::Truncated`] if the bits run out; [`SpsError::Invalid`] for a `chroma_format_idc` over 3, an `ue(v)` of
+/// more than 32 bits, or a coded or cropped picture that is empty or over 32768 pixels on a side.
 pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
-    if nal.len() < 5 || nal[0] & 0x80 != 0 || nal_type(nal[0]) != NAL_SPS {
-        return Err(SpsError::NotSps);
-    }
+    let (_, payload) = split_sps_nal(nal)?;
     // Emulation prevention covers everything after the NAL header byte, the profile, constraint flags and level
     // too (a `00 00` there is followed by `03` if the next byte is 0..=3): unescape it all, as the rewrite does.
-    let rbsp = unescape_rbsp(&nal[1..]);
+    let rbsp = unescape_rbsp(payload);
     let mut b = Bits::new(&rbsp);
-    let (profile_idc, constraint_flags, level_idc) = (b.u(8)? as u8, b.u(8)? as u8, b.u(8)? as u8);
+    let (profile_idc, constraint_flags, level_idc) = (b.byte(8)?, b.byte(8)?, b.byte(8)?);
     b.ue()?; // seq_parameter_set_id
-    let mut chroma_format_idc = 1;
+    let mut chroma_format_idc = 1u8;
     if has_chroma_info(profile_idc) {
-        chroma_format_idc = b.ue()?;
-        if chroma_format_idc > 3 {
-            return Err(SpsError::Invalid("chroma_format_idc"));
-        }
+        chroma_format_idc = chroma_format_idc_of(b.ue()?)?;
         if chroma_format_idc == 3 {
             b.skip(1)?; // separate_colour_plane_flag
         }
@@ -178,8 +197,8 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     }
     b.ue()?; // max_num_ref_frames
     b.skip(1)?; // gaps_in_frame_num_value_allowed_flag
-    let width_mbs = u64::from(b.ue()?) + 1;
-    let height_map_units = u64::from(b.ue()?) + 1;
+    let width_mbs = u64::from(b.ue()?).saturating_add(1);
+    let height_map_units = u64::from(b.ue()?).saturating_add(1);
     let frame_mbs_only = b.bit()? == 1;
     if !frame_mbs_only {
         b.skip(1)?; // mb_adaptive_frame_field_flag
@@ -187,39 +206,63 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     b.skip(1)?; // direct_8x8_inference_flag
     let mut crop = [0u64; 4]; // left, right, top, bottom
     if b.bit()? == 1 {
-        for c in crop.iter_mut() {
+        for c in &mut crop {
             *c = u64::from(b.ue()?);
         }
     }
-    let frame_height_mbs = (2 - u64::from(frame_mbs_only)) * height_map_units;
+    let [crop_left, crop_right, crop_top, crop_bottom] = crop;
+    // 2 for a picture of two fields per frame, 1 for a frame only (a macroblock is 16 luma rows of a frame).
+    let field_factor: u64 = if frame_mbs_only { 1 } else { 2 };
+    // Every product below is of at most 2^33 and a small factor, so none saturates; a saturated value would only
+    // be refused as too big, as it should.
+    let frame_height_mbs = field_factor.saturating_mul(height_map_units);
+    let coded_width = width_mbs.saturating_mul(16);
+    let coded_height = frame_height_mbs.saturating_mul(16);
     // The coded size is checked as well as the cropped one: it is what `coded_width`/`coded_height` hold, and
     // macroblock counts read off the wire are up to 2^32, which would wrap there.
-    if width_mbs * 16 > MAX_PICTURE_SIDE || frame_height_mbs * 16 > MAX_PICTURE_SIDE {
+    if coded_width > MAX_PICTURE_SIDE || coded_height > MAX_PICTURE_SIDE {
         return Err(SpsError::Invalid("picture size"));
     }
     // Cropping is in chroma sample units (ChromaArrayType 0 has none).
-    let (unit_x, unit_y) = match chroma_format_idc {
-        0 => (1, 2 - u64::from(frame_mbs_only)),
-        1 => (2, 2 * (2 - u64::from(frame_mbs_only))),
-        2 => (2, 2 - u64::from(frame_mbs_only)),
-        _ => (1, 2 - u64::from(frame_mbs_only)),
+    let (unit_x, unit_y): (u64, u64) = match chroma_format_idc {
+        1 => (2, field_factor.saturating_mul(2)),
+        2 => (2, field_factor),
+        _ => (1, field_factor), // monochrome and 4:4:4
     };
-    let width = (width_mbs * 16).saturating_sub(unit_x * (crop[0] + crop[1]));
-    let height = (frame_height_mbs * 16).saturating_sub(unit_y * (crop[2] + crop[3]));
-    if width == 0 || height == 0 || width > MAX_PICTURE_SIDE || height > MAX_PICTURE_SIDE {
+    let width = coded_width.saturating_sub(unit_x.saturating_mul(crop_left.saturating_add(crop_right)));
+    let height = coded_height.saturating_sub(unit_y.saturating_mul(crop_top.saturating_add(crop_bottom)));
+    let size = |side: u64| u32::try_from(side).ok().filter(|_| (1..=MAX_PICTURE_SIDE).contains(&side));
+    let sizes = (size(width), size(height), u32::try_from(coded_width), u32::try_from(coded_height));
+    let (Some(width), Some(height), Ok(coded_width), Ok(coded_height)) = sizes else {
         return Err(SpsError::Invalid("picture size"));
-    }
+    };
     Ok(AvcSps {
         profile_idc,
         constraint_flags,
         level_idc,
-        chroma_format_idc: chroma_format_idc as u8,
+        chroma_format_idc,
         frame_mbs_only,
-        width: width as u32,
-        height: height as u32,
-        coded_width: (width_mbs * 16) as u32,
-        coded_height: (frame_height_mbs * 16) as u32,
+        width,
+        height,
+        coded_width,
+        coded_height,
     })
+}
+
+/// The `chroma_format_idc` of an SPS: 0 to 3.
+fn chroma_format_idc_of(v: u32) -> Result<u8, SpsError> {
+    u8::try_from(v).ok().filter(|c| *c <= 3).ok_or(SpsError::Invalid("chroma_format_idc"))
+}
+
+/// An H.264 SPS NAL unit (of at least 5 bytes: its header byte and four more) as its header byte and the rest;
+/// `NotSps` for anything else.
+fn split_sps_nal(nal: &[u8]) -> Result<(u8, &[u8]), SpsError> {
+    match nal.split_first() {
+        Some((&header, rest)) if nal.len() >= 5 && header & 0x80 == 0 && nal_type(header) == NAL_SPS => {
+            Ok((header, rest))
+        }
+        _ => Err(SpsError::NotSps),
+    }
 }
 
 // ---- the SPS rewrite: a VUI bitstream restriction ------------------------------------------------
@@ -282,11 +325,15 @@ impl Copier<'_> {
         Ok(v)
     }
 
+    fn byte(&mut self, n: u32) -> Result<u8, SpsError> {
+        u8::try_from(self.u(n)?).map_err(|_| SpsError::Invalid("a field wider than a byte"))
+    }
+
     fn scaling_list(&mut self, size: usize) -> Result<(), SpsError> {
         let (mut last, mut next) = (8i64, 8i64);
         for _ in 0..size {
             if next != 0 {
-                next = (last + self.se()? + 256).rem_euclid(256);
+                next = last.saturating_add(self.se()?).rem_euclid(256);
             }
             if next != 0 {
                 last = next;
@@ -319,21 +366,20 @@ impl Copier<'_> {
 /// Walks the SPS up to its `bitstream_restriction_flag`. With `write`, the bits are copied to a writer, and an
 /// SPS with no VUI gets one that holds nothing but flags that are off. Returns the number of reference
 /// frames, the restriction if the SPS has one, and the writer (positioned at the restriction flag).
+#[expect(
+    clippy::too_many_lines,
+    reason = "a straight walk down the SPS syntax of H.264 7.3.2.1.1 and Annex E, one element after the other: it is checked against the standard line by line"
+)]
 fn walk_sps(nal: &[u8], write: bool) -> Result<(u32, Option<Restriction>, Option<BitWriter>), SpsError> {
-    if nal.len() < 5 || nal[0] & 0x80 != 0 || nal_type(nal[0]) != NAL_SPS {
-        return Err(SpsError::NotSps);
-    }
-    let rbsp = unescape_rbsp(&nal[1..]);
+    let (_, payload) = split_sps_nal(nal)?;
+    let rbsp = unescape_rbsp(payload);
     let mut c = Copier { r: Bits::new(&rbsp), w: write.then(BitWriter::default) };
-    let profile_idc = c.u(8)?;
+    let profile_idc = c.byte(8)?;
     c.u(8)?; // constraint flags
     c.u(8)?; // level_idc
     c.ue()?; // seq_parameter_set_id
-    if has_chroma_info(profile_idc as u8) {
-        let chroma_format_idc = c.ue()?;
-        if chroma_format_idc > 3 {
-            return Err(SpsError::Invalid("chroma_format_idc"));
-        }
+    if has_chroma_info(profile_idc) {
+        let chroma_format_idc = chroma_format_idc_of(c.ue()?)?;
         if chroma_format_idc == 3 {
             c.u(1)?; // separate_colour_plane_flag
         }
@@ -457,6 +503,10 @@ fn walk_sps(nal: &[u8], write: bool) -> Result<(u32, Option<Restriction>, Option
 }
 
 /// The VUI `bitstream_restriction` of an SPS NAL unit, if it has one.
+///
+/// # Errors
+///
+/// As for [`add_bitstream_restriction`].
 #[cfg(test)]
 pub fn sps_restriction(nal: &[u8]) -> Result<Option<Restriction>, SpsError> {
     Ok(walk_sps(nal, false)?.1)
@@ -466,12 +516,19 @@ pub fn sps_restriction(nal: &[u8]) -> Result<Option<Restriction>, SpsError> {
 /// least 1) to an H.264 SPS NAL unit, copying every bit before it as it was. An SPS with no VUI gets one
 /// that holds only the restriction. An SPS that has a restriction already is not touched. The NAL header
 /// byte is kept, and the result has its emulation prevention bytes.
+///
+/// # Errors
+///
+/// [`SpsError::NotSps`], [`SpsError::Truncated`] or [`SpsError::Invalid`] if `nal` is not an H.264 SPS, ends early or
+/// holds a value that cannot be right (as for [`parse_avc_sps`]).
 pub fn add_bitstream_restriction(nal: &[u8]) -> Result<SpsRewrite, SpsError> {
     let (max_num_ref_frames, existing, writer) = walk_sps(nal, true)?;
     if let Some(r) = existing {
         return Ok(SpsRewrite::AlreadyRestricted(r));
     }
-    let mut w = writer.expect("write was asked for");
+    let (Some(mut w), Some(&header)) = (writer, nal.first()) else {
+        return Err(SpsError::NotSps); // not reached: `walk_sps` wrote, and read a header byte
+    };
     w.u(1, 1); // bitstream_restriction_flag
     w.u(1, 1); // motion_vectors_over_pic_boundaries_flag
     w.ue(0); // max_bytes_per_pic_denom
@@ -480,12 +537,13 @@ pub fn add_bitstream_restriction(nal: &[u8]) -> Result<SpsRewrite, SpsError> {
     w.ue(15); // log2_max_mv_length_vertical
     w.ue(0); // max_num_reorder_frames
     w.ue(max_num_ref_frames.max(1)); // max_dec_frame_buffering
-    let mut out = vec![nal[0]];
+    let mut out = vec![header];
     out.extend_from_slice(&escape_rbsp(&w.finish()));
     Ok(SpsRewrite::Patched(out))
 }
 
 /// The slice type of a slice NAL unit (types 1 and 5): the second `ue(v)` of its header, 0 to 9.
+#[must_use]
 pub fn slice_type(nal: &[u8]) -> Option<u32> {
     if !matches!(nal_type(*nal.first()?), 1 | 5) {
         return None;
@@ -497,8 +555,9 @@ pub fn slice_type(nal: &[u8]) -> Option<u32> {
     (t <= 9).then_some(t)
 }
 
-/// A B slice (slice_type 1 or 6) of a non-IDR picture: an IDR picture has only I slices (H.264 7.4.3),
+/// A B slice (`slice_type` 1 or 6) of a non-IDR picture: an IDR picture has only I slices (H.264 7.4.3),
 /// so a slice of NAL type 5 is never counted, whatever its header says.
+#[must_use]
 pub fn is_b_slice(nal: &[u8]) -> bool {
     nal.first().is_some_and(|&b| nal_type(b) == 1) && matches!(slice_type(nal), Some(1 | 6))
 }
@@ -518,51 +577,58 @@ pub struct AvcConfig {
     pub pps: Vec<Vec<u8>>,
 }
 
-fn be16(b: &[u8], at: usize) -> Option<usize> {
-    Some(usize::from(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?])))
-}
-
 /// Parses an `AVCDecoderConfigurationRecord`: version 1, profile, compatibility, level, the length
 /// size, the SPS list and the PPS list (each entry a 16-bit length and the NAL unit). Anything after the
 /// PPS list (the extension of the high profiles) is left alone.
+///
+/// # Errors
+///
+/// A message that says what is wrong: the record is under 7 bytes or is not version 1, a list is cut short, or an
+/// entry is not an SPS (or PPS) NAL unit.
+#[expect(clippy::similar_names, reason = "`sps` and `pps` are the standard's names, one letter apart")]
 pub fn parse_avcc(rec: &[u8]) -> Result<AvcConfig, String> {
-    if rec.len() < 7 {
+    let [version, profile_indication, profile_compatibility, level_indication, length, num_sps, _, ..] = rec else {
         return Err("avcC record too short".into());
+    };
+    if *version != 1 {
+        return Err(format!("avcC configurationVersion {version} (expected 1)"));
     }
-    if rec[0] != 1 {
-        return Err(format!("avcC configurationVersion {} (expected 1)", rec[0]));
-    }
-    let mut off = 6;
-    let mut sps = Vec::new();
-    for _ in 0..(rec[5] & 0x1f) {
-        let n = be16(rec, off).ok_or("avcC SPS list is cut short")?;
-        let nal = rec.get(off + 2..off + 2 + n).ok_or("avcC SPS is cut short")?;
-        if n == 0 || nal_type(nal[0]) != NAL_SPS {
-            return Err("avcC SPS entry is not an SPS NAL unit".into());
-        }
-        sps.push(nal.to_vec());
-        off += 2 + n;
-    }
-    let num_pps = *rec.get(off).ok_or("avcC has no PPS count")?;
-    off += 1;
-    let mut pps = Vec::new();
-    for _ in 0..num_pps {
-        let n = be16(rec, off).ok_or("avcC PPS list is cut short")?;
-        let nal = rec.get(off + 2..off + 2 + n).ok_or("avcC PPS is cut short")?;
-        if n == 0 || nal_type(nal[0]) != NAL_PPS {
-            return Err("avcC PPS entry is not a PPS NAL unit".into());
-        }
-        pps.push(nal.to_vec());
-        off += 2 + n;
-    }
+    let lists = rec.get(6..).unwrap_or_default();
+    let (sps, lists) = parameter_set_list(lists, num_sps & 0x1f, "SPS", NAL_SPS)?;
+    let (num_pps, lists) = lists.split_first().ok_or("avcC has no PPS count")?;
+    let (pps, _) = parameter_set_list(lists, *num_pps, "PPS", NAL_PPS)?;
     Ok(AvcConfig {
-        profile_indication: rec[1],
-        profile_compatibility: rec[2],
-        level_indication: rec[3],
-        length_size: (rec[4] & 3) + 1,
+        profile_indication: *profile_indication,
+        profile_compatibility: *profile_compatibility,
+        level_indication: *level_indication,
+        length_size: (length & 3).saturating_add(1),
         sps,
         pps,
     })
+}
+
+/// `count` entries of an avcC parameter-set list (each a 16-bit length and a NAL unit of type `nal_kind`, `what`
+/// is its name for the errors): the NAL units, and what follows the list.
+fn parameter_set_list<'a>(
+    mut data: &'a [u8],
+    count: u8,
+    what: &str,
+    nal_kind: u8,
+) -> Result<(Vec<Vec<u8>>, &'a [u8]), String> {
+    let mut sets = Vec::new();
+    for _ in 0..count {
+        let (len, tail) = data.split_first_chunk::<2>().ok_or_else(|| format!("avcC {what} list is cut short"))?;
+        let (nal, tail) = tail
+            .split_at_checked(usize::from(u16::from_be_bytes(*len)))
+            .ok_or_else(|| format!("avcC {what} is cut short"))?;
+        if nal.first().is_none_or(|b| nal_type(*b) != nal_kind) {
+            let article = if nal_kind == NAL_SPS { "an" } else { "a" };
+            return Err(format!("avcC {what} entry is not {article} {what} NAL unit"));
+        }
+        sets.push(nal.to_vec());
+        data = tail;
+    }
+    Ok((sets, data))
 }
 
 /// One box of an ISO base media file: its type and its content (what follows the header).
@@ -574,24 +640,24 @@ pub struct BoxRef<'a> {
 
 /// The boxes of a sequence of boxes, up to the first one that is cut short or malformed. A size of 1
 /// means a 64-bit size follows, a size of 0 means the box runs to the end.
+#[must_use]
 pub fn boxes(mut buf: &[u8]) -> Vec<BoxRef<'_>> {
     let mut out = Vec::new();
-    while buf.len() >= 8 {
-        let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
-        let kind = [buf[4], buf[5], buf[6], buf[7]];
-        let (header, total) = match size {
-            0 => (8, buf.len() as u64),
+    while let Some((&[s0, s1, s2, s3, k0, k1, k2, k3], after_header)) = buf.split_first_chunk::<8>() {
+        let kind = [k0, k1, k2, k3];
+        let (header, total) = match u32::from_be_bytes([s0, s1, s2, s3]) {
+            0 => (8, Some(buf.len())),
             1 => {
-                let Some(big) = buf.get(8..16) else { break };
-                (16, u64::from_be_bytes(big.try_into().expect("8 bytes")))
+                let Some(big) = after_header.first_chunk::<8>() else { break };
+                (16, usize::try_from(u64::from_be_bytes(*big)).ok())
             }
-            n => (8, n),
+            n => (8, usize::try_from(n).ok()),
         };
-        if total < header as u64 || total > buf.len() as u64 {
-            break;
-        }
-        out.push(BoxRef { kind, content: &buf[header..total as usize] });
-        buf = &buf[total as usize..];
+        // A size that is below the header's or above what is left ends the boxes (so does one that is no usize).
+        let Some((whole, tail)) = total.and_then(|total| buf.split_at_checked(total)) else { break };
+        let Some(content) = whole.get(header..) else { break };
+        out.push(BoxRef { kind, content });
+        buf = tail;
     }
     out
 }
@@ -603,6 +669,11 @@ const VISUAL_SAMPLE_ENTRY_FIELDS: usize = 78;
 
 /// Reads an `avc1` box (as the content of its header: the visual sample entry fields, then child boxes)
 /// and returns the `avcC` record it holds.
+///
+/// # Errors
+///
+/// A message if the box is shorter than a visual sample entry, has no `avcC` child, or that child is not a record
+/// (see [`parse_avcc`]).
 pub fn parse_avc1_content(content: &[u8]) -> Result<AvcConfig, String> {
     let children = content.get(VISUAL_SAMPLE_ENTRY_FIELDS..).ok_or("avc1 box is shorter than a visual sample entry")?;
     let avcc = boxes(children).into_iter().find(|b| &b.kind == b"avcC").ok_or("avc1 box has no avcC child")?;
@@ -612,19 +683,20 @@ pub fn parse_avc1_content(content: &[u8]) -> Result<AvcConfig, String> {
 /// SPS and PPS NAL units found as Annex-B (start codes `00 00 01` or `00 00 00 01`) anywhere in a payload.
 fn annexb_config(payload: &[u8]) -> Option<AvcConfig> {
     let mut starts = Vec::new(); // (start of the NAL unit, start of its start code)
-    let mut i = 0;
-    while i + 3 <= payload.len() {
-        if payload[i] == 0 && payload[i + 1] == 0 && payload[i + 2] == 1 {
-            let code_at = if i > 0 && payload[i - 1] == 0 { i - 1 } else { i };
-            starts.push((i + 3, code_at));
-            i += 3;
+    let mut i = 0usize;
+    while let Some(&[a, b, c]) = payload.get(i..).and_then(<[u8]>::first_chunk::<3>) {
+        if (a, b, c) == (0, 0, 1) {
+            // A zero byte before the start code makes it a 4-byte one.
+            let code_at = i.checked_sub(1).filter(|before| payload.get(*before) == Some(&0)).unwrap_or(i);
+            starts.push((i.saturating_add(3), code_at));
+            i = i.saturating_add(3);
         } else {
-            i += 1;
+            i = i.saturating_add(1);
         }
     }
     let (mut sps, mut pps) = (None, None);
     for (k, &(nal_at, _)) in starts.iter().enumerate() {
-        let end = starts.get(k + 1).map_or(payload.len(), |&(_, code_at)| code_at);
+        let end = starts.get(k.saturating_add(1)).map_or(payload.len(), |&(_, code_at)| code_at);
         let nal = payload.get(nal_at..end)?;
         match nal.first().map(|b| nal_type(*b)) {
             Some(NAL_SPS) if sps.is_none() && nal.len() >= 4 => sps = Some(nal.to_vec()),
@@ -632,12 +704,15 @@ fn annexb_config(payload: &[u8]) -> Option<AvcConfig> {
             _ => {}
         }
     }
-    let sps = sps?;
+    let sps: Vec<u8> = sps?;
     let pps = pps?;
+    let &[_, profile_indication, profile_compatibility, level_indication, ..] = sps.as_slice() else {
+        return None; // not reached: an SPS is kept only with 4 bytes or more
+    };
     Some(AvcConfig {
-        profile_indication: sps[1],
-        profile_compatibility: sps[2],
-        level_indication: sps[3],
+        profile_indication,
+        profile_compatibility,
+        level_indication,
         length_size: 4,
         sps: vec![sps],
         pps: vec![pps],
@@ -654,15 +729,20 @@ fn annexb_config(payload: &[u8]) -> Option<AvcConfig> {
 /// 4. SPS and PPS NAL units in Annex-B form.
 ///
 /// Returns `None` if none of them parses; the caller then takes the sets from the stream's own NAL units.
+#[must_use]
 pub fn find_avc_config(payload: &[u8]) -> Option<AvcConfig> {
     find_avc_boxes(payload)
-        .or_else(|| (0..=8usize.min(payload.len().saturating_sub(1))).find_map(|off| parse_avcc(&payload[off..]).ok()))
+        .or_else(|| {
+            (0..=8usize.min(payload.len().saturating_sub(1))).find_map(|off| parse_avcc(payload.get(off..)?).ok())
+        })
         .or_else(|| annexb_config(payload))
 }
 
 fn find_avc_boxes(payload: &[u8]) -> Option<AvcConfig> {
-    let find = |kind: &[u8; 4]| (4..payload.len().saturating_sub(3)).find(|&i| &payload[i..i + 4] == kind);
-    let box_at = |type_at: usize| -> Option<BoxRef<'_>> { boxes(payload.get(type_at - 4..)?).into_iter().next() };
+    // The position of a box type at 4 or later (after the 4-byte size of its box).
+    let find = |kind: &[u8; 4]| payload.windows(4).enumerate().skip(4).find(|(_, w)| w == kind).map(|(i, _)| i);
+    let box_at =
+        |type_at: usize| -> Option<BoxRef<'_>> { boxes(payload.get(type_at.checked_sub(4)?..)?).into_iter().next() };
     if let Some(i) = find(b"avc1")
         && let Some(b) = box_at(i)
         && let Ok(cfg) = parse_avc1_content(b.content)
@@ -680,12 +760,25 @@ fn find_avc_boxes(payload: &[u8]) -> Option<AvcConfig> {
 
 #[cfg(test)]
 pub mod testutil {
+    #![expect(
+        clippy::missing_panics_doc,
+        reason = "test builders: a failed unwrap or assert is a failed test, and nobody reads these docs"
+    )]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::*;
     use crate::sps::testutil::{BitWriter, escape_rbsp};
 
     pub const PPS: [u8; 4] = [0x68, 0xEE, 0x3C, 0x80];
 
     /// An IDR slice NAL unit (type 5).
+    #[must_use]
     pub fn idr(body: &[u8]) -> Vec<u8> {
         let mut v = vec![0x65];
         v.extend_from_slice(body);
@@ -693,6 +786,7 @@ pub mod testutil {
     }
 
     /// A non-IDR slice NAL unit (type 1).
+    #[must_use]
     pub fn slice(body: &[u8]) -> Vec<u8> {
         let mut v = vec![0x41];
         v.extend_from_slice(body);
@@ -700,18 +794,20 @@ pub mod testutil {
     }
 
     /// A STAP-A packet payload.
+    #[must_use]
     pub fn stap_a(nals: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![0x18];
         for n in nals {
-            v.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            v.extend_from_slice(&u16::try_from(n.len()).unwrap().to_be_bytes());
             v.extend_from_slice(n);
         }
         v
     }
 
     /// FU-A payloads of at most `chunk` fragment bytes for `nal` (header byte included).
+    #[must_use]
     pub fn fu_a(nal: &[u8], chunk: usize) -> Vec<Vec<u8>> {
-        let (indicator, typ) = ((nal[0] & 0xE0) | 28, nal[0] & 0x1f);
+        let (indicator, typ) = ((nal[0] & 0xE0) | 0x1C, nal[0] & 0x1f);
         let parts: Vec<&[u8]> = nal[1..].chunks(chunk).collect();
         let n = parts.len();
         parts
@@ -733,29 +829,32 @@ pub mod testutil {
     }
 
     /// An `AVCDecoderConfigurationRecord`.
+    #[must_use]
     pub fn avcc_record(profile: u8, compat: u8, level: u8, sps: &[&[u8]], pps: &[&[u8]]) -> Vec<u8> {
-        let mut r = vec![1, profile, compat, level, 0xFF, 0xE0 | sps.len() as u8];
+        let mut r = vec![1, profile, compat, level, 0xFF, 0xE0 | u8::try_from(sps.len()).unwrap()];
         for s in sps {
-            r.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            r.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
             r.extend_from_slice(s);
         }
-        r.push(pps.len() as u8);
+        r.push(u8::try_from(pps.len()).unwrap());
         for p in pps {
-            r.extend_from_slice(&(p.len() as u16).to_be_bytes());
+            r.extend_from_slice(&u16::try_from(p.len()).unwrap().to_be_bytes());
             r.extend_from_slice(p);
         }
         r
     }
 
     /// An ISO box: size, type, content.
+    #[must_use]
     pub fn make_box(kind: &[u8; 4], content: &[u8]) -> Vec<u8> {
-        let mut b = ((content.len() + 8) as u32).to_be_bytes().to_vec();
+        let mut b = u32::try_from(content.len() + 8).unwrap().to_be_bytes().to_vec();
         b.extend_from_slice(kind);
         b.extend_from_slice(content);
         b
     }
 
     /// An `avc1` box: the visual sample entry fields for a `width` x `height` picture, then the child boxes.
+    #[must_use]
     pub fn avc1_box(width: u16, height: u16, children: &[Vec<u8>]) -> Vec<u8> {
         let mut c = vec![0u8; 6]; // reserved
         c.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
@@ -777,28 +876,28 @@ pub mod testutil {
     }
 
     /// The HRD parameters of a VUI.
-    #[derive(Clone, Default)]
+    #[derive(Debug, Clone, Default)]
     pub struct HrdSpec {
         pub cpb_cnt_minus1: u32,
         pub bit_rate_scale: u32,
         pub cpb_size_scale: u32,
         pub entries: Vec<(u32, u32, bool)>,
-        /// initial_cpb_removal_delay_length_minus1, cpb_removal_delay_length_minus1,
-        /// dpb_output_delay_length_minus1, time_offset_length
+        /// `initial_cpb_removal_delay_length_minus1`, `cpb_removal_delay_length_minus1`,
+        /// `dpb_output_delay_length_minus1`, `time_offset_length`
         pub lengths: [u32; 4],
     }
 
     /// The VUI of an SPS, field by field.
-    #[allow(clippy::type_complexity)]
-    #[derive(Clone, Default)]
+    #[expect(clippy::type_complexity, reason = "a test builder: the optional fields hold their sub-fields as tuples")]
+    #[derive(Debug, Clone, Default)]
     pub struct VuiSpec {
-        /// aspect_ratio_idc, and the SAR for 255.
+        /// `aspect_ratio_idc`, and the SAR for 255.
         pub aspect: Option<(u8, Option<(u16, u16)>)>,
         pub overscan: Option<bool>,
-        /// video_format, full range, and the three colour description bytes.
+        /// `video_format`, full range, and the three colour description bytes.
         pub video_signal: Option<(u32, bool, Option<(u8, u8, u8)>)>,
         pub chroma_loc: Option<(u32, u32)>,
-        /// num_units_in_tick, time_scale, fixed_frame_rate_flag
+        /// `num_units_in_tick`, `time_scale`, `fixed_frame_rate_flag`
         pub timing: Option<(u32, u32, bool)>,
         pub nal_hrd: Option<HrdSpec>,
         pub vcl_hrd: Option<HrdSpec>,
@@ -809,11 +908,13 @@ pub mod testutil {
 
     impl VuiSpec {
         /// What the iPad's SPS has: the video signal type with full range and no colour description.
+        #[must_use]
         pub fn ipad() -> Self {
             VuiSpec { video_signal: Some((5, true, None)), ..VuiSpec::default() }
         }
 
         /// Everything there is, with an HRD of two CPBs for both kinds.
+        #[must_use]
         pub fn everything() -> Self {
             let hrd = HrdSpec {
                 cpb_cnt_minus1: 1,
@@ -931,6 +1032,7 @@ pub mod testutil {
     }
 
     /// The restriction the rewrite adds, for a stream with `refs` reference frames.
+    #[must_use]
     pub fn added_restriction(refs: u32) -> Restriction {
         Restriction {
             motion_vectors_over_pic_boundaries: true,
@@ -943,7 +1045,7 @@ pub mod testutil {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     pub struct AvcSpsSpec {
         pub sps_id: u32,
         pub profile_idc: u8,
@@ -965,6 +1067,7 @@ pub mod testutil {
 
     impl AvcSpsSpec {
         /// Baseline, level 3.0, 640x480.
+        #[must_use]
         pub fn baseline_vga() -> Self {
             AvcSpsSpec {
                 sps_id: 0,
@@ -985,6 +1088,7 @@ pub mod testutil {
         }
 
         /// High, level 4.0, 1920x1088 coded and cropped to 1080.
+        #[must_use]
         pub fn high_1080p() -> Self {
             AvcSpsSpec {
                 sps_id: 0,
@@ -1004,6 +1108,7 @@ pub mod testutil {
             }
         }
 
+        #[must_use]
         pub fn nal(&self) -> Vec<u8> {
             let mut w = BitWriter::default();
             w.ue(self.sps_id); // seq_parameter_set_id
@@ -1080,6 +1185,14 @@ pub mod testutil {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
+    )]
     use super::testutil::*;
     use super::*;
 
@@ -1279,7 +1392,7 @@ mod tests {
     fn patched(nal: &[u8]) -> Vec<u8> {
         match add_bitstream_restriction(nal).unwrap() {
             SpsRewrite::Patched(p) => p,
-            other => panic!("expected a rewrite, got {other:?}"),
+            other @ SpsRewrite::AlreadyRestricted(_) => panic!("expected a rewrite, got {other:?}"),
         }
     }
 
@@ -1619,11 +1732,11 @@ mod tests {
         let avcc = make_box(b"avcC", &avcc_content);
         assert_eq!(avcc.len(), 44);
         // The avc1 box: 8 + 78 + 44 = 130, and 4 more bytes make the 134 of the capture.
-        let mut avc1 = avc1_box(2400, 1680, &[avcc, vec![0, 0, 0, 0]]);
-        assert_eq!(avc1.len(), 134);
-        assert_eq!(&avc1[..8], &[0, 0, 0, 0x86, b'a', b'v', b'c', b'1']);
+        let mut sample_entry = avc1_box(2400, 1680, &[avcc, vec![0, 0, 0, 0]]);
+        assert_eq!(sample_entry.len(), 134);
+        assert_eq!(&sample_entry[..8], &[0, 0, 0, 0x86, b'a', b'v', b'c', b'1']);
         let mut packet = vec![0x92, 0xE6, 0xC0, 0xA3];
-        packet.append(&mut avc1);
+        packet.append(&mut sample_entry);
         packet
     }
 
@@ -1696,7 +1809,7 @@ mod tests {
         assert_eq!(find_avc_config(&p), None);
         // Random bytes with the word `avc1` in them never panic.
         for len in 4..120usize {
-            let mut v: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let mut v: Vec<u8> = (0..len).map(|i| u8::try_from(i * 31 % 251).unwrap()).collect();
             v[len / 2..].iter_mut().zip(b"avc1avcC").for_each(|(d, s)| *d = *s);
             let _ = find_avc_config(&v);
         }
