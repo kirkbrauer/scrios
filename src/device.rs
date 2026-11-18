@@ -473,7 +473,7 @@ impl Session {
         ))
         .await?
         .map_err(|e| {
-            format!("this device has no display service (needs iOS 27 and a mounted developer image): {e:?}")
+            format!("this device has no display service (needs iOS 27, Developer Mode on and a mounted developer disk image: `scrios doctor` checks them, `scrios mount-ddi` mounts the image): {e:?}")
         })?;
         let client = self.client.insert(client);
 

@@ -832,6 +832,34 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_made_by_tar_in_the_folder_has_dot_slash_names_and_unpacks() {
+        // `tar czf ddi.tar.gz -C iOS_DDI .` names its entries `./Restore/...`, with a `./` entry of its own.
+        let archive = {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut dir = tar::Header::new_gnu();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_mode(0o755);
+            dir.set_size(0);
+            tar.append_data(&mut dir, "./", std::io::empty()).unwrap();
+            for (name, data) in [
+                ("./Restore/BuildManifest.plist", manifest("022-1.dmg", "Firmware/022-1.dmg.trustcache")),
+                ("./Restore/022-1.dmg", b"image".to_vec()),
+                ("./Restore/Firmware/022-1.dmg.trustcache", b"cache".to_vec()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                tar.append_data(&mut header, name, data.as_slice()).unwrap();
+            }
+            tar.into_inner().unwrap()
+        };
+        let dir = TempDir::new("ddi-dotslash");
+        let dest = dir.path().join("ddi");
+        let folder = install_archive(&archive, &sha256_hex(&archive), &dest).unwrap();
+        assert!(folder.files_for(0x0A, 0x8110).is_ok());
+    }
+
+    #[test]
     fn an_entry_that_leaves_the_folder_is_refused() {
         // `tar::Builder` will not write a `..` path, so the header is written by hand.
         let mut header = tar::Header::new_gnu();
