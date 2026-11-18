@@ -1,0 +1,18 @@
+[package]
+name = "scrios-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Fuzz and differential harnesses for the parsers of scrios (SPS, avcC, RTP depacketizers); not part of the main build"
+
+# Its own workspace: not a member of scrios, so `cargo build` / `cargo test` in the parent never see it.
+[workspace]
+
+[lib]
+# The modules it includes carry unit tests that need the whole of scrios (and its dependencies).
+test = false
+doctest = false
+
+[dependencies]
+# A stand-in with the three logging macros the included modules use (no dependency from any registry).
+tracing = { path = "stubs/tracing" }

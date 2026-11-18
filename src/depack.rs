@@ -224,12 +224,22 @@ impl NalFormat for Hevc {
                     out.push(Item::Malformed);
                     return;
                 }
+                // The NAL header the unit is rebuilt with is judged as a whole NAL unit's is: reserved and
+                // unspecified types are left out, a zero temporal id is malformed.
+                let header = [(p[0] & 0x81) | (fu_type << 1), p[1]];
+                match Self::check_nal(&header) {
+                    NalCheck::Ok(_) => {}
+                    NalCheck::Skip => {
+                        out.push(Item::Ignore);
+                        return;
+                    }
+                    NalCheck::Malformed => {
+                        out.push(Item::Malformed);
+                        return;
+                    }
+                }
                 out.push(Item::Fragment {
-                    start: start.then_some(FragmentStart {
-                        header: [(p[0] & 0x81) | (fu_type << 1), p[1]],
-                        header_len: 2,
-                        typ: fu_type,
-                    }),
+                    start: start.then_some(FragmentStart { header, header_len: 2, typ: fu_type }),
                     fragment: &p[3..],
                     end,
                 });
@@ -254,6 +264,20 @@ pub const H264_CONFIG_KIND: u8 = 18;
 static CONFIG_READ_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONFIG_FAILED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SPS_PATCH_FAILED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SPS_REORDERS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says once (per `warned` flag) that an SPS has a bitstream restriction of its own that allows reordering.
+/// Such an SPS is passed on as it is, whereas the rewrite for one without a restriction says there is none
+/// (`max_num_reorder_frames=0`): the decoder will hold that many pictures back before it outputs them.
+fn note_reordering_sps(r: &crate::avc::Restriction, warned: &std::sync::atomic::AtomicBool) {
+    if r.max_num_reorder_frames > 0 && !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "an H.264 SPS has a bitstream restriction of its own with max_num_reorder_frames={} (max_dec_frame_buffering={}): passing it on as it is; a decoder will hold that many pictures back before it outputs, and a stream that reorders is not the low-latency one this expects",
+            r.max_num_reorder_frames,
+            r.max_dec_frame_buffering
+        );
+    }
+}
 
 impl NalFormat for H264 {
     const PARAM_TYPES: &'static [u8] = &[crate::avc::NAL_SPS, crate::avc::NAL_PPS];
@@ -274,7 +298,10 @@ impl NalFormat for H264 {
         }
         match add_bitstream_restriction(nal) {
             Ok(SpsRewrite::Patched(p)) => Some(p),
-            Ok(SpsRewrite::AlreadyRestricted(_)) => None,
+            Ok(SpsRewrite::AlreadyRestricted(r)) => {
+                note_reordering_sps(&r, &SPS_REORDERS_LOGGED);
+                None
+            }
             Err(e) => {
                 if !SPS_PATCH_FAILED_LOGGED.swap(true, Relaxed) {
                     tracing::warn!(
@@ -389,12 +416,22 @@ impl NalFormat for H264 {
                     out.push(Item::Malformed);
                     return;
                 }
+                // The NAL header the unit is rebuilt with is judged as a whole NAL unit's is: the types that
+                // are not part of the base stream (prefix, extension and reserved ones) are left out.
+                let header = [(b0 & 0xE0) | fu_type, 0];
+                match Self::check_nal(&header[..1]) {
+                    NalCheck::Ok(_) => {}
+                    NalCheck::Skip => {
+                        out.push(Item::Ignore);
+                        return;
+                    }
+                    NalCheck::Malformed => {
+                        out.push(Item::Malformed);
+                        return;
+                    }
+                }
                 out.push(Item::Fragment {
-                    start: start.then_some(FragmentStart {
-                        header: [(b0 & 0xE0) | fu_type, 0],
-                        header_len: 1,
-                        typ: fu_type,
-                    }),
+                    start: start.then_some(FragmentStart { header, header_len: 1, typ: fu_type }),
                     fragment: &p[2..],
                     end,
                 });
@@ -1190,6 +1227,36 @@ mod tests {
     }
 
     #[test]
+    fn a_fragmented_nal_unit_is_judged_by_its_rebuilt_header_like_a_whole_one() {
+        let mut a = Assembler::new();
+        let base = trail(&[1; 4]);
+        // A reserved type (45), fragmented: every fragment is left out, as the whole unit would be.
+        let reserved = vec![45 << 1, 0x01, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE];
+        let frags = fu(&reserved, 3);
+        assert!(frags.len() > 1);
+        let mut out = Vec::new();
+        for (i, f) in frags.iter().enumerate() {
+            out.extend(feed(&mut a, 1 + i as u16, 100, false, f));
+        }
+        let mut seq = 1 + frags.len() as u16;
+        out.extend(feed(&mut a, seq, 100, true, &base));
+        assert_eq!(out.len(), 1);
+        assert_eq!(unit(&out[0]).payload, annexb(&[&base]));
+        seq += 1;
+
+        // A temporal id plus 1 of 0 is never valid: the unit is dropped, as with a whole NAL unit of it.
+        let bad = vec![1 << 1, 0x00, 1, 2, 3, 4, 5, 6];
+        let frags = fu(&bad, 3);
+        let mut out = Vec::new();
+        for (i, f) in frags.iter().enumerate() {
+            out.extend(feed(&mut a, seq + i as u16, 200, i == frags.len() - 1, f));
+        }
+        assert_eq!(out, vec![Output::Dropped { timestamp: 200, reason: DropReason::Malformed }]);
+        let whole = feed(&mut a, seq + frags.len() as u16, 300, true, &bad);
+        assert!(matches!(whole[0], Output::Dropped { reason: DropReason::Malformed, .. }));
+    }
+
+    #[test]
     fn an_oversized_unit_is_dropped_and_memory_stays_bounded() {
         let mut a = Assembler::with_max_unit_bytes(1000);
         let big = trail(&[1; 1500]);
@@ -1609,6 +1676,26 @@ mod h264_tests {
     }
 
     #[test]
+    fn fragmented_extension_and_prefix_nal_units_are_left_out_like_whole_ones() {
+        let mut a = H264Assembler::new();
+        let base = slice(&[1; 4]);
+        let mut out = Vec::new();
+        let mut seq = 1;
+        // A prefix NAL unit (14) and a slice extension (20), each in three FU-A fragments.
+        for typ in [14u8, 20] {
+            let frags = fu_a(&[0x60 | typ, 1, 2, 3, 4, 5, 6, 7], 3);
+            assert!(frags.len() > 1);
+            for f in &frags {
+                out.extend(feed(&mut a, seq, 100, false, f));
+                seq += 1;
+            }
+        }
+        out.extend(feed(&mut a, seq, 100, true, &base));
+        assert_eq!(out.len(), 1);
+        assert_eq!(unit(&out[0]).payload, annexb(&[&base]));
+    }
+
+    #[test]
     fn an_oversized_unit_is_dropped_and_memory_stays_bounded() {
         let mut a = H264Assembler::with_max_unit_bytes(1000);
         let frags = fu_a(&slice(&[1; 1500]), 100);
@@ -1825,6 +1912,60 @@ mod h264_tests {
         out.extend(feed(&mut a, 2, 100, false, &PPS));
         out.extend(feed(&mut a, 3, 100, true, &idr(&[1; 4])));
         assert_eq!(unit(&out[0]).payload, annexb(&[&restricted, &PPS, &idr(&[1; 4])]));
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn an_sps_with_a_restriction_that_allows_reordering_is_warned_about_once() {
+        let restriction = |reorder| crate::avc::Restriction {
+            motion_vectors_over_pic_boundaries: true,
+            max_bytes_per_pic_denom: 0,
+            max_bits_per_mb_denom: 0,
+            log2_max_mv_length_horizontal: 13,
+            log2_max_mv_length_vertical: 13,
+            max_num_reorder_frames: reorder,
+            max_dec_frame_buffering: 4,
+        };
+        let log = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt().with_writer(log.clone()).with_ansi(false).finish();
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        tracing::subscriber::with_default(subscriber, || {
+            // No reordering: nothing to say, and the once-only flag stays unused.
+            note_reordering_sps(&restriction(0), &warned);
+            assert!(!warned.load(std::sync::atomic::Ordering::Relaxed));
+            note_reordering_sps(&restriction(2), &warned);
+            note_reordering_sps(&restriction(3), &warned);
+        });
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("max_num_reorder_frames")).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains(" WARN ") && lines[0].contains("max_num_reorder_frames=2"), "{text}");
+        assert!(lines[0].contains("max_dec_frame_buffering=4"), "{text}");
+
+        // Through the assembler: the SPS is still passed on as it came.
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.vui = Some(crate::avc::testutil::VuiSpec { restriction: Some(restriction(2)), ..Default::default() });
+        let reordering = spec.nal();
+        assert_eq!(H264::transform_nal(crate::avc::NAL_SPS, &reordering), None);
     }
 
     /// A slice NAL unit of the given NAL header byte and slice_type.

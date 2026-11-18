@@ -72,16 +72,24 @@ impl SpsInfo {
     }
 
     /// The picture size after the conformance window is applied (what a decoder outputs).
-    pub fn cropped_size(&self) -> (u32, u32) {
+    ///
+    /// The offsets are `ue(v)` values read from the stream, so they can be anything up to 2^32-1: the
+    /// arithmetic is done in 64 bits, and a window that leaves no picture (a crop of the whole coded
+    /// size or more) is an error rather than a zero or wrapped size.
+    pub fn cropped_size(&self) -> Result<(u32, u32), SpsError> {
         let (sub_w, sub_h) = match self.chroma_format_idc {
-            1 => (2, 2),
+            1 => (2u64, 2u64),
             2 => (2, 1),
             _ => (1, 1), // monochrome and 4:4:4
         };
-        let [left, right, top, bottom] = self.conf_window;
-        let w = self.width.saturating_sub(sub_w * left.saturating_add(right));
-        let h = self.height.saturating_sub(sub_h * top.saturating_add(bottom));
-        (w, h)
+        let [left, right, top, bottom] = self.conf_window.map(u64::from);
+        let crop_w = sub_w.saturating_mul(left.saturating_add(right));
+        let crop_h = sub_h.saturating_mul(top.saturating_add(bottom));
+        if crop_w >= u64::from(self.width) || crop_h >= u64::from(self.height) {
+            return Err(SpsError::Invalid("conformance window"));
+        }
+        // Both are below a u32, so the differences are too.
+        Ok(((u64::from(self.width) - crop_w) as u32, (u64::from(self.height) - crop_h) as u32))
     }
 }
 
@@ -287,7 +295,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
         }
     }
 
-    Ok(SpsInfo {
+    let info = SpsInfo {
         profile_space,
         tier_high,
         profile_idc,
@@ -298,7 +306,10 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
         width,
         height,
         conf_window,
-    })
+    };
+    // A conformance window that leaves no picture is not an SPS to trust (and its size must never wrap).
+    info.cropped_size()?;
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -434,7 +445,7 @@ mod tests {
         assert_eq!((sps.width, sps.height), (1216, 2656));
         assert_eq!(sps.conf_window, [0; 4]);
         assert_eq!(sps.codec_string("hev1"), "hev1.1.6.L150.B0");
-        assert_eq!(sps.cropped_size(), (1216, 2656));
+        assert_eq!(sps.cropped_size(), Ok((1216, 2656)));
     }
 
     #[test]
@@ -462,14 +473,14 @@ mod tests {
         let sps = parse_sps(&spec.nal()).unwrap();
         assert_eq!((sps.width, sps.height), (1920, 1088));
         assert_eq!(sps.conf_window, [0, 0, 0, 4]);
-        assert_eq!(sps.cropped_size(), (1920, 1080));
+        assert_eq!(sps.cropped_size(), Ok((1920, 1080)));
         assert_eq!(sps.codec_string("hvc1"), "hvc1.1.6.L120.B0");
 
         // Padding on the right and bottom, as the phone's encoder does, if it declared it.
         let mut spec = SpsSpec::main_l150(1216, 2656);
         spec.conf_window = Some([0, 5, 0, 17]);
         let sps = parse_sps(&spec.nal()).unwrap();
-        assert_eq!(sps.cropped_size(), (1216 - 10, 2656 - 34));
+        assert_eq!(sps.cropped_size(), Ok((1216 - 10, 2656 - 34)));
     }
 
     #[test]
@@ -479,13 +490,57 @@ mod tests {
         spec.chroma_format_idc = 2; // 4:2:2: SubWidthC 2, SubHeightC 1
         spec.conf_window = Some([1, 1, 1, 1]);
         let sps = parse_sps(&spec.nal()).unwrap();
-        assert_eq!(sps.cropped_size(), (60, 62));
+        assert_eq!(sps.cropped_size(), Ok((60, 62)));
         spec.chroma_format_idc = 3; // 4:4:4: 1 and 1
         let sps = parse_sps(&spec.nal()).unwrap();
-        assert_eq!(sps.cropped_size(), (62, 62));
+        assert_eq!(sps.cropped_size(), Ok((62, 62)));
         spec.chroma_format_idc = 0; // monochrome: 1 and 1
         let sps = parse_sps(&spec.nal()).unwrap();
-        assert_eq!(sps.cropped_size(), (62, 62));
+        assert_eq!(sps.cropped_size(), Ok((62, 62)));
+    }
+
+    #[test]
+    fn a_conformance_window_that_overflows_or_leaves_no_picture_is_an_error_not_a_wrapped_size() {
+        // ue(v) offsets of up to 2^32-2 (the longest the reader accepts), times a chroma unit of 2, overflowed
+        // a u32 (a panic in a debug build, a wrapped size in a release one); the SPS must be rejected instead.
+        const BIG: u32 = u32::MAX - 1;
+        let mut spec = SpsSpec::main_l150(1216, 2656);
+        for window in [
+            [BIG, BIG, 0, 0],
+            [0, 0, BIG, BIG],
+            [0x8000_0000, 0, 0, 0],
+            [0x4000_0000, 0x4000_0000, 0, 0],
+            [0, 0, 0x7FFF_FFFF, 1],
+        ] {
+            spec.conf_window = Some(window);
+            assert_eq!(parse_sps(&spec.nal()), Err(SpsError::Invalid("conformance window")), "window {window:?}");
+        }
+        // A crop of exactly the coded size (or one chroma unit more) leaves nothing.
+        let mut spec = SpsSpec::main_l150(64, 64);
+        spec.conf_window = Some([16, 16, 0, 0]); // 2 * 32 = 64 columns
+        assert_eq!(parse_sps(&spec.nal()), Err(SpsError::Invalid("conformance window")));
+        spec.conf_window = Some([0, 0, 16, 16]);
+        assert_eq!(parse_sps(&spec.nal()), Err(SpsError::Invalid("conformance window")));
+        spec.conf_window = Some([16, 17, 0, 0]);
+        assert_eq!(parse_sps(&spec.nal()), Err(SpsError::Invalid("conformance window")));
+        // One unit less is a picture of 2 columns.
+        spec.conf_window = Some([16, 15, 0, 0]);
+        assert_eq!(parse_sps(&spec.nal()).unwrap().cropped_size(), Ok((2, 64)));
+
+        // A hand-built SpsInfo (its fields are public) gets the same answer, without a panic.
+        let mut info = parse_sps(&SpsSpec::main_l150(64, 64).nal()).unwrap();
+        info.conf_window = [u32::MAX, u32::MAX, u32::MAX, u32::MAX];
+        assert_eq!(info.cropped_size(), Err(SpsError::Invalid("conformance window")));
+        // And through the codec layer, which reports it as a string error.
+        assert!(
+            crate::codec::CodecKind::Hevc
+                .describe_sps(&{
+                    let mut spec = SpsSpec::main_l150(1216, 2656);
+                    spec.conf_window = Some([u32::MAX, 0, 0, 0]);
+                    spec.nal()
+                })
+                .is_err()
+        );
     }
 
     #[test]

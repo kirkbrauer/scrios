@@ -120,15 +120,20 @@ fn skip_scaling_list(b: &mut Bits<'_>, size: usize) -> Result<(), SpsError> {
     Ok(())
 }
 
+/// The longest side of a picture accepted (the same limit as for HEVC), coded or cropped.
+const MAX_PICTURE_SIDE: u64 = 32768;
+
 /// Parses an H.264 SPS NAL unit (with its one-byte header, without a start code): profile, level,
 /// and the picture size with the cropping applied (ITU-T H.264 7.3.2.1.1).
 pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     if nal.len() < 5 || nal[0] & 0x80 != 0 || nal_type(nal[0]) != NAL_SPS {
         return Err(SpsError::NotSps);
     }
-    let (profile_idc, constraint_flags, level_idc) = (nal[1], nal[2], nal[3]);
-    let rbsp = unescape_rbsp(&nal[4..]);
+    // Emulation prevention covers everything after the NAL header byte, the profile, constraint flags and level
+    // too (a `00 00` there is followed by `03` if the next byte is 0..=3): unescape it all, as the rewrite does.
+    let rbsp = unescape_rbsp(&nal[1..]);
     let mut b = Bits::new(&rbsp);
+    let (profile_idc, constraint_flags, level_idc) = (b.u(8)? as u8, b.u(8)? as u8, b.u(8)? as u8);
     b.ue()?; // seq_parameter_set_id
     let mut chroma_format_idc = 1;
     if has_chroma_info(profile_idc) {
@@ -187,6 +192,11 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
         }
     }
     let frame_height_mbs = (2 - u64::from(frame_mbs_only)) * height_map_units;
+    // The coded size is checked as well as the cropped one: it is what `coded_width`/`coded_height` hold, and
+    // macroblock counts read off the wire are up to 2^32, which would wrap there.
+    if width_mbs * 16 > MAX_PICTURE_SIDE || frame_height_mbs * 16 > MAX_PICTURE_SIDE {
+        return Err(SpsError::Invalid("picture size"));
+    }
     // Cropping is in chroma sample units (ChromaArrayType 0 has none).
     let (unit_x, unit_y) = match chroma_format_idc {
         0 => (1, 2 - u64::from(frame_mbs_only)),
@@ -196,7 +206,7 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     };
     let width = (width_mbs * 16).saturating_sub(unit_x * (crop[0] + crop[1]));
     let height = (frame_height_mbs * 16).saturating_sub(unit_y * (crop[2] + crop[3]));
-    if width == 0 || height == 0 || width > 32768 || height > 32768 {
+    if width == 0 || height == 0 || width > MAX_PICTURE_SIDE || height > MAX_PICTURE_SIDE {
         return Err(SpsError::Invalid("picture size"));
     }
     Ok(AvcSps {
@@ -935,6 +945,7 @@ pub mod testutil {
 
     #[derive(Clone)]
     pub struct AvcSpsSpec {
+        pub sps_id: u32,
         pub profile_idc: u8,
         pub constraint_flags: u8,
         pub level_idc: u8,
@@ -956,6 +967,7 @@ pub mod testutil {
         /// Baseline, level 3.0, 640x480.
         pub fn baseline_vga() -> Self {
             AvcSpsSpec {
+                sps_id: 0,
                 profile_idc: 66,
                 constraint_flags: 0xC0,
                 level_idc: 30,
@@ -975,6 +987,7 @@ pub mod testutil {
         /// High, level 4.0, 1920x1088 coded and cropped to 1080.
         pub fn high_1080p() -> Self {
             AvcSpsSpec {
+                sps_id: 0,
                 profile_idc: 100,
                 constraint_flags: 0,
                 level_idc: 40,
@@ -993,7 +1006,7 @@ pub mod testutil {
 
         pub fn nal(&self) -> Vec<u8> {
             let mut w = BitWriter::default();
-            w.ue(0); // seq_parameter_set_id
+            w.ue(self.sps_id); // seq_parameter_set_id
             if has_chroma_info(self.profile_idc) {
                 w.ue(self.chroma_format_idc);
                 if self.chroma_format_idc == 3 {
@@ -1089,6 +1102,56 @@ mod tests {
         assert_eq!(sps.codec_string(), "avc1.640028");
         assert_eq!(sps.constraint_names(), "none");
         assert_eq!(sps.chroma_format_idc, 1);
+    }
+
+    #[test]
+    fn a_coded_size_over_32768_is_refused_even_when_the_cropped_one_is_not() {
+        // 2048 macroblocks across is 32768: the limit itself is fine.
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.width_mbs = 2048;
+        let sps = parse_avc_sps(&spec.nal()).unwrap();
+        assert_eq!((sps.width, sps.coded_width), (32768, 32768));
+        spec.height_map_units = 2048;
+        assert_eq!(parse_avc_sps(&spec.nal()).unwrap().coded_height, 32768);
+        // One macroblock more is 32784 coded, and cropping 8 chroma units off it (16 columns) would leave
+        // 32768: the picture is still too big for the coded size.
+        spec.width_mbs = 2049;
+        spec.crop = Some([0, 8, 0, 0]);
+        assert_eq!(parse_avc_sps(&spec.nal()), Err(SpsError::Invalid("picture size")));
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.height_map_units = 2049;
+        spec.crop = Some([0, 0, 0, 8]);
+        assert_eq!(parse_avc_sps(&spec.nal()), Err(SpsError::Invalid("picture size")));
+        // Interlaced: the frame is two map units tall for each.
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.frame_mbs_only = false;
+        spec.height_map_units = 1025; // 2050 macroblocks of frame height
+        assert_eq!(parse_avc_sps(&spec.nal()), Err(SpsError::Invalid("picture size")));
+        // Macroblock counts that do not fit 32 bits once multiplied by 16 are an error, not a wrapped size.
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.width_mbs = 1 << 28; // x 16 = 2^32: wrapped to 0 as a u32
+        spec.crop = Some([0, 0, 0, 0]);
+        assert_eq!(parse_avc_sps(&spec.nal()), Err(SpsError::Invalid("picture size")));
+    }
+
+    #[test]
+    fn an_emulation_prevention_byte_between_the_level_and_the_first_field_is_removed() {
+        // Constraint flags 0 and level 0 followed by an SPS id of 255 (eight zero bits) make `00 00 00`, which the
+        // NAL unit escapes as `00 00 03 00` across the end of the header fields: the byte after the level is 03.
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.sps_id = 255;
+        spec.constraint_flags = 0;
+        spec.level_idc = 0;
+        let unescaped = spec.nal();
+        let mut escaped = vec![unescaped[0]];
+        escaped.extend_from_slice(&escape_rbsp(&unescaped[1..]));
+        assert_eq!(&escaped[1..6], &[66, 0, 0, 3, 0], "the escape byte is there");
+        let want = parse_avc_sps(&unescaped).unwrap();
+        assert_eq!((want.width, want.height), (640, 480));
+        assert_eq!(parse_avc_sps(&escaped), Ok(want.clone()));
+        // And the rewrite, which always unescaped it, leaves the same picture.
+        let SpsRewrite::Patched(patched) = add_bitstream_restriction(&escaped).unwrap() else { panic!("not patched") };
+        assert_eq!(parse_avc_sps(&patched), Ok(want));
     }
 
     #[test]

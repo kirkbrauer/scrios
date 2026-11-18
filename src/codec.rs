@@ -47,7 +47,7 @@ impl CodecKind {
                 Ok(SpsDescription {
                     codec: sps.codec_string("hev1"),
                     coded: (sps.width, sps.height),
-                    visible: sps.cropped_size(),
+                    visible: sps.cropped_size().map_err(|e| e.to_string())?,
                 })
             }
             CodecKind::H264 => {

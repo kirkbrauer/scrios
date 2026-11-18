@@ -25,8 +25,9 @@ use crate::outqueue::OutQueue;
 pub const AXIS_MAX: f64 = 65535.0;
 /// Touch positions are sent at most this often while a finger moves (the newest wins).
 pub const MOVE_INTERVAL: Duration = Duration::from_millis(8);
-/// Each HID report must go out within this, or it is given up on: a stalled service must not hold
-/// the stream loop.
+/// Each HID report must go out within this, or it is given up on: a stalled service must not keep the
+/// reports behind it waiting for long (the stream loop does not wait for it at all, see
+/// [`ActionQueue`]).
 pub const SEND_TIMEOUT: Duration = Duration::from_millis(500);
 /// Key presses waiting for their release (held down for the button's hold time) at most.
 const MAX_KEYS_HELD: usize = 8;
@@ -314,6 +315,88 @@ impl Action {
             Action::KeyboardRemove => Duration::from_secs(2),
             _ => SEND_TIMEOUT,
         }
+    }
+
+    /// Whether it lets go of something (a lift, a button or key up, the keyboard released or removed). These
+    /// are never refused by a full [`ActionQueue`]: what is held down must come up.
+    pub fn is_release(self) -> bool {
+        match self {
+            Action::Touch { down, .. } | Action::Button { down, .. } | Action::Key { down, .. } => !down,
+            Action::KeyboardRelease | Action::KeyboardRemove => true,
+        }
+    }
+}
+
+/// The most actions that wait for the HID service (not counting releases, see [`ActionQueue::push`]).
+pub const ACTION_QUEUE_CAP: usize = 64;
+
+/// The actions waiting to be performed, in the order they were made: what stands between the controller
+/// and a HID service that is slow or stuck, so that the stream loop never waits for the service.
+///
+/// Order is kept: nothing is reordered, and a finger down, a lift, a button or a key is never dropped
+/// to make room (a refused press is reported to the caller, a release is always taken). The only
+/// thing that may be lost is a touch *move*, a mere sample of where the finger is: a move that is
+/// waiting while the next one arrives is replaced by it, and when the queue is full the oldest move
+/// makes room.
+#[derive(Debug, Default)]
+pub struct ActionQueue {
+    items: VecDeque<Queued>,
+    /// Whether the finger is down as of the last action queued: the next contact sample is then a
+    /// move, not a down.
+    finger_down: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Queued {
+    action: Action,
+    /// A contact sample of a finger that was down already.
+    is_move: bool,
+}
+
+impl ActionQueue {
+    /// Queues `action`. Returns false if it was refused: the queue is full of presses and the action
+    /// is another one (never a release, which is always taken, and never a move, which replaces the
+    /// pending move or the oldest one).
+    pub fn push(&mut self, action: Action) -> bool {
+        let is_move = self.finger_down && matches!(action, Action::Touch { down: true, .. });
+        if is_move && let Some(tail) = self.items.back_mut().filter(|q| q.is_move) {
+            tail.action = action; // the newest position wins; the order does not change
+            return true;
+        }
+        if self.items.len() >= ACTION_QUEUE_CAP {
+            match self.items.iter().position(|q| q.is_move) {
+                Some(oldest) => {
+                    self.items.remove(oldest);
+                }
+                None if action.is_release() => {}
+                None => return false,
+            }
+        }
+        if let Action::Touch { down, .. } = action {
+            self.finger_down = down;
+        }
+        self.items.push_back(Queued { action, is_move });
+        true
+    }
+
+    /// The next action to perform.
+    pub fn pop(&mut self) -> Option<Action> {
+        self.items.pop_front().map(|q| q.action)
+    }
+
+    /// Forgets the moves that wait (the finger is about to be lifted anyway); how many there were.
+    pub fn drop_moves(&mut self) -> usize {
+        let before = self.items.len();
+        self.items.retain(|q| !q.is_move);
+        before - self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
     }
 }
 
@@ -2204,5 +2287,163 @@ mod tests {
         let cfg = crate::engine::EngineConfig::new(0x1234_5678);
         let e = crate::engine::Engine::new(cfg, q.clone(), Instant::now());
         assert_eq!(e.stats().edge_downs, 3);
+    }
+
+    // ---- the queue between the controller and the service ------------------------------------
+
+    fn contact(x: u16) -> Action {
+        Action::Touch { down: true, x, y: 0 }
+    }
+
+    fn lift(x: u16) -> Action {
+        Action::Touch { down: false, x, y: 0 }
+    }
+
+    fn home(down: bool) -> Action {
+        Action::Button { page: 0x0C, code: 0x40, down }
+    }
+
+    fn drained(q: &mut ActionQueue) -> Vec<Action> {
+        std::iter::from_fn(|| q.pop()).collect()
+    }
+
+    /// What waits in the queue, without taking it.
+    fn waiting(q: &ActionQueue) -> Vec<Action> {
+        q.items.iter().map(|i| i.action).collect()
+    }
+
+    #[test]
+    fn a_pending_move_is_replaced_by_the_next_one_and_the_order_is_kept() {
+        let mut q = ActionQueue::default();
+        for a in [contact(1), contact(2), contact(3), contact(4)] {
+            assert!(q.push(a));
+        }
+        // The first is the down; the three after it are moves of which only the newest is kept.
+        assert_eq!(q.len(), 2);
+        assert_eq!(drained(&mut q), vec![contact(1), contact(4)]);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_down_is_never_replaced_by_a_move_and_a_lift_or_a_key_in_between_keeps_moves_apart() {
+        let mut q = ActionQueue::default();
+        let key = Action::Key { usage: 4, down: true };
+        for a in [
+            contact(1), // down
+            contact(2), // move
+            key,        // a key in between: the next move does not reach back over it
+            contact(3), // move
+            contact(4), // replaces 3
+            lift(5),
+            contact(6), // a new down: not a move, so not merged with anything
+            contact(7), // move
+            home(true),
+            home(false),
+            lift(8),
+        ] {
+            assert!(q.push(a), "{a:?}");
+        }
+        assert_eq!(
+            drained(&mut q),
+            vec![
+                contact(1),
+                contact(2),
+                key,
+                contact(4),
+                lift(5),
+                contact(6),
+                contact(7),
+                home(true),
+                home(false),
+                lift(8)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_full_queue_makes_room_with_its_oldest_move_and_refuses_a_press_but_never_a_release() {
+        let mut q = ActionQueue::default();
+        assert!(q.push(contact(0))); // the down
+        let key = |n: u8| Action::Key { usage: n, down: true };
+        // Presses (and a move among them) up to the cap.
+        assert!(q.push(key(0)));
+        assert!(q.push(contact(1))); // a move, after a key: its own entry
+        for n in 1..(ACTION_QUEUE_CAP as u8 - 2) {
+            assert!(q.push(key(n)));
+        }
+        assert_eq!(q.len(), ACTION_QUEUE_CAP);
+        // Another press: the pending move is the one to go.
+        assert!(q.push(key(100)));
+        assert_eq!(q.len(), ACTION_QUEUE_CAP);
+        assert!(!waiting(&q).contains(&contact(1)));
+        // Nothing to give up now: a press is refused, and so is a down after a lift ...
+        assert!(!q.push(key(101)));
+        assert!(!q.push(home(true)));
+        assert_eq!(q.len(), ACTION_QUEUE_CAP);
+        // ... but a lift, a button up, a key up and a keyboard release are always taken, in order.
+        for a in [
+            lift(9),
+            home(false),
+            Action::Key { usage: 4, down: false },
+            Action::KeyboardRelease,
+            Action::KeyboardRemove,
+        ] {
+            assert!(q.push(a), "{a:?}");
+        }
+        let all = drained(&mut q);
+        assert_eq!(all.len(), ACTION_QUEUE_CAP + 5);
+        assert_eq!(all[0], contact(0));
+        assert_eq!(all[ACTION_QUEUE_CAP - 1], key(100));
+        assert_eq!(
+            all[ACTION_QUEUE_CAP..],
+            [
+                lift(9),
+                home(false),
+                Action::Key { usage: 4, down: false },
+                Action::KeyboardRelease,
+                Action::KeyboardRemove
+            ]
+        );
+    }
+
+    #[test]
+    fn a_move_when_the_queue_is_full_of_presses_is_the_one_that_replaces_the_oldest_move() {
+        let mut q = ActionQueue::default();
+        assert!(q.push(contact(0)));
+        assert!(q.push(Action::Key { usage: 1, down: true }));
+        assert!(q.push(contact(1))); // a move, behind the key
+        assert!(q.push(Action::Key { usage: 2, down: true }));
+        while q.len() < ACTION_QUEUE_CAP {
+            assert!(q.push(Action::Key { usage: 3, down: true }));
+        }
+        // A new move cannot merge (a key is last); the oldest move is dropped for it.
+        assert!(q.push(contact(2)));
+        let all = waiting(&q);
+        assert_eq!(all.len(), ACTION_QUEUE_CAP);
+        assert!(!all.contains(&contact(1)));
+        assert_eq!(all.last(), Some(&contact(2)));
+    }
+
+    #[test]
+    fn at_the_end_the_waiting_moves_are_dropped_and_the_rest_stays() {
+        let mut q = ActionQueue::default();
+        let key = Action::Key { usage: 4, down: true };
+        for a in [contact(1), contact(2), key, contact(3), home(true)] {
+            q.push(a);
+        }
+        assert_eq!(q.drop_moves(), 2);
+        assert_eq!(drained(&mut q), vec![contact(1), key, home(true)]);
+    }
+
+    #[test]
+    fn what_lets_go_is_a_release() {
+        assert!(lift(0).is_release());
+        assert!(home(false).is_release());
+        assert!(Action::Key { usage: 4, down: false }.is_release());
+        assert!(Action::KeyboardRelease.is_release());
+        assert!(Action::KeyboardRemove.is_release());
+        assert!(!contact(0).is_release());
+        assert!(!home(true).is_release());
+        assert!(!Action::Key { usage: 4, down: true }.is_release());
     }
 }

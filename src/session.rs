@@ -1,8 +1,11 @@
 //! The async loop that drives an [`Engine`] from a datagram socket, the command channel and the
 //! clock. The socket and the clock are traits, so the loop runs against fakes in the tests.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::io;
+use std::pin::Pin;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
@@ -11,7 +14,7 @@ use tracing::{debug, warn};
 use crate::commands::Command;
 use crate::displayinfo::{DisplayInfoSource, DisplayQuery};
 use crate::engine::Engine;
-use crate::hid::{Hid, HidBackend};
+use crate::hid::{Action, ActionQueue, Hid, HidBackend};
 
 /// One datagram from the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,29 +87,147 @@ pub struct Links<'a> {
     pub hid: Option<HidLink<'a>>,
 }
 
-/// Performs what the controller has queued, each action within its own time limit. A failed
-/// keyboard action makes the controller queue a release, which is performed in the next round
-/// (a few rounds at most).
-async fn perform_hid<C: Clock>(link: &mut HidLink<'_>, clock: &C) {
-    for _ in 0..4 {
-        let actions = link.hid.take_actions();
-        if actions.is_empty() {
-            return;
+/// At the end, how long the actions still waiting for the HID service (the lift of a finger, the release of
+/// keys, taking the keyboard down) are waited for in all. The service answers in a few milliseconds when it
+/// is well; this only bounds the wait on one that is not (each action has its own, shorter, limit too).
+pub const HID_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+
+/// What the loop and the HID pump share. They run in one task (the backend is not `Send`), so this is
+/// only ever touched between awaits; the lock is there for the type system.
+#[derive(Default)]
+struct HidShared {
+    state: Mutex<HidState>,
+    /// The pump has something to do.
+    work: Notify,
+    /// The pump finished an action: the loop may have a failure to read, or the end to see.
+    done: Notify,
+}
+
+#[derive(Default)]
+struct HidState {
+    queue: ActionQueue,
+    /// An action is being performed (it is not in the queue any more).
+    busy: bool,
+    /// What the backend refused or did not answer in time, to be told to the controller.
+    failures: Vec<(Action, String)>,
+}
+
+impl HidShared {
+    fn state(&self) -> MutexGuard<'_, HidState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues an action for the pump; false if it was refused (see [`ActionQueue::push`]).
+    fn push(&self, action: Action) -> bool {
+        let queued = self.state().queue.push(action);
+        self.work.notify_one();
+        queued
+    }
+
+    fn take_failures(&self) -> Vec<(Action, String)> {
+        std::mem::take(&mut self.state().failures)
+    }
+
+    /// Nothing waits and nothing is being performed.
+    fn idle(&self) -> bool {
+        let state = self.state();
+        state.queue.is_empty() && !state.busy
+    }
+
+    fn next_action(&self) -> Option<Action> {
+        let mut state = self.state();
+        let action = state.queue.pop();
+        state.busy = action.is_some();
+        action
+    }
+
+    fn finished(&self, action: Action, failure: Option<String>) {
+        let mut state = self.state();
+        state.busy = false;
+        if let Some(failure) = failure {
+            state.failures.push((action, failure));
         }
-        for action in actions {
-            let limit = action.timeout();
-            let failure = match tokio::time::timeout(limit, link.backend.perform(action)).await {
-                Ok(Ok(())) => continue,
-                Ok(Err(e)) => e,
-                Err(_) => format!("the HID service did not answer in {} ms", limit.as_millis()),
-            };
-            link.hid.on_action_failed(clock.now(), &failure, action);
+        drop(state);
+        self.done.notify_one();
+    }
+}
+
+/// Performs the queued actions one at a time, in order, each within its own time limit. It runs beside
+/// the loop (see [`run_session`]), so a service that does not answer holds up only the actions behind it,
+/// never the video, the commands or the clock. It does not end.
+async fn hid_pump(backend: &mut dyn HidBackend, shared: &HidShared) -> Infallible {
+    loop {
+        let Some(action) = shared.next_action() else {
+            shared.work.notified().await;
+            continue;
+        };
+        let limit = action.timeout();
+        let failure = match tokio::time::timeout(limit, backend.perform(action)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some(format!("the HID service did not answer in {} ms", limit.as_millis())),
+        };
+        shared.finished(action, failure);
+    }
+}
+
+/// The controller's side of the HID link, as the loop has it.
+struct HidSide<'a> {
+    hid: &'a mut Hid,
+    shared: &'a HidShared,
+}
+
+impl HidSide<'_> {
+    /// Tells the controller what failed and hands what it has queued to the pump. A failed keyboard action
+    /// makes the controller queue a release, which goes on in the next round (a few rounds at most).
+    fn sync<C: Clock>(&mut self, clock: &C) {
+        for _ in 0..4 {
+            let failures = self.shared.take_failures();
+            for (action, failure) in &failures {
+                self.hid.on_action_failed(clock.now(), failure, *action);
+            }
+            let actions = self.hid.take_actions();
+            if failures.is_empty() && actions.is_empty() {
+                return;
+            }
+            for action in actions {
+                if !self.shared.push(action) {
+                    let why = "the HID service is not keeping up: too many actions are waiting, one was dropped";
+                    self.hid.on_action_failed(clock.now(), why, action);
+                }
+            }
+        }
+    }
+
+    /// The end of the session: lets go of everything and waits (for [`HID_SHUTDOWN_BUDGET`] at most) until
+    /// the actions that do so, and those still waiting before them, have been performed.
+    async fn finish<C: Clock>(&mut self, clock: &C) {
+        self.hid.shutdown();
+        // The finger is lifted next: where it was on its way there is of no interest.
+        self.shared.state().queue.drop_moves();
+        let give_up = tokio::time::Instant::now() + HID_SHUTDOWN_BUDGET;
+        loop {
+            self.sync(clock);
+            if self.shared.idle() {
+                return;
+            }
+            tokio::select! {
+                _ = self.shared.done.notified() => {}
+                _ = tokio::time::sleep_until(give_up) => {
+                    warn!("the HID service did not finish within {} s of the end: giving up", HID_SHUTDOWN_BUDGET.as_secs());
+                    return;
+                }
+            }
         }
     }
 }
 
 /// Runs until a stop, the consumer going away, or a failure. Before it returns, a finger still on
 /// the screen is lifted and held keys are released.
+///
+/// What the controller asks of the HID service is performed beside the loop, by a pump in this same
+/// task (see [`hid_pump`] and [`ActionQueue`]): the loop never awaits the service, so a service that
+/// has stalled holds up neither the video nor the commands.
 pub async fn run_session<S: DatagramSocket, C: Clock>(
     sock: &S,
     engine: &mut Engine,
@@ -115,7 +236,32 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
     clock: &C,
     links: Links<'_>,
 ) -> Exit {
-    let Links { display, mut hid } = links;
+    let Links { display, hid } = links;
+    let shared = HidShared::default();
+    let (side, backend) = match hid {
+        Some(HidLink { hid, backend }) => (Some(HidSide { hid, shared: &shared }), Some(backend)),
+        None => (None, None),
+    };
+    let mut pump: Pin<Box<dyn Future<Output = Infallible> + '_>> = match backend {
+        Some(backend) => Box::pin(hid_pump(backend, &shared)),
+        None => Box::pin(std::future::pending()),
+    };
+    let session = session_loop(sock, engine, commands, consumer_gone, clock, display, side);
+    tokio::select! {
+        exit = session => exit,
+        never = &mut pump => match never {},
+    }
+}
+
+async fn session_loop<S: DatagramSocket, C: Clock>(
+    sock: &S,
+    engine: &mut Engine,
+    commands: &mut mpsc::Receiver<Command>,
+    consumer_gone: &Notify,
+    clock: &C,
+    display: Option<DisplayLink<'_>>,
+    mut hid: Option<HidSide<'_>>,
+) -> Exit {
     let (source, poll_every, mut query) = match display {
         Some(d) => (Some(d.source), d.poll_interval, d.pending),
         None => (None, None, None),
@@ -140,6 +286,13 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
             .min()
             .unwrap_or(now + Duration::from_secs(3600));
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        // The pump finished an action: a failure may be waiting for the controller.
+        let pump_done = async {
+            match hid.as_ref() {
+                Some(h) => h.shared.done.notified().await,
+                None => std::future::pending().await,
+            }
+        };
 
         tokio::select! {
             cmd = commands.recv() => match cmd {
@@ -181,6 +334,7 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
                 query = None;
                 engine.on_display_info(reply);
             },
+            _ = pump_done => {},
             _ = consumer_gone.notified() => break Exit::Stopped(StopCause::ConsumerGone),
         }
 
@@ -200,13 +354,12 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
             }
         }
         if let Some(h) = hid.as_mut() {
-            perform_hid(h, clock).await;
+            h.sync(clock);
         }
     };
 
     if let Some(h) = hid.as_mut() {
-        h.hid.shutdown();
-        perform_hid(h, clock).await;
+        h.finish(clock).await;
     }
     exit
 }
@@ -938,6 +1091,182 @@ mod tests {
             .expect("a hid failure was reported");
         assert_eq!(failure["ok"], false);
         assert!(failure["message"].as_str().unwrap().contains("did not answer"));
+    }
+
+    // ---- a HID service that is stuck or slow does not hold up the loop --------------------------
+
+    type Stamps = Arc<Mutex<Vec<tokio::time::Instant>>>;
+
+    /// A [`FakeSocket`] that notes when the loop took each datagram and when it sent one.
+    struct StampedSocket {
+        inner: FakeSocket,
+        received: Stamps,
+        sent: Stamps,
+    }
+
+    impl DatagramSocket for StampedSocket {
+        async fn recv(&self) -> io::Result<Datagram> {
+            let dg = self.inner.recv().await;
+            self.received.lock().unwrap().push(tokio::time::Instant::now());
+            dg
+        }
+
+        async fn send_to(&self, port: u16, data: Vec<u8>) -> io::Result<()> {
+            self.sent.lock().unwrap().push(tokio::time::Instant::now());
+            self.inner.send_to(port, data).await
+        }
+    }
+
+    fn stamped(sock: FakeSocket) -> (StampedSocket, Stamps, Stamps) {
+        let (received, sent) = (Stamps::default(), Stamps::default());
+        (StampedSocket { inner: sock, received: received.clone(), sent: sent.clone() }, received, sent)
+    }
+
+    fn ms_since(t0: tokio::time::Instant, stamps: &Stamps) -> Vec<u64> {
+        stamps.lock().unwrap().iter().map(|t| (*t - t0).as_millis() as u64).collect()
+    }
+
+    /// A P frame (one NAL unit in one packet) at `at_ms`, with the sequence number and timestamp that follow
+    /// the first picture's.
+    fn send_p_frame_later(tx: &mpsc::UnboundedSender<io::Result<Datagram>>, at_ms: u64, seq: u16) {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(at_ms)).await;
+            tx.send(dg(seq, 1000 + 3000 * u32::from(seq), true, &trail(&[7; 20]))).unwrap();
+        });
+    }
+
+    fn hid_failures(frames: &[Frame]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f.is_control())
+            .map(|f| serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap())
+            .filter(|v| v["event"] == "hid" && v["ok"] == false)
+            .map(|v| v["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_hid_service_does_not_hold_up_the_video_or_the_commands() {
+        let (sock, tx) = fake();
+        let (sock, received, sent) = stamped(sock);
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let mut backend = FakeHid { done: Arc::default(), stall: true };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        // At 100 ms a touch goes to the service, which never answers: it is given up on at 600 ms.
+        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0)).await;
+        // Meanwhile the picture goes on, and a keyframe is asked for.
+        for (at, seq) in [(150, 5), (250, 6), (350, 7), (450, 8)] {
+            send_p_frame_later(&tx, at, seq);
+        }
+        send_later(&r, 200, Command::Keyframe).await;
+        send_later(&r, 500, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+
+        // Every datagram was taken the moment it came (the first four are the first picture, at 0), and the
+        // keyframe request went out at 200: the loop did not wait for the touch.
+        assert_eq!(ms_since(t0, &received), vec![0, 0, 0, 0, 150, 250, 350, 450]);
+        assert_eq!(ms_since(t0, &sent), vec![200]);
+        let frames = r.queue.drain();
+        assert_eq!(frames.iter().filter(|f| !f.is_control()).count(), 5, "the first picture and four more");
+        assert!(hid_failures(&frames).iter().any(|m| m.contains("did not answer")), "{:?}", hid_failures(&frames));
+    }
+
+    /// Takes `delay` to perform each action, and notes when it did.
+    struct SlowHid {
+        delay: Duration,
+        done: Arc<Mutex<Vec<(Action, tokio::time::Instant)>>>,
+    }
+
+    impl HidBackend for SlowHid {
+        fn perform(&mut self, action: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
+            let (delay, done) = (self.delay, self.done.clone());
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                done.lock().unwrap().push((action, tokio::time::Instant::now()));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_hid_service_gets_its_actions_in_order_with_the_waiting_moves_replaced() {
+        let (sock, tx) = fake();
+        let (sock, received, _sent) = stamped(sock);
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = SlowHid { delay: Duration::from_millis(30), done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        // A drag: down at 100 ms, a move every 10 ms (the service takes 30 ms for each report), the lift at
+        // 300 ms, then the Home button, then the stop.
+        send_later(&r, 100, touch(TouchPhase::Down, 100.0, 1000.0)).await;
+        for i in 1..=19u64 {
+            send_later(&r, 100 + 10 * i, touch(TouchPhase::Move, 100.0 + 10.0 * i as f64, 1000.0)).await;
+        }
+        send_later(&r, 300, touch(TouchPhase::Up, 300.0, 1000.0)).await;
+        send_later(&r, 310, Command::Key(Key::Home, Press::Short)).await;
+        send_p_frame_later(&tx, 200, 5);
+        send_later(&r, 700, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        // The picture was not held up by the service's 30 ms.
+        assert_eq!(ms_since(t0, &received), vec![0, 0, 0, 0, 200]);
+
+        let done: Vec<Action> = done.lock().unwrap().iter().map(|(a, _)| *a).collect();
+        let home = |down| Action::Button { page: 0x0C, code: 0x40, down };
+        // Order: the down first, then moves of a finger that only goes one way, the lift, the button, the end.
+        let contacts: Vec<u16> = done
+            .iter()
+            .filter_map(|a| match a {
+                Action::Touch { down: true, x, .. } => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert!(contacts.windows(2).all(|w| w[0] < w[1]), "the finger only goes right: {contacts:?}");
+        assert!(contacts.len() >= 3 && contacts.len() < 15, "some moves were replaced by newer ones: {contacts:?}");
+        // The picture is 1216x2656 and the mapping is the identity without display info.
+        let at = |px: f64| crate::hid::map_touch(px, 1000.0, 1216, 2656, 0);
+        assert_eq!(contacts[0], at(100.0).0, "the down is the first contact, where it was put");
+        assert_eq!(*contacts.last().unwrap(), at(290.0).0, "the newest move is never lost");
+        let pos = |a: Action| done.iter().position(|x| *x == a).unwrap_or_else(|| panic!("{a:?} missing in {done:?}"));
+        let lift = Action::Touch { down: false, x: at(300.0).0, y: at(300.0).1 };
+        assert!(done.iter().rposition(|a| matches!(a, Action::Touch { down: true, .. })).unwrap() < pos(lift));
+        assert!(pos(lift) < pos(home(true)) && pos(home(true)) < pos(home(false)));
+        assert_eq!(done.last(), Some(&Action::KeyboardRemove));
+        assert_eq!(done.len(), contacts.len() + 4, "the lift, the two button reports and the keyboard: {done:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backlog_for_a_stuck_service_is_reported_and_a_stop_waits_for_it_only_so_long() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let mut backend = FakeHid { done: Arc::default(), stall: true };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        // 90 distinct keys go down at 100 ms: the first is being performed (it never finishes), the queue
+        // takes 64, and the others are turned away and said so.
+        for usage in 4..94u8 {
+            send_later(&r, 100, Command::Kb(Kb::Down(usage))).await;
+        }
+        send_later(&r, 1000, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        // The 65 that were taken would need half a minute to time out one by one: the end does not wait
+        // for them for more than the budget.
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(1000) + HID_SHUTDOWN_BUDGET, "{took:?}");
+        assert!(took < Duration::from_millis(1000) + HID_SHUTDOWN_BUDGET + Duration::from_millis(100), "{took:?}");
+        let failures = hid_failures(&r.queue.drain());
+        assert!(failures.iter().any(|m| m.contains("not keeping up")), "{failures:?}");
     }
 
     #[tokio::test(start_paused = true)]

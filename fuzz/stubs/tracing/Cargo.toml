@@ -1,0 +1,6 @@
+[package]
+name = "tracing"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stand-in for the tracing crate: the macros format their arguments and drop the result"

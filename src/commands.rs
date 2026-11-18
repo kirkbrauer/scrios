@@ -146,10 +146,25 @@ pub enum Parsed {
 /// Coordinates beyond this are not pixels of any screen.
 const MAX_COORDINATE: f64 = 1_000_000.0;
 
+/// How much of a token the client sent is quoted back in an error message.
+const MAX_ECHO_CHARS: usize = 64;
+
+/// A token of the client's line as an error message quotes it: in quotes, and at most
+/// [`MAX_ECHO_CHARS`] characters of it (a line may be 64 KiB, and the message goes to the client's event
+/// stream and the log), with `...` where it was cut.
+fn quoted(token: &str) -> String {
+    let mut chars = token.chars();
+    let mut shown: String = chars.by_ref().take(MAX_ECHO_CHARS).collect();
+    if chars.next().is_some() {
+        shown.push_str("...");
+    }
+    format!("{shown:?}")
+}
+
 fn parse_coordinate(what: &str, s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|_| format!("{what} {s:?} is not a number"))?;
+    let v: f64 = s.parse().map_err(|_| format!("{what} {} is not a number", quoted(s)))?;
     if !v.is_finite() || v.abs() > MAX_COORDINATE {
-        return Err(format!("{what} {s:?} is out of range"));
+        return Err(format!("{what} {} is out of range", quoted(s)));
     }
     Ok(v)
 }
@@ -162,9 +177,9 @@ fn parse_touch(args: &[&str]) -> Result<Touch, String> {
         "down" => TouchPhase::Down,
         "move" => TouchPhase::Move,
         "up" => TouchPhase::Up,
-        other => return Err(format!("touch phase {other:?} is not down, move or up")),
+        other => return Err(format!("touch phase {} is not down, move or up", quoted(other))),
     };
-    let id: u32 = id.parse().map_err(|_| format!("finger id {id:?} is not a number"))?;
+    let id: u32 = id.parse().map_err(|_| format!("finger id {} is not a number", quoted(id)))?;
     Ok(Touch { phase, x: parse_coordinate("x", x)?, y: parse_coordinate("y", y)?, id })
 }
 
@@ -173,12 +188,12 @@ fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
         [name] => (name, Press::Short),
         [name, "short"] => (name, Press::Short),
         [name, "long"] => (name, Press::Long),
-        [_, other] => return Err(format!("key press {other:?} is not short or long")),
+        [_, other] => return Err(format!("key press {} is not short or long", quoted(other))),
         _ => {
             return Err(format!("usage: key <name> [short|long] (name is one of {})", Key::NAMES));
         }
     };
-    let key = Key::from_name(name).ok_or_else(|| format!("unknown key {name:?} (one of {})", Key::NAMES))?;
+    let key = Key::from_name(name).ok_or_else(|| format!("unknown key {} (one of {})", quoted(name), Key::NAMES))?;
     Ok((key, press))
 }
 
@@ -186,11 +201,11 @@ fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
 fn parse_usage(s: &str) -> Result<u8, String> {
     let hex = s.strip_prefix("0x").unwrap_or(s);
     if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("usage {s:?} is not a hex number"));
+        return Err(format!("usage {} is not a hex number", quoted(s)));
     }
     match u16::from_str_radix(hex, 16) {
         Ok(v) if (1..=u16::from(MAX_KEY_USAGE)).contains(&v) => Ok(v as u8),
-        _ => Err(format!("usage {s:?} is out of range (01 to {MAX_KEY_USAGE:02x})")),
+        _ => Err(format!("usage {} is out of range (01 to {MAX_KEY_USAGE:02x})", quoted(s))),
     }
 }
 
@@ -518,6 +533,42 @@ mod tests {
         assert!(bad("kb down ffff").contains("out of range"));
         assert!(bad("kb down fffffffffff").contains("not a hex number"), "more than 4 digits");
         assert!(matches!(touch("KB down 04"), Parsed::Unknown(_)));
+    }
+
+    #[test]
+    fn a_long_token_is_quoted_back_cut_short() {
+        let bad = |line: &str| match touch(line) {
+            Parsed::Bad(why) => why,
+            other => panic!("{line:?} parsed as {other:?}"),
+        };
+        let long = "9".repeat(5000);
+        let cut = format!("\"{}...\"", "9".repeat(64));
+        let wide = "é".repeat(500); // characters, not bytes, are counted
+        for (line, what) in [
+            (format!("touch {long} 1 2 0"), "touch phase"),
+            (format!("touch down {long}x 2 0"), "not a number"),
+            (format!("touch down {long} 2 0"), "out of range"), // 10^5000 parses as infinity
+            (format!("touch down 1 2 {long}"), "finger id"),
+            (format!("key home {long}"), "key press"),
+            (format!("key {long}"), "unknown key"),
+            (format!("kb down {long}"), "not a hex number"),
+        ] {
+            let why = bad(&line);
+            assert!(why.contains(what), "{why}");
+            assert!(why.len() < 300, "{} bytes: {why}", why.len());
+            assert!(why.contains(&cut), "{why}");
+            assert!(!why.contains(&"9".repeat(65)), "{why}");
+        }
+        let why = bad(&format!("kb up 0x{long}"));
+        assert!(why.contains(&format!("\"0x{}...\"", "9".repeat(62))), "{why}");
+        let why = bad(&format!("key {wide}"));
+        assert!(why.contains(&format!("\"{}...\"", "é".repeat(64))), "{why}");
+        // A token that fits is quoted whole, with nothing added; at the limit too.
+        assert!(bad("key what").contains("unknown key \"what\""));
+        let exact = "k".repeat(64);
+        assert!(bad(&format!("key {exact}")).contains(&format!("unknown key \"{exact}\" (one of")));
+        let one_more = "k".repeat(65);
+        assert!(bad(&format!("key {one_more}")).contains(&format!("unknown key \"{exact}...\" (one of")));
     }
 
     #[test]

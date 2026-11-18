@@ -36,6 +36,10 @@ pub const RTP_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOCK_CANDIDATES: [u32; 2] = [24_000, 90_000];
 /// Device Hub's RCTL feedback goes out about this often.
 const RCTL_INTERVAL: Duration = Duration::from_millis(50);
+/// How many RTP packets in a row must come from an SSRC other than the stream's before the stream is taken to
+/// have a new source and starts over: one stray packet (another sender on the port, a damaged header) must
+/// not throw away the parameter sets and the picture.
+const SSRC_SWITCH_RUN: usize = 3;
 
 /// Where the RTP clock rate comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +152,7 @@ impl DisplayFacts {
 }
 
 /// Microseconds since the first access unit, from the RTP timestamp. The origin can be moved
-/// (a new source, a corrected clock rate) without the times jumping.
+/// (a new source, a corrected clock rate) without the times jumping, and the times never go back.
 #[derive(Debug)]
 struct PtsClock {
     hz: u64,
@@ -176,6 +180,10 @@ impl PtsClock {
         }
         self.last = timestamp;
         let pts = self.anchor_us + (self.ticks.max(0) as u128 * 1_000_000 / u128::from(self.hz)) as u64;
+        // A unit whose timestamp is behind the one before (a reordered or restarted sender) gets the previous
+        // time, never an earlier one: a decoder or a player must not see presentation times go backwards.
+        // The ticks go on from where the timestamps are, so the times follow them again once they pass.
+        let pts = pts.max(self.last_pts);
         self.last_pts = pts;
         pts
     }
@@ -245,6 +253,25 @@ fn clock_correction(current: u32, measured: f64) -> Option<u32> {
     (nearest != current).then_some(nearest)
 }
 
+/// RTP packets from an SSRC other than the stream's, held (as datagrams, with when and from which port they
+/// came) until there are [`SSRC_SWITCH_RUN`] in a row. A packet of the stream's own SSRC, or one from a third
+/// SSRC, ends the run.
+#[derive(Debug)]
+struct NewSource {
+    ssrc: u32,
+    held: Vec<(Instant, u16, Vec<u8>)>,
+}
+
+/// What to do with an RTP packet, by its SSRC.
+enum SourceCheck {
+    /// It is the stream's (or the stream has no source yet): process it.
+    Accept,
+    /// It is not, and the run that would make it the new source is not complete: set aside.
+    Held,
+    /// The run is complete and the stream has started over; these earlier packets of the run come first.
+    Switch(Vec<(Instant, u16, Vec<u8>)>),
+}
+
 pub struct Engine {
     cfg: EngineConfig,
     queue: Arc<OutQueue>,
@@ -262,6 +289,8 @@ pub struct Engine {
 
     device_ssrc: Option<u32>,
     ssrc_confirmed: bool,
+    /// Packets of another SSRC that may become the stream's.
+    new_source: Option<NewSource>,
     rtcp_port: Option<u16>,
     port_from_rtp: bool,
 
@@ -291,6 +320,7 @@ pub struct Engine {
     warn_malformed: Throttle,
     warn_payload_type: Throttle,
     warn_dropped: Throttle,
+    warn_other_source: Throttle,
 }
 
 impl Engine {
@@ -307,6 +337,7 @@ impl Engine {
             clock_checked: false,
             device_ssrc: cfg.device_ssrc,
             ssrc_confirmed: false,
+            new_source: None,
             rtcp_port: cfg.rtcp_port,
             port_from_rtp: false,
             need_key: true,
@@ -328,6 +359,7 @@ impl Engine {
             warn_malformed: Throttle::new(Duration::from_secs(5)),
             warn_payload_type: Throttle::new(Duration::from_secs(30)),
             warn_dropped: Throttle::new(Duration::from_secs(2)),
+            warn_other_source: Throttle::new(Duration::from_secs(5)),
             queue,
             cfg,
         }
@@ -357,6 +389,23 @@ impl Engine {
             }
             return;
         }
+        match self.check_source(now, src_port, pkt.ssrc, data) {
+            SourceCheck::Accept => {}
+            SourceCheck::Held => return,
+            // The start of the new stream: the packets of the run, in the order they came.
+            SourceCheck::Switch(held) => {
+                for (at, port, bytes) in held {
+                    if let Some(earlier) = RtpPacket::parse(&bytes) {
+                        self.on_rtp(at, port, &earlier);
+                    }
+                }
+            }
+        }
+        self.on_rtp(now, src_port, &pkt);
+    }
+
+    /// An RTP packet of the stream.
+    fn on_rtp(&mut self, now: Instant, src_port: u16, pkt: &RtpPacket<'_>) {
         self.last_rtp = now;
         self.counters.packets += 1;
         self.learn_source(src_port, pkt.ssrc);
@@ -564,15 +613,46 @@ impl Engine {
         }
     }
 
-    /// Takes the device's SSRC and RTCP port from the first RTP packet, and starts over if the
-    /// source changes under us.
+    /// Decides by its SSRC whether an RTP packet belongs to the stream. Once the stream's SSRC is known, a
+    /// packet of another one is set aside until [`SSRC_SWITCH_RUN`] of them have come in a row (any packet of
+    /// the stream's own, or of a third SSRC, starts the count over); then the source has changed and the
+    /// stream starts over.
+    fn check_source(&mut self, now: Instant, src_port: u16, ssrc: u32, data: &[u8]) -> SourceCheck {
+        let Some(known) = self.device_ssrc.filter(|_| self.ssrc_confirmed) else {
+            return SourceCheck::Accept; // the first SSRC seen is taken (learn_source)
+        };
+        if known == ssrc {
+            self.new_source = None;
+            return SourceCheck::Accept;
+        }
+        let mut held = match self.new_source.take() {
+            Some(n) if n.ssrc == ssrc => n.held,
+            _ => Vec::new(),
+        };
+        if held.len() + 1 < SSRC_SWITCH_RUN {
+            held.push((now, src_port, data.to_vec()));
+            self.new_source = Some(NewSource { ssrc, held });
+            if let Some(n) = self.warn_other_source.allow(now) {
+                warn!(
+                    "ignoring RTP of SSRC {ssrc:#x} (the stream's is {known:#x}) until {SSRC_SWITCH_RUN} packets in a row come from it ({n} more before)"
+                );
+            }
+            return SourceCheck::Held;
+        }
+        warn!("the device's SSRC changed ({known:#x} -> {ssrc:#x}, {SSRC_SWITCH_RUN} packets in a row): starting over");
+        self.restart_stream();
+        self.device_ssrc = Some(ssrc);
+        SourceCheck::Switch(held)
+    }
+
+    /// Takes the device's SSRC and RTCP port from the first RTP packet (a change of source is dealt with by
+    /// [`check_source`](Self::check_source) before).
     fn learn_source(&mut self, src_port: u16, ssrc: u32) {
         match self.device_ssrc {
             Some(known) if known == ssrc => self.ssrc_confirmed = true,
             Some(known) if self.ssrc_confirmed => {
-                warn!("the device's SSRC changed ({known:#x} -> {ssrc:#x}): starting over");
-                self.restart_stream();
-                self.device_ssrc = Some(ssrc);
+                // Not reached: check_source has switched the stream to this SSRC already.
+                debug_assert!(false, "an RTP packet of SSRC {ssrc:#x} reached a stream of {known:#x}");
             }
             Some(known) => {
                 info!("the device's RTP SSRC is {ssrc:#x} (the answer said {known:#x})");
@@ -848,8 +928,14 @@ fn describe(reason: DropReason) -> &'static str {
     }
 }
 
+/// How many bytes of a NAL unit that could not be read are written out in the message.
+const MAX_HEX_BYTES: usize = 32;
+
+/// The bytes in hex, the first [`MAX_HEX_BYTES`] of them, then `...` and the length if there are more (the
+/// device can send an SPS of any size up to the packet's, and the message goes to the log).
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    let shown: String = b.iter().take(MAX_HEX_BYTES).map(|x| format!("{x:02x}")).collect();
+    if b.len() > MAX_HEX_BYTES { format!("{shown}... ({} bytes in all)", b.len()) } else { shown }
 }
 
 #[cfg(test)]
@@ -1373,19 +1459,110 @@ mod tests {
     }
 
     #[test]
+    fn an_sps_that_cannot_be_read_is_dumped_in_the_message_only_up_to_a_limit() {
+        let mut r = Rig::new();
+        // Short: all of it.
+        let short = vec![0x42, 0x01, 0xAB, 0xCD];
+        let why = r.eng.announce(&short).unwrap_err();
+        assert!(why.ends_with("(SPS bytes: 4201abcd)"), "{why}");
+        // Exactly the limit: all of it, nothing added.
+        let mut exact = vec![0x42, 0x01];
+        exact.resize(MAX_HEX_BYTES, 0xAB);
+        let why = r.eng.announce(&exact).unwrap_err();
+        assert!(why.ends_with(&format!("(SPS bytes: {})", hex(&exact))) && !why.contains("..."), "{why}");
+        assert_eq!(hex(&exact).len(), 2 * MAX_HEX_BYTES);
+        // Long: the first 32 bytes, an ellipsis and the size.
+        let mut long = vec![0x42, 0x01];
+        long.resize(5000, 0xAB);
+        let why = r.eng.announce(&long).unwrap_err();
+        assert!(why.len() < 250, "{} bytes: {why}", why.len());
+        assert!(why.ends_with(&format!("(SPS bytes: 4201{}... (5000 bytes in all))", "ab".repeat(30))), "{why}");
+        assert!(r.frames().is_empty(), "nothing was announced");
+    }
+
+    #[test]
     fn the_first_rtp_ssrc_wins_over_the_answers_and_a_later_change_starts_over() {
         let mut r = Rig::with(|c| c.device_ssrc = Some(0x1111));
         assert_eq!(r.eng.device_ssrc(), Some(0x1111));
         r.idr(0, true);
         assert_eq!(r.eng.device_ssrc(), Some(DEV));
         assert_eq!(json(&r.frames()[0])["device_ssrc"], DEV);
-        // The source changes: new SSRC, the sequence restarts, the state is reset.
-        let bytes = rtp_bytes(5000, 5, true, 0xBEEF, &idr(&[1; 4]));
-        r.eng.on_datagram(r.at(50), PORT, &bytes);
+        // The source changes: new SSRC, the sequence restarts, the state is reset (once three packets in a
+        // row have come from it, see `a_new_ssrc_needs_a_run_of_packets_...`).
+        for (i, seq) in [5000u16, 5001, 5002].into_iter().enumerate() {
+            assert_eq!(r.eng.device_ssrc(), Some(DEV), "still the old one after {i} packets");
+            let bytes = rtp_bytes(seq, 5, i == 2, 0xBEEF, &idr(&[1; 4]));
+            r.eng.on_datagram(r.at(50), PORT, &bytes);
+        }
         assert_eq!(r.eng.device_ssrc(), Some(0xBEEF));
         // No parameter sets since the reset: that keyframe cannot be sent.
         assert!(r.frames().is_empty());
         assert_eq!(r.eng.stats().dropped_units, 1);
+    }
+
+    #[test]
+    fn a_new_ssrc_needs_a_run_of_packets_before_the_stream_starts_over() {
+        let mut r = Rig::with(no_stall);
+        r.idr(0, true);
+        r.delta(10);
+        assert_eq!(r.frames().len(), 3, "config, the key unit and one delta unit");
+        let before = r.eng.stats();
+        let stray = |seq: u16, ssrc: u32| rtp_bytes(seq, 77, true, ssrc, &trail(&[9; 4]));
+
+        // One stray packet, and another from a third SSRC, then one of the stream's own: nothing is reset, the
+        // strays are not counted as packets and are not decoded.
+        r.eng.on_datagram(r.at(20), PORT, &stray(900, 0xBEEF));
+        r.eng.on_datagram(r.at(21), PORT, &stray(901, 0xCAFE));
+        r.delta(22);
+        assert_eq!(r.eng.device_ssrc(), Some(DEV));
+        let f = r.frames();
+        assert_eq!(f.len(), 1, "only the stream's own delta unit: {f:?}");
+        assert!(!f[0].is_control() && f[0].flags & FLAG_KEY == 0);
+        let after = r.eng.stats();
+        assert_eq!(after.packets, before.packets + 1);
+        assert_eq!(after.dropped_units, before.dropped_units, "nothing was dropped, nothing needs a keyframe");
+
+        // Two from 0xBEEF, a packet of the stream between them, two more: the run was broken, so still no switch.
+        r.eng.on_datagram(r.at(30), PORT, &stray(910, 0xBEEF));
+        r.eng.on_datagram(r.at(31), PORT, &stray(911, 0xBEEF));
+        r.delta(32);
+        r.eng.on_datagram(r.at(33), PORT, &stray(912, 0xBEEF));
+        r.eng.on_datagram(r.at(34), PORT, &stray(913, 0xBEEF));
+        assert_eq!(r.eng.device_ssrc(), Some(DEV));
+        assert_eq!(r.frames().len(), 1);
+
+        // Three in a row switch: the stream starts over, and all three go to the depacketizer.
+        r.delta(36); // the stream's own, so that the count starts at 0
+        r.frames();
+        r.eng.on_datagram(r.at(40), PORT, &stray(920, 0xBEEF));
+        assert_eq!(r.eng.device_ssrc(), Some(DEV));
+        r.eng.on_datagram(r.at(41), PORT, &stray(921, 0xBEEF));
+        assert_eq!(r.eng.device_ssrc(), Some(DEV));
+        r.eng.on_datagram(r.at(42), PORT, &stray(922, 0xBEEF));
+        assert_eq!(r.eng.device_ssrc(), Some(0xBEEF));
+        // All three reached the depacketizer (they were delta units of a stream with no parameter sets).
+        assert_eq!(r.eng.stats().packets, after.packets + 1 + 1 + 3);
+        assert_eq!(r.eng.stats().dropped_units, after.dropped_units + 3, "delta units, and no keyframe yet");
+    }
+
+    #[test]
+    fn strays_of_another_ssrc_do_not_count_as_media_for_the_stall_watch() {
+        let mut r = Rig::with(|c| {
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = Some(Duration::from_secs(15));
+            c.no_data_timeout = Duration::from_secs(3600);
+        });
+        r.idr(0, true);
+        // The device goes quiet; a stray of another SSRC every second (never three in a row of the same one)
+        // does not keep the stream alive.
+        for s in 1..=14u16 {
+            let stray = rtp_bytes(s, 1, true, if s % 2 == 0 { 0xBEEF } else { 0xCAFE }, &trail(&[9; 4]));
+            r.eng.on_datagram(r.at(u64::from(s) * 1000), PORT, &stray);
+            r.eng.on_tick(r.at(u64::from(s) * 1000));
+            assert_eq!(r.eng.take_fatal(), None);
+        }
+        r.eng.on_tick(r.at(15_000));
+        assert!(r.eng.take_fatal().unwrap().contains("no RTP media"));
     }
 
     #[test]
@@ -1694,18 +1871,62 @@ mod tests {
         r.ts = 90_000 + 24_000;
         r.delta(10); // pts 1 000 000
         r.frames();
-        // A new source: new SSRC, new sequence numbers, timestamps from nowhere.
+        // A new source: new SSRC, new sequence numbers, timestamps from nowhere. Its first two packets are held
+        // until the third makes the run, and then they are the start of the new stream, none of them lost.
         let sps = sps_1216x2656();
+        let frags = fu(&idr(&[4; 8]), 4);
+        assert_eq!(frags.len(), 2);
         r.eng.on_datagram(r.at(50), PORT, &rtp_bytes(7000, 7, false, 0xBEEF, &ap(&[&VPS, &sps, &PPS])));
-        r.eng.on_datagram(r.at(50), PORT, &rtp_bytes(7001, 7, true, 0xBEEF, &idr(&[4; 8])));
+        r.eng.on_datagram(r.at(50), PORT, &rtp_bytes(7001, 7, false, 0xBEEF, &frags[0]));
+        assert_eq!(r.eng.device_ssrc(), Some(DEV));
+        r.eng.on_datagram(r.at(50), PORT, &rtp_bytes(7002, 7, true, 0xBEEF, &frags[1]));
         let f = r.frames();
         assert_eq!(f.len(), 2, "config again (it names the new SSRC), then the keyframe");
         assert_eq!(json(&f[0])["device_ssrc"], 0xBEEF);
         // One frame (1/60 s) after the last time sent.
         assert_eq!(f[1].pts_us, 1_000_000 + 16_666);
         // And from there on in step with the new timestamps (500 ticks = 20 833 us).
-        r.eng.on_datagram(r.at(60), PORT, &rtp_bytes(7002, 507, true, 0xBEEF, &trail(&[1; 4])));
+        r.eng.on_datagram(r.at(60), PORT, &rtp_bytes(7003, 507, true, 0xBEEF, &trail(&[1; 4])));
         assert_eq!(r.frames()[0].pts_us, 1_000_000 + 16_666 + 20_833);
+    }
+
+    #[test]
+    fn pts_never_goes_back_when_a_timestamp_does() {
+        let mut p = PtsClock::new(24_000);
+        assert_eq!(p.pts_us(1000), 0);
+        assert_eq!(p.pts_us(1000 + 24_000), 1_000_000);
+        // A unit that is half a second behind: the previous time again, not 500 000.
+        assert_eq!(p.pts_us(1000 + 12_000), 1_000_000);
+        // The same timestamp twice is fine (equal, not lower).
+        assert_eq!(p.pts_us(1000 + 12_000), 1_000_000);
+        // Going forward from the late one follows the timestamps again: 2400 ticks past it is 100 ms, but that
+        // is still behind the 1 s already given, so the time waits for them to catch up ...
+        assert_eq!(p.pts_us(1000 + 14_400), 1_000_000);
+        // ... and goes on from there once they have: 24 000 + 2 400 ticks is 1.1 s.
+        assert_eq!(p.pts_us(1000 + 26_400), 1_100_000);
+        // A timestamp from before the very first one is the first time.
+        let mut p = PtsClock::new(24_000);
+        assert_eq!(p.pts_us(50_000), 0);
+        assert_eq!(p.pts_us(49_000), 0);
+    }
+
+    #[test]
+    fn the_pts_of_the_units_written_never_goes_back() {
+        let mut r = Rig::with(no_stall);
+        r.idr(0, true);
+        r.delta(10);
+        r.delta(20);
+        // A delta unit with an earlier timestamp (reordered by the sender): written, with the time before.
+        r.ts -= 2000;
+        r.delta(30);
+        r.ts += 2000 + 500;
+        r.delta(40);
+        r.delta(50);
+        let pts: Vec<u64> = r.frames().iter().filter(|f| !f.is_control()).map(|f| f.pts_us).collect();
+        assert_eq!(pts.len(), 6);
+        assert!(pts.windows(2).all(|w| w[0] <= w[1]), "{pts:?}");
+        assert_eq!(pts[3], pts[2], "the late unit gets the time of the one before it");
+        assert!(pts[5] > pts[3], "{pts:?}");
     }
 
     #[test]
