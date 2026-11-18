@@ -444,7 +444,7 @@ fn run_thread(
             let cleanup = catch_unwind(AssertUnwindSafe(|| {
                 rt.block_on(async {
                     let _ = tokio::time::timeout(PANIC_CLEANUP, async {
-                        session.lock().await.shutdown().await;
+                        Box::pin(session.lock().await.shutdown()).await;
                     })
                     .await;
                 })
@@ -499,7 +499,7 @@ async fn run_probe(
         Some(video) => Ok(probe::collect(video, window, cmd_rx, gone, raw).await),
         None => Err("the video stream is gone".to_string()),
     };
-    sess.shutdown().await;
+    Box::pin(sess.shutdown()).await;
     let (report, outcome) = match collected {
         Ok(c) => c,
         Err(why) => return failed(queue, why),
@@ -587,27 +587,27 @@ async fn run(
     match started {
         None => {
             info!("stop requested while starting");
-            sess.shutdown().await;
+            Box::pin(sess.shutdown()).await;
             queue.push_control(Frame::control(&Event::Stopped));
             return Outcome::Stopped;
         }
         Some(Err(e)) => {
             // Whatever was started on the device is stopped before the failure is reported.
-            sess.shutdown().await;
+            Box::pin(sess.shutdown()).await;
             return start_failed(&queue, e);
         }
         Some(Ok(())) => {}
     }
 
     if let Some(probe) = &opts.probe {
-        let outcome = run_probe(
+        let outcome = Box::pin(run_probe(
             &mut sess,
             probe.window,
             &mut cmd_rx,
             &gone,
             &queue,
             raw_dump.as_mut().map(|w| w as &mut dyn std::io::Write),
-        )
+        ))
         .await;
         if let (Some(w), Some(path)) = (raw_dump.as_mut(), probe.raw_dump.as_ref()) {
             use std::io::Write as _;
@@ -631,7 +631,7 @@ async fn run(
         };
         let Some(device_hid) = connected else {
             info!("stop requested while connecting HID");
-            sess.shutdown().await;
+            Box::pin(sess.shutdown()).await;
             queue.push_control(Frame::control(&Event::Stopped));
             return Outcome::Stopped;
         };
@@ -721,7 +721,7 @@ async fn run(
     };
     info!("done: {}", engine.summary());
 
-    sess.shutdown().await;
+    Box::pin(sess.shutdown()).await;
     match exit {
         Exit::Stopped(StopCause::Command) => {
             queue.push_control(Frame::control(&Event::Stopped));

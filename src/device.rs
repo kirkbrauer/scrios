@@ -325,16 +325,14 @@ impl RsdService for DeviceInfoClient {
     }
 
     async fn from_stream(stream: Box<dyn ReadWrite>) -> Result<Self, IdeviceError> {
-        Ok(Self { inner: CoreDeviceServiceClient::new(stream).await? })
+        Ok(Self { inner: Box::pin(CoreDeviceServiceClient::new(stream)).await? })
     }
 }
 
 impl DeviceInfoClient {
     /// The device's displays (`getdisplayinfo`).
     pub async fn get_display_info(&mut self) -> Result<Vec<DisplayInfo>, String> {
-        let reply = self
-            .inner
-            .invoke_with_plist(GET_DISPLAY_INFO, plist::Dictionary::new())
+        let reply = Box::pin(self.inner.invoke_with_plist(GET_DISPLAY_INFO, plist::Dictionary::new()))
             .await
             .map_err(|e| format!("getdisplayinfo failed: {e:?}"))?;
         parse_display_info(&reply)
@@ -361,7 +359,7 @@ impl DisplayInfoSource for DisplayInfoClient {
             let Some(client) = guard.as_mut() else {
                 return Err("the device info service is not available".to_string());
             };
-            match tokio::time::timeout(DISPLAY_QUERY_LIMIT, client.get_display_info()).await {
+            match Box::pin(tokio::time::timeout(DISPLAY_QUERY_LIMIT, client.get_display_info())).await {
                 Ok(reply) => reply,
                 Err(_) => {
                     // An unanswered request leaves the connection out of step: do not use it again.
@@ -493,14 +491,14 @@ impl Session {
         let stream = timed("connecting to RSD", CONNECT_TIMEOUT, adapter.connect(rsd_port))
             .await?
             .map_err(|e| format!("cannot connect to the RSD port {rsd_port}: {e}"))?;
-        let mut handshake = timed("the RSD handshake", CONNECT_TIMEOUT, RsdHandshake::new(stream))
+        let mut handshake = Box::pin(timed("the RSD handshake", CONNECT_TIMEOUT, RsdHandshake::new(stream)))
             .await?
             .map_err(|e| format!("RSD handshake failed: {e:?}"))?;
-        let client: DisplayServiceClient<Box<dyn ReadWrite>> = timed(
+        let client: DisplayServiceClient<Box<dyn ReadWrite>> = Box::pin(timed(
             "connecting the display service",
             CONNECT_TIMEOUT,
             DisplayServiceClient::connect_rsd(&mut adapter, &mut handshake),
-        )
+        ))
         .await?
         .map_err(|e| {
             format!("this device has no display service (needs iOS 27 and a mounted developer image): {e:?}")
@@ -509,7 +507,7 @@ impl Session {
 
         // The display's size and orientation, best effort: a slow or missing answer must not hold
         // the stream up (a slow one arrives later, a missing one means --visible-size or the SPS).
-        let started = connect_display_info(&mut adapter, &mut handshake).await;
+        let started = Box::pin(connect_display_info(&mut adapter, &mut handshake)).await;
         self.display = started.source;
         self.first_display = started.first;
         self.pending_display = started.pending;
@@ -549,7 +547,7 @@ impl Session {
         );
         // From here on the device may hold a stream for us, whatever happens to this call.
         self.stream_requested = true;
-        timed("starting the audio stream", START_TIMEOUT, client.start_media_stream(audio_params))
+        Box::pin(timed("starting the audio stream", START_TIMEOUT, client.start_media_stream(audio_params)))
             .await?
             .map_err(|e| format!("the audio stream did not start: {e:?}"))?;
         // Nothing reads the audio; drain it so the tunnel's queue for that socket cannot grow.
@@ -574,7 +572,7 @@ impl Session {
             opts.display_id,
             session_id,
         );
-        let answer = timed("starting the video stream", START_TIMEOUT, client.start_media_stream(params))
+        let answer = Box::pin(timed("starting the video stream", START_TIMEOUT, client.start_media_stream(params)))
             .await?
             .map_err(|e| format!("the video stream did not start: {e:?}"))?;
         info!("video stream started (session {session_id}, our SSRC {:#x})", self.our_ssrc);
@@ -588,7 +586,7 @@ impl Session {
         }
         if info_from.source_port.is_none() || info_from.device_ssrc.is_none() {
             // The same stream config is in the server status while the session is active.
-            match timed("the server status", STOP_TIMEOUT, client.get_media_stream_server_status()).await {
+            match Box::pin(timed("the server status", STOP_TIMEOUT, client.get_media_stream_server_status())).await {
                 Ok(Ok(status)) => {
                     if opts.log_answer {
                         info!("server status: {status:?}");
@@ -603,7 +601,7 @@ impl Session {
             }
         }
         if opts.log_answer {
-            match timed("media support info", STOP_TIMEOUT, client.get_media_support_info()).await {
+            match Box::pin(timed("media support info", STOP_TIMEOUT, client.get_media_support_info())).await {
                 Ok(Ok(v)) => info!("media support info: {v:?}"),
                 Ok(Err(e)) => warn!("media support info unavailable: {e:?}"),
                 Err(e) => warn!("{e}"),
@@ -624,16 +622,18 @@ impl Session {
             hid.touch_error = Some("the stream is not up".into());
             return hid;
         };
-        match timed(
+        match Box::pin(timed(
             "connecting the touch service",
             HID_CONNECT_TIMEOUT,
             UniversalHidServiceClient::connect_rsd(adapter, handshake),
-        )
+        ))
         .await
         {
             Ok(Ok(mut c)) => {
                 // What the device says its HID surfaces are, to check the touch mapping against.
-                match timed("listing the HID surfaces", HID_CONNECT_TIMEOUT, c.list_connected_services()).await {
+                match Box::pin(timed("listing the HID surfaces", HID_CONNECT_TIMEOUT, c.list_connected_services()))
+                    .await
+                {
                     Ok(Ok(surfaces)) => {
                         for s in &surfaces {
                             info!(
@@ -652,7 +652,7 @@ impl Session {
                 }
                 // The virtual keyboard: created once here, taken down when the session ends. Touch and
                 // buttons work without it.
-                match timed("creating the keyboard", HID_CONNECT_TIMEOUT, c.create_main_keyboard()).await {
+                match Box::pin(timed("creating the keyboard", HID_CONNECT_TIMEOUT, c.create_main_keyboard())).await {
                     Ok(Ok(kb)) => hid.keyboard = Some(kb),
                     Ok(Err(e)) => hid.keyboard_error = Some(format!("the keyboard could not be created: {e}")),
                     Err(e) => hid.keyboard_error = Some(e),
@@ -662,11 +662,11 @@ impl Session {
             Ok(Err(e)) => hid.touch_error = Some(format!("the touch service did not open: {e:?}")),
             Err(e) => hid.touch_error = Some(e),
         }
-        match timed(
+        match Box::pin(timed(
             "connecting the button service",
             HID_CONNECT_TIMEOUT,
             IndigoHidClient::connect_rsd(adapter, handshake),
-        )
+        ))
         .await
         {
             Ok(Ok(c)) => hid.buttons = Some(c),
@@ -683,7 +683,7 @@ impl Session {
             self.stream_requested = false;
             if let Some(client) = self.client.as_mut() {
                 // stopAll: the audio stream goes too.
-                match timed("stopMediaStream", STOP_TIMEOUT, client.stop_media_stream()).await {
+                match Box::pin(timed("stopMediaStream", STOP_TIMEOUT, client.stop_media_stream())).await {
                     Ok(Ok(_)) => info!("media stream stopped"),
                     Ok(Err(e)) => warn!("stopMediaStream failed: {e:?}"),
                     Err(e) => warn!("{e}"),
@@ -777,7 +777,9 @@ impl HidBackend for DeviceHid {
                     // One report type for a finger on the screen (0xC2) and one for its lift (0x02);
                     // a move is another contact sample. The timestamp is the wall clock.
                     let state = if down { TOUCHSCREEN_STATE_CONTACT } else { TOUCHSCREEN_STATE_RELEASE };
-                    client.send_touchscreen(state, x, y, None).await.map_err(|e| format!("touch report failed: {e:?}"))
+                    Box::pin(client.send_touchscreen(state, x, y, None))
+                        .await
+                        .map_err(|e| format!("touch report failed: {e:?}"))
                 }
                 Action::Key { usage, down } => {
                     let (Some(client), Some(kb)) = (self.touch.as_mut(), self.keyboard.as_mut()) else {
@@ -788,9 +790,9 @@ impl HidBackend for DeviceHid {
                     };
                     let usage = KeyboardUsage::new(u16::from(usage)).map_err(kb_error)?;
                     if down {
-                        client.main_keyboard_key_down(kb, usage).await.map_err(kb_error)
+                        Box::pin(client.main_keyboard_key_down(kb, usage)).await.map_err(kb_error)
                     } else {
-                        client.main_keyboard_key_up(kb, usage).await.map_err(kb_error)
+                        Box::pin(client.main_keyboard_key_up(kb, usage)).await.map_err(kb_error)
                     }
                 }
                 Action::KeyboardRelease => {
@@ -798,15 +800,15 @@ impl HidBackend for DeviceHid {
                         return Ok(()); // no keyboard: nothing is down
                     };
                     // An empty report lets go of every key (the device's reset alone is not known to).
-                    let emptied = client.set_main_keyboard_usages(kb, []).await.map_err(kb_error);
-                    let reset = client.reset_main_keyboard(kb).await.map_err(kb_error);
+                    let emptied = Box::pin(client.set_main_keyboard_usages(kb, [])).await.map_err(kb_error);
+                    let reset = Box::pin(client.reset_main_keyboard(kb)).await.map_err(kb_error);
                     emptied.and(reset)
                 }
                 Action::KeyboardRemove => {
                     let (Some(client), Some(kb)) = (self.touch.as_mut(), self.keyboard.as_mut()) else {
                         return Ok(());
                     };
-                    let result = client.remove_main_keyboard(kb).await.map_err(kb_error);
+                    let result = Box::pin(client.remove_main_keyboard(kb)).await.map_err(kb_error);
                     if result.is_ok() {
                         self.keyboard = None;
                     }
@@ -820,7 +822,9 @@ impl HidBackend for DeviceHid {
                             .unwrap_or_else(|| "the button service is not connected".into()));
                     };
                     let state = if down { ButtonState::Down } else { ButtonState::Up };
-                    client.send_button(page, code, state).await.map_err(|e| format!("button event failed: {e:?}"))
+                    Box::pin(client.send_button(page, code, state))
+                        .await
+                        .map_err(|e| format!("button event failed: {e:?}"))
                 }
             }
         })
@@ -839,11 +843,11 @@ struct DisplayStart {
 /// seconds at most. Failures are logged, not returned: the size then comes from `--visible-size`
 /// or the SPS.
 async fn connect_display_info(adapter: &mut AdapterHandle, handshake: &mut RsdHandshake) -> DisplayStart {
-    let service = match timed(
+    let service = match Box::pin(timed(
         "connecting the device info service",
         CONNECT_TIMEOUT,
         DeviceInfoClient::connect_rsd(adapter, handshake),
-    )
+    ))
     .await
     {
         Ok(Ok(c)) => c,
