@@ -42,7 +42,7 @@ space, including after the automatic mapping (swap first, then x, then y), so th
 `{"event":"hid","ready":true,"mapping":"auto","swap_xy":true,"flip_x":true,"flip_y":false}` (`mapping` is `auto`,
 `identity (no display info)`, `panel` or `ui`). Every mapped touch is logged at debug level.
 
-At `--hid` start the device's list of HID surfaces (`list_connected_services`: id, product, primary usage) is logged at INFO. The
+When control is connected (the default; see `--no-control`) the device's list of HID surfaces (`list_connected_services`: id, product, primary usage) is logged at INFO. The
 listing carries no orientation or size (the crate reads only those three fields), so the mapping cannot be checked against it;
 a device that lists no touchscreen surface (id 257, the one touch reports go to) gets a `{"event":"hid","warning":"..."}`.
 
@@ -58,8 +58,8 @@ HID events unless a display stream is open: the stream this process holds is tha
 
 ## Offer
 
-With `--codec hevc` the offer is **idevice's stock screen-sharing offer** (the one the system's own client sends), with our SSRC in it; by default
-(`--codec h264`) it is that offer without the HEVC bank (see below). The stock offer, with a PLI sent behind receiver reports, was answered with an IDR in
+With `--video-codec h265` the offer is **idevice's stock screen-sharing offer** (the one the system's own client sends), with our SSRC in it; by default
+(`--video-codec h264`) it is that offer without the HEVC bank (see below). The stock offer, with a PLI sent behind receiver reports, was answered with an IDR in
 about 50 ms on a real iPad, and so was the H.264 one (57 to 80 ms).
 Two settings of its video settings message can be changed for comparison on a device, each by an opt-in flag:
 `--rtcp-fb` sets `allowRTCPFB` (field 2) to 1, `--no-ltr` sets `ltrpEnabled` (field 7) to 0 and removes `LTR;` from the
@@ -68,12 +68,12 @@ and checks the fields, and that the default is identical to the builder's).
 
 ## H.264 (the default)
 
-**The default codec is `h264`**; `--codec hevc` is the opt-in (the stock offer, HEVC, which a browser can only decode in hardware). The default is a single constant
+**The default codec is `h264`**; `--video-codec h265` is the opt-in (the stock offer, HEVC, which a browser can only decode in hardware). The default is a single constant
 (`DEFAULT_CODEC` in `src/main.rs`), named by the tests of the default and by this paragraph. H.264 was run on a real iPad (iPad14,3, iOS 27.0.1): the configuration
 packet was read (1 SPS and 1 PPS, profile 100, level 51), the codec string was `avc1.640033`, every IDR carried SPS and PPS, a keyframe request was answered by an IDR in 57 to
 80 ms, and the stream decoded cleanly in ffmpeg and in Chrome.
 
-`--codec h264` (the default) sends the offer without the HEVC bank (see below) and runs the stream with an H.264 depacketizer (RFC 6184, packetization mode 1:
+`--video-codec h264` (the default) sends the offer without the HEVC bank (see below) and runs the stream with an H.264 depacketizer (RFC 6184, packetization mode 1:
 single NAL units, STAP-A, FU-A; the interleaved types are refused). It is the same machinery as for HEVC, with the same loss rules, the same
 keyframe handling and the same frames: `config.codec` is `avc1.PPCCLL` (profile_idc, the constraint byte and level_idc of the SPS, in hex), `width` and
 `height` are the cropped picture (the display's size if known) and `coded_width`/`coded_height` the macroblock-aligned size, KEY is an IDR slice,

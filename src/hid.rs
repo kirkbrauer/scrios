@@ -370,7 +370,7 @@ pub trait HidBackend {
     fn perform(&mut self, action: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>>;
 }
 
-/// The backend when `--hid` is off: every action fails with a message that says why.
+/// The backend when control is off: every action fails with a message that says why.
 pub struct NoHid;
 
 impl HidBackend for NoHid {
@@ -380,7 +380,7 @@ impl HidBackend for NoHid {
             if matches!(action, Action::KeyboardRelease | Action::KeyboardRemove) {
                 return Ok(());
             }
-            Err("HID is not enabled (start with --hid)".to_string())
+            Err("touch and keys are not enabled (control is off: see --no-control)".to_string())
         })
     }
 }
