@@ -39,6 +39,10 @@ pub const KEYBOARD_IDLE_RELEASE: Duration = Duration::from_secs(30);
 const TYPE_LAG: Duration = Duration::from_millis(50);
 /// Left Shift in the HID keyboard page.
 pub const LEFT_SHIFT: u8 = 0xE1;
+/// The App Switcher is the Home button pressed twice: each press is held for the short Home hold
+/// (80 ms), and the second goes down this long after the first came up, so that the two downs are
+/// 200 ms apart (the device wants them within 250 ms; 400 ms was measured to be too slow).
+pub const APP_SWITCHER_GAP: Duration = Duration::from_millis(120);
 /// Rate limit on commands that send a report: a burst, then this many a second.
 const BURST: f64 = 100.0;
 const REFILL_PER_SEC: f64 = 250.0;
@@ -404,6 +408,15 @@ struct KeyUp {
     code: u64,
 }
 
+/// A later button state change of a double press (the App Switcher), at the time it is due.
+#[derive(Debug, Clone, Copy)]
+struct ButtonStep {
+    at: Instant,
+    page: u64,
+    code: u64,
+    down: bool,
+}
+
 /// One step of a string being typed, at the time it is due.
 #[derive(Debug, Clone, Copy)]
 struct TypeStep {
@@ -435,6 +448,9 @@ pub struct Hid {
     pending_move: Option<(u16, u16)>,
     last_touch_sent: Option<Instant>,
     keys_down: VecDeque<KeyUp>,
+    /// What is still to come of a double press, in time order (empty when none is in progress).
+    /// The button is down while the first step is a release.
+    button_steps: VecDeque<ButtonStep>,
     tokens: f64,
     tokens_at: Option<Instant>,
     replies: ReplyLimit,
@@ -464,6 +480,7 @@ impl Hid {
             pending_move: None,
             last_touch_sent: None,
             keys_down: VecDeque::new(),
+            button_steps: VecDeque::new(),
             tokens: BURST,
             tokens_at: None,
             replies: ReplyLimit {
@@ -506,7 +523,12 @@ impl Hid {
             .pending_move
             .and(self.last_touch_sent)
             .map(|t| t + MOVE_INTERVAL);
-        let key_due = self.keys_down.iter().map(|k| k.at).min();
+        let key_due = self
+            .keys_down
+            .iter()
+            .map(|k| k.at)
+            .chain(self.button_steps.front().map(|s| s.at))
+            .min();
         let type_due = self.typing.front().map(|s| s.at);
         let idle_due = (!self.kb_pressed.is_empty())
             .then(|| self.kb_last.map(|t| t + KEYBOARD_IDLE_RELEASE))
@@ -792,6 +814,9 @@ impl Hid {
     /// A `key` command: the button goes down now and up after its hold time (a long press is held
     /// longer; it is one held press, not a repeated one).
     pub fn on_key(&mut self, now: Instant, key: Key, press: Press) {
+        if key == Key::AppSwitcher {
+            return self.on_app_switcher(now);
+        }
         if self.keys_down.len() >= MAX_KEYS_HELD {
             return self.fail(now, "too many keys pressed at once: key ignored");
         }
@@ -811,6 +836,32 @@ impl Hid {
             page,
             code,
         });
+    }
+
+    /// `key app-switcher`: the Home button, pressed and released, then after a gap pressed and
+    /// released again. The first press goes out now and the rest is scheduled (see `on_tick`), so the
+    /// loop is never held up by it: a touch, a key or a stop arriving meanwhile is handled as it
+    /// comes, and `release_all` lets go of the button if it is down. One at a time: a second one
+    /// while the first is going on is refused (it would make a triple press).
+    fn on_app_switcher(&mut self, now: Instant) {
+        if !self.button_steps.is_empty() {
+            return self.fail(now, "the app switcher is already being opened: key ignored");
+        }
+        if !self.take_token(now) {
+            return self.fail(now, "too many commands: key dropped");
+        }
+        let (page, code) = Key::AppSwitcher.usage();
+        let hold = Duration::from_millis(Key::AppSwitcher.hold_ms(Press::Short));
+        debug!("hid: key app-switcher (the home button twice: held {hold:?}, {APP_SWITCHER_GAP:?} apart)");
+        self.actions.push(Action::Button { page, code, down: true });
+        let up1 = now + hold;
+        let down2 = up1 + APP_SWITCHER_GAP;
+        let up2 = down2 + hold;
+        self.button_steps.extend([
+            ButtonStep { at: up1, page, code, down: false },
+            ButtonStep { at: down2, page, code, down: true },
+            ButtonStep { at: up2, page, code, down: false },
+        ]);
     }
 
     /// The clock reached [`next_deadline`](Self::next_deadline).
@@ -839,6 +890,10 @@ impl Hid {
                 self.send_touch(now, true, x, y);
             }
         }
+        while let Some(step) = self.button_steps.front().filter(|s| s.at <= now).copied() {
+            self.button_steps.pop_front();
+            self.actions.push(Action::Button { page: step.page, code: step.code, down: step.down });
+        }
         while let Some(i) = self.keys_down.iter().position(|k| k.at <= now) {
             let k = self.keys_down.remove(i).expect("position is in range");
             self.actions.push(Action::Button {
@@ -861,6 +916,12 @@ impl Hid {
                 y,
             });
         }
+        // A double press under way: if the button is down (the next step is its release), let go of
+        // it; the rest of the sequence is dropped.
+        if let Some(step) = self.button_steps.front().filter(|s| !s.down).copied() {
+            self.actions.push(Action::Button { page: step.page, code: step.code, down: false });
+        }
+        self.button_steps.clear();
         for k in self.keys_down.drain(..) {
             self.actions.push(Action::Button {
                 page: k.page,
@@ -1394,6 +1455,130 @@ mod tests {
         h.on_tick(ms(t0, 500));
         assert_eq!(h.take_actions(), vec![Action::Button { page: 0x0C, code: 0x30, down: false }]);
         assert_eq!(h.next_deadline(), None);
+    }
+
+    const HOME_DOWN: Action = Action::Button { page: 0x0C, code: 0x40, down: true };
+    const HOME_UP: Action = Action::Button { page: 0x0C, code: 0x40, down: false };
+
+    #[test]
+    fn the_app_switcher_is_the_home_button_twice_80_ms_held_and_120_ms_apart() {
+        // short and long are the same for it.
+        for press in [Press::Short, Press::Long] {
+            let (mut h, q, t0) = rig();
+            h.on_key(t0, Key::AppSwitcher, press);
+            // The first press is down at once; nothing else is sent yet.
+            assert_eq!(h.take_actions(), vec![HOME_DOWN]);
+            assert_eq!(h.next_deadline(), Some(ms(t0, 80)));
+            h.on_tick(ms(t0, 79));
+            assert!(h.take_actions().is_empty());
+            // 80 ms: up.
+            h.on_tick(ms(t0, 80));
+            assert_eq!(h.take_actions(), vec![HOME_UP]);
+            assert_eq!(h.next_deadline(), Some(ms(t0, 200)), "the second press, 120 ms after the release");
+            h.on_tick(ms(t0, 199));
+            assert!(h.take_actions().is_empty());
+            // 200 ms: down again (the two downs are 200 ms apart); then held 80 ms.
+            h.on_tick(ms(t0, 200));
+            assert_eq!(h.take_actions(), vec![HOME_DOWN]);
+            assert_eq!(h.next_deadline(), Some(ms(t0, 280)));
+            h.on_tick(ms(t0, 279));
+            assert!(h.take_actions().is_empty());
+            h.on_tick(ms(t0, 280));
+            assert_eq!(h.take_actions(), vec![HOME_UP]);
+            assert_eq!(h.next_deadline(), None);
+            h.on_tick(ms(t0, 10_000));
+            assert!(h.take_actions().is_empty(), "nothing more");
+            assert!(controls(&q).is_empty(), "no reply: it worked");
+        }
+    }
+
+    #[test]
+    fn a_late_tick_does_the_due_steps_in_order() {
+        let (mut h, _q, t0) = rig();
+        h.on_key(t0, Key::AppSwitcher, Press::Short);
+        h.take_actions();
+        h.on_tick(ms(t0, 1000));
+        assert_eq!(h.take_actions(), vec![HOME_UP, HOME_DOWN, HOME_UP]);
+        assert_eq!(h.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_touch_or_another_key_in_the_middle_of_an_app_switcher_is_handled_at_once() {
+        let (mut h, _q, t0) = rig();
+        h.on_key(t0, Key::AppSwitcher, Press::Short);
+        assert_eq!(h.take_actions(), vec![HOME_DOWN]);
+        // In the gap (between 80 and 200 ms) a finger goes down; the sequence is not held up.
+        h.on_tick(ms(t0, 80));
+        assert_eq!(h.take_actions(), vec![HOME_UP]);
+        h.on_touch(ms(t0, 100), touch(TouchPhase::Down, 500.0, 1000.0), VIEW);
+        h.on_key(ms(t0, 110), Key::VolumeUp, Press::Short);
+        assert_eq!(
+            h.take_actions(),
+            vec![
+                Action::Touch { down: true, x: 32768, y: 32768 },
+                Action::Button { page: 0x0C, code: 0xE9, down: true },
+            ]
+        );
+        // The deadline is the earliest of the volume key's release (190 ms) and the second press (200 ms).
+        assert_eq!(h.next_deadline(), Some(ms(t0, 190)));
+        h.on_tick(ms(t0, 190));
+        assert_eq!(h.take_actions(), vec![Action::Button { page: 0x0C, code: 0xE9, down: false }]);
+        assert_eq!(h.next_deadline(), Some(ms(t0, 200)));
+        h.on_tick(ms(t0, 200));
+        assert_eq!(h.take_actions(), vec![HOME_DOWN]);
+        h.on_tick(ms(t0, 280));
+        assert_eq!(h.take_actions(), vec![HOME_UP]);
+    }
+
+    #[test]
+    fn a_stop_in_the_middle_of_an_app_switcher_lets_go_of_the_button_and_drops_the_rest() {
+        // Each stop time, with everything sent after the first press (the loop ticks at every deadline
+        // up to the stop, then lets go of everything): the button is up at the end, whenever the stop is.
+        let cases: [(u64, Vec<Action>); 9] = [
+            (0, vec![HOME_UP]),   // as the first press goes down
+            (40, vec![HOME_UP]),  // during the first press
+            (79, vec![HOME_UP]),
+            (80, vec![HOME_UP]),  // as it comes up: once, not twice
+            (150, vec![HOME_UP]), // in the gap: it is up; the second press never happens
+            (199, vec![HOME_UP]),
+            (200, vec![HOME_UP, HOME_DOWN, HOME_UP]), // as the second goes down
+            (250, vec![HOME_UP, HOME_DOWN, HOME_UP]), // during the second press
+            (280, vec![HOME_UP, HOME_DOWN, HOME_UP]), // as the sequence ends: nothing extra
+        ];
+        for (stop_at, want) in cases {
+            let (mut h, _q, t0) = rig();
+            h.on_key(t0, Key::AppSwitcher, Press::Short);
+            assert_eq!(h.take_actions(), vec![HOME_DOWN]);
+            let stop = ms(t0, stop_at);
+            while let Some(d) = h.next_deadline().filter(|d| *d <= stop) {
+                h.on_tick(d);
+            }
+            h.release_all();
+            assert_eq!(h.take_actions(), want, "stop at {stop_at} ms");
+            // Nothing is left to happen, however long it is waited for.
+            assert_eq!(h.next_deadline(), None, "stop at {stop_at} ms");
+            h.on_tick(ms(t0, 10_000));
+            assert!(h.take_actions().is_empty(), "stop at {stop_at} ms");
+        }
+    }
+
+    #[test]
+    fn a_second_app_switcher_while_one_is_going_on_is_refused_and_one_after_it_works() {
+        let (mut h, q, t0) = rig();
+        h.on_key(t0, Key::AppSwitcher, Press::Short);
+        h.take_actions();
+        h.on_key(ms(t0, 50), Key::AppSwitcher, Press::Short);
+        assert!(h.take_actions().is_empty());
+        let c = controls(&q);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["ok"], false);
+        assert!(c[0]["message"].as_str().unwrap().contains("app switcher"), "{c:?}");
+        h.on_tick(ms(t0, 280));
+        assert_eq!(h.take_actions(), vec![HOME_UP, HOME_DOWN, HOME_UP]);
+        // Done: the next one runs.
+        h.on_key(ms(t0, 400), Key::AppSwitcher, Press::Short);
+        assert_eq!(h.take_actions(), vec![HOME_DOWN]);
+        assert_eq!(h.next_deadline(), Some(ms(t0, 480)));
     }
 
     #[test]

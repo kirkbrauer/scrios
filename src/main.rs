@@ -90,7 +90,8 @@ enum SpaceArg {
 CoreDevice tunnel, starts the display stream and writes each picture to stdout as one frame: \
 [u32 len][u64 pts_us][u8 flags][payload], big-endian. Control events are JSON frames (flag 0x80). \
 Commands arrive on stdin, one per line: `keyframe`, `stop` (end of input also stops) and, with --hid, \
-`touch down|move|up <x> <y> <id>` and `key <name> [short|long]`. Logs go to stderr. A clean stop can take up to about 8 seconds."
+`touch down|move|up <x> <y> <id>` and `key <name> [short|long]` (names: home, app-switcher or switcher (the Home button \
+twice: short|long is ignored), lock, power, sleep, volume-up, volume-down, mute, siri). Logs go to stderr. A clean stop can take up to about 8 seconds."
 )]
 struct Args {
     /// UDID of the phone (default: the only device usbmuxd lists)

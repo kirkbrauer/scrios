@@ -746,6 +746,59 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_app_switcher_goes_through_the_loop_on_schedule_and_does_not_hold_it_up() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = TimedHid { done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        send_later(&r, 100, Command::Key(Key::AppSwitcher, Press::Short)).await;
+        // A touch in the gap (the first press is up at 180, the second goes down at 300) is performed when it comes.
+        send_later(&r, 230, touch(TouchPhase::Down, 607.5, 1327.5)).await;
+        send_later(&r, 1000, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        let done = done.lock().unwrap();
+        let home = |down| Action::Button { page: 0x0C, code: 0x40, down };
+        let timed: Vec<(Action, u64)> = done.iter().map(|(a, t)| (*a, (*t - t0).as_millis() as u64)).collect();
+        assert_eq!(
+            &timed[..5],
+            &[
+                (home(true), 100),
+                (home(false), 180),
+                (Action::Touch { down: true, x: 32768, y: 32768 }, 230),
+                (home(true), 300),
+                (home(false), 380),
+            ]
+        );
+        // Then the stop, at 1000: the finger lifted and the keyboard taken down; no button after 380.
+        assert!(timed[5..].iter().all(|(a, t)| *t == 1000 && !matches!(a, Action::Button { .. })), "{timed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_in_the_middle_of_an_app_switcher_releases_the_button_first() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = TimedHid { done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        send_later(&r, 100, Command::Key(Key::AppSwitcher, Press::Long)).await; // long is ignored
+        send_later(&r, 130, Command::Stop).await; // the first press is still down (80 ms: until 180)
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        let timed: Vec<(Action, u64)> =
+            done.lock().unwrap().iter().map(|(a, t)| (*a, (*t - t0).as_millis() as u64)).collect();
+        let home = |down| Action::Button { page: 0x0C, code: 0x40, down };
+        assert_eq!(timed, vec![(home(true), 100), (home(false), 130), (Action::KeyboardRemove, 130)]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_finger_down_when_stdin_ends_is_lifted() {
         // End of input is a Stop through the same channel.
         let (sock, tx) = fake();

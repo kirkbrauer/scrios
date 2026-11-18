@@ -149,6 +149,12 @@ unit sent) and when the clock rate is corrected.
   default. `home`, `volume-up`, `volume-down`, `mute`: 80 ms short, 600 ms long. `lock`, `power`, `sleep` (the same button):
   200 ms short, 1200 ms long. `siri`: 1200 ms short, 2500 ms long. The short times are the reference tool's; a long press is
   one held press, not a repeated one. At most 8 presses wait for their release; further ones are refused.
+  `app-switcher` (alias `switcher`) opens the App Switcher, which on the iPad is the **Home button pressed twice**: Home down, 80 ms (the short Home hold), up,
+  a 120 ms gap, Home down, 80 ms, up (the two downs are 200 ms apart; two presses 250 ms apart or less work on the iPad, 400 ms is too slow, and a touch on
+  the bottom edge never triggers the gesture). It is one scheduled action: the first press goes out at once and the rest follows on the clock, so a `touch`,
+  another `key` or a `stop` that arrives meanwhile is handled as it comes; a `stop` (or the end of stdin) in the middle lets go of the button first and drops the
+  rest. `short` and `long` are accepted and **ignored**. A second `app-switcher` while one is going on is refused (one `hid` event with `ok:false`), so it can never
+  become three presses.
 - `kb down <usage>` and `kb up <usage>` (with `--hid`): a key of the HID keyboard page, by its usage in hex (two digits, `0x` allowed): `04` is A,
   `28` Enter, `29` Escape, `2a` Backspace, `2b` Tab, `4f`..`52` Right, Left, Down, Up, and `e0`..`e7` the modifiers (Left Control, Shift, Alt, GUI, then
   the right ones). The usages 01 to e7 are accepted. Keys and modifiers **accumulate in the virtual keyboard's pressed set, as on a physical keyboard**: each

@@ -4,7 +4,8 @@
 //! * `stop` ends the stream cleanly.
 //! * `touch down|move|up <x> <y> <id>`: a finger, in pixels of the upright picture (see `hid`).
 //! * `key <name> [short|long]`: a hardware button, one of [`Key::NAMES`], pressed briefly (the
-//!   default) or held.
+//!   default) or held. `key app-switcher` (or `switcher`) is the Home button pressed twice, and
+//!   ignores `short|long`.
 //! * `kb down|up <usage>`: a key of the HID keyboard page, by its usage in hex (`04` is A, `e1` is
 //!   Left Shift); `kb type <base64>`: type a UTF-8 string.
 //! * End of input is `stop`.
@@ -66,6 +67,8 @@ pub struct Touch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Home,
+    /// The App Switcher: the Home button pressed twice, quickly (see `hid`).
+    AppSwitcher,
     Lock,
     Power,
     Sleep,
@@ -83,11 +86,12 @@ pub enum Press {
 }
 
 impl Key {
-    pub const NAMES: &'static str = "home, lock, power, sleep, volume-up, volume-down, mute, siri";
+    pub const NAMES: &'static str = "home, app-switcher (or switcher), lock, power, sleep, volume-up, volume-down, mute, siri";
 
     pub fn from_name(name: &str) -> Option<Key> {
         Some(match name {
             "home" => Key::Home,
+            "app-switcher" | "switcher" => Key::AppSwitcher,
             "lock" => Key::Lock,
             "power" => Key::Power,
             "sleep" => Key::Sleep,
@@ -103,7 +107,7 @@ impl Key {
     /// lock and sleep are the same button.
     pub fn usage(self) -> (u64, u64) {
         match self {
-            Key::Home => (0x0C, 0x40),
+            Key::Home | Key::AppSwitcher => (0x0C, 0x40),
             Key::Power | Key::Lock | Key::Sleep => (0x0C, 0x30),
             Key::VolumeUp => (0x0C, 0xE9),
             Key::VolumeDown => (0x0C, 0xEA),
@@ -113,9 +117,11 @@ impl Key {
     }
 
     /// How long the button is held down in ms. The short hold is the reference tool's; a long
-    /// press is held about twice as long or more (a held press, not a repeated one).
+    /// press is held about twice as long or more (a held press, not a repeated one). The App
+    /// Switcher is two short Home presses whatever `press` says.
     pub fn hold_ms(self, press: Press) -> u64 {
         match (self, press) {
+            (Key::AppSwitcher, _) => 80,
             (Key::Home | Key::VolumeUp | Key::VolumeDown | Key::Mute, Press::Short) => 80,
             (Key::Home | Key::VolumeUp | Key::VolumeDown | Key::Mute, Press::Long) => 600,
             (Key::Power | Key::Lock | Key::Sleep, Press::Short) => 200,
@@ -417,6 +423,8 @@ mod tests {
     fn key_commands_parse_every_named_button() {
         for (name, key) in [
             ("home", Key::Home),
+            ("app-switcher", Key::AppSwitcher),
+            ("switcher", Key::AppSwitcher),
             ("lock", Key::Lock),
             ("power", Key::Power),
             ("sleep", Key::Sleep),
@@ -445,12 +453,13 @@ mod tests {
             assert!(matches!(touch(bad), Parsed::Bad(_)), "{bad}");
         }
         assert!(matches!(touch("key home forever"), Parsed::Bad(m) if m.contains("short or long")));
-        assert!(matches!(touch("key what"), Parsed::Bad(m) if m.contains("home") && m.contains("siri")));
+        assert!(matches!(touch("key what"), Parsed::Bad(m) if m.contains("home") && m.contains("siri") && m.contains("app-switcher")));
     }
 
     #[test]
     fn the_buttons_have_the_reference_tools_usages_and_hold_times() {
         assert_eq!(Key::Home.usage(), (0x0C, 0x40));
+        assert_eq!(Key::AppSwitcher.usage(), Key::Home.usage(), "the App Switcher is the Home button, twice");
         assert_eq!(Key::Power.usage(), (0x0C, 0x30));
         assert_eq!(Key::Lock.usage(), Key::Power.usage());
         assert_eq!(Key::Sleep.usage(), Key::Power.usage());
@@ -461,6 +470,7 @@ mod tests {
         // (short, long) in ms.
         for (key, short, long) in [
             (Key::Home, 80, 600),
+            (Key::AppSwitcher, 80, 80), // `long` is ignored
             (Key::Power, 200, 1200),
             (Key::Lock, 200, 1200),
             (Key::Sleep, 200, 1200),
