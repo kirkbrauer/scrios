@@ -944,7 +944,7 @@ pub mod testutil {
     pub fn ap(nals: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![NAL_AP << 1, 0x01];
         for n in nals {
-            v.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            v.extend_from_slice(&u16::try_from(n.len()).unwrap().to_be_bytes());
             v.extend_from_slice(n);
         }
         v
@@ -997,6 +997,10 @@ pub mod testutil {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1457,6 +1461,10 @@ mod tests {
 
 #[cfg(test)]
 mod h264_tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,

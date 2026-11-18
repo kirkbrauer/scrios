@@ -127,7 +127,7 @@ impl RtpStats {
         let epoch = *self.epoch.get_or_insert(now);
         let arrival = now.saturating_duration_since(epoch).as_secs_f64() * f64::from(self.clock_hz);
         if let Some((prev_arrival, prev_ts)) = self.prev {
-            let ts_delta = f64::from(timestamp.wrapping_sub(prev_ts) as i32);
+            let ts_delta = f64::from(timestamp.wrapping_sub(prev_ts).cast_signed());
             let d = (arrival - prev_arrival) - ts_delta;
             self.jitter += (d.abs() - self.jitter) / 16.0;
         }
@@ -146,6 +146,7 @@ impl RtpStats {
     }
 
     /// The highest sequence number received, counted from the first one (low 16 bits).
+    #[expect(clippy::cast_possible_truncation, reason = "the low 16 bits are what is asked for")]
     pub fn highest_since_base(&self) -> u16 {
         self.extended_highest().wrapping_sub(self.base_seq) as u16
     }
@@ -166,9 +167,14 @@ impl RtpStats {
     /// Cumulative packets lost, clamped to the report's 24 bits (a negative count, from duplicates, is 0).
     pub fn cumulative_lost(&self) -> u32 {
         let lost = i64::from(self.expected()) - i64::from(self.received);
-        lost.clamp(0, 0x00FF_FFFF) as u32
+        u32::try_from(lost.clamp(0, 0x00FF_FFFF)).unwrap_or(0) // in range: clamped
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the jitter is not negative, and a float-to-int `as` saturates"
+    )]
     pub fn jitter(&self) -> u32 {
         self.jitter as u32
     }
@@ -185,12 +191,18 @@ impl RtpStats {
         let fraction_lost = if expected_interval == 0 || lost_interval <= 0 {
             0
         } else {
-            ((lost_interval << 8) / i64::from(expected_interval)).min(255) as u8
+            u8::try_from(((lost_interval << 8) / i64::from(expected_interval)).min(255)).unwrap_or(u8::MAX)
         };
         let (lsr, dlsr) = match self.last_sr {
             Some((ntp_middle, at)) => {
                 let secs = now.saturating_duration_since(at).as_secs_f64();
-                (ntp_middle, (secs * 65536.0) as u32)
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "seconds are not negative, and a float-to-int `as` saturates"
+                )]
+                let dlsr = (secs * 65536.0) as u32;
+                (ntp_middle, dlsr)
             }
             None => (0, 0),
         };
@@ -208,6 +220,10 @@ impl RtpStats {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use std::time::Duration;
 
     use super::*;
@@ -217,6 +233,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "0x11112222 + 0.5 is exact in a double, and the parse must give exactly that")]
     fn sender_reports_are_parsed_from_compound_packets() {
         // An RR first, then the SR: SSRC, NTP 0x11112222.80000000 (= 286331682.5 s), RTP ts 7777.
         let mut b = vec![0x80, 201, 0, 1, 0, 0, 0, 9];

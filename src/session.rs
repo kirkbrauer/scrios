@@ -384,6 +384,11 @@ async fn session_loop<S: DatagramSocket, C: Clock>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::Mutex as AsyncMutex;

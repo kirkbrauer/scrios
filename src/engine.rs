@@ -173,13 +173,14 @@ impl PtsClock {
     fn pts_us(&mut self, timestamp: u32) -> u64 {
         if self.started {
             // Signed step, so a 32-bit wrap of the timestamp is no jump.
-            self.ticks += i64::from(timestamp.wrapping_sub(self.last) as i32);
+            self.ticks += i64::from(timestamp.wrapping_sub(self.last).cast_signed());
         } else {
             self.started = true;
             self.ticks = 0;
         }
         self.last = timestamp;
-        let pts = self.anchor_us + (self.ticks.max(0) as u128 * 1_000_000 / u128::from(self.hz)) as u64;
+        let elapsed_us = u128::try_from(self.ticks).unwrap_or(0) * 1_000_000 / u128::from(self.hz);
+        let pts = self.anchor_us + u64::try_from(elapsed_us).unwrap_or(u64::MAX);
         // A unit whose timestamp is behind the one before (a reordered or restarted sender) gets the previous
         // time, never an earlier one: a decoder or a player must not see presentation times go backwards.
         // The ticks go on from where the timestamps are, so the times follow them again once they pass.
@@ -907,7 +908,9 @@ impl Engine {
         if self.rtcp_port.is_none() || self.rtp.received() == 0 {
             return;
         }
-        let clock_ms = now.saturating_duration_since(self.started_at).as_millis() as u16;
+        // The report's clock is 16 bits of milliseconds: it wraps every 65.5 s.
+        let clock_ms =
+            u16::try_from(now.saturating_duration_since(self.started_at).as_millis() % 0x1_0000).unwrap_or(0);
         self.outbox.push(build_rctl(self.cfg.our_ssrc, clock_ms, self.frames_received, self.rtp.highest_since_base()));
         self.counters.rtcp += 1;
     }
@@ -941,6 +944,10 @@ fn hex(b: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use super::*;
     use crate::depack::testutil::*;
     use crate::frame::{FLAG_CONTROL, FLAG_KEY, FLAG_PARAMS};

@@ -270,7 +270,9 @@ pub enum Outcome {
 
 /// Writes one datagram to the raw dump: its length as 4 bytes big-endian, then the bytes.
 pub fn write_raw(out: &mut dyn Write, data: &[u8]) -> io::Result<()> {
-    out.write_all(&(data.len() as u32).to_be_bytes())?;
+    let len =
+        u32::try_from(data.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "datagram too long"))?;
+    out.write_all(&len.to_be_bytes())?;
     out.write_all(data)
 }
 
@@ -319,6 +321,10 @@ pub async fn collect<S: DatagramSocket>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use std::io;
     use std::sync::Arc;
 

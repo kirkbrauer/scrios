@@ -754,7 +754,7 @@ pub mod testutil {
     pub fn stap_a(nals: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![0x18];
         for n in nals {
-            v.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            v.extend_from_slice(&u16::try_from(n.len()).unwrap().to_be_bytes());
             v.extend_from_slice(n);
         }
         v
@@ -785,14 +785,14 @@ pub mod testutil {
 
     /// An `AVCDecoderConfigurationRecord`.
     pub fn avcc_record(profile: u8, compat: u8, level: u8, sps: &[&[u8]], pps: &[&[u8]]) -> Vec<u8> {
-        let mut r = vec![1, profile, compat, level, 0xFF, 0xE0 | sps.len() as u8];
+        let mut r = vec![1, profile, compat, level, 0xFF, 0xE0 | u8::try_from(sps.len()).unwrap()];
         for s in sps {
-            r.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            r.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
             r.extend_from_slice(s);
         }
-        r.push(pps.len() as u8);
+        r.push(u8::try_from(pps.len()).unwrap());
         for p in pps {
-            r.extend_from_slice(&(p.len() as u16).to_be_bytes());
+            r.extend_from_slice(&u16::try_from(p.len()).unwrap().to_be_bytes());
             r.extend_from_slice(p);
         }
         r
@@ -800,7 +800,7 @@ pub mod testutil {
 
     /// An ISO box: size, type, content.
     pub fn make_box(kind: &[u8; 4], content: &[u8]) -> Vec<u8> {
-        let mut b = ((content.len() + 8) as u32).to_be_bytes().to_vec();
+        let mut b = u32::try_from(content.len() + 8).unwrap().to_be_bytes().to_vec();
         b.extend_from_slice(kind);
         b.extend_from_slice(content);
         b
@@ -1755,7 +1755,7 @@ mod tests {
         assert_eq!(find_avc_config(&p), None);
         // Random bytes with the word `avc1` in them never panic.
         for len in 4..120usize {
-            let mut v: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let mut v: Vec<u8> = (0..len).map(|i| u8::try_from(i * 31 % 251).unwrap()).collect();
             v[len / 2..].iter_mut().zip(b"avc1avcC").for_each(|(d, s)| *d = *s);
             let _ = find_avc_config(&v);
         }

@@ -139,13 +139,23 @@ pub fn select_device<'a>(devices: &'a [UsbmuxdDevice], udid: Option<&str>) -> Re
     }
 }
 
+/// A non-negative real as a whole number: the fraction is dropped, and a number too big for a `u64` is the largest.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a float-to-int `as` saturates; the caller has checked the sign"
+)]
+fn real_to_u64(r: f64) -> u64 {
+    r as u64
+}
+
 /// A plist number, or a string of digits, or the `{"int": n}` wrapper CoreDevice uses.
 fn value_u64(v: &plist::Value) -> Option<u64> {
     match v {
         plist::Value::Integer(_) => {
             v.as_unsigned_integer().or_else(|| v.as_signed_integer().and_then(|i| u64::try_from(i).ok()))
         }
-        plist::Value::Real(r) if *r >= 0.0 => Some(*r as u64),
+        plist::Value::Real(r) if *r >= 0.0 => Some(real_to_u64(*r)),
         plist::Value::String(s) => s.trim().parse().ok(),
         plist::Value::Dictionary(d) if d.len() == 1 => d.iter().next().and_then(|(_, inner)| value_u64(inner)),
         _ => None,
@@ -865,7 +875,9 @@ async fn connect_display_info(adapter: &mut AdapterHandle, handshake: &mut RsdHa
 /// A non-zero random SSRC.
 fn fresh_ssrc() -> u32 {
     loop {
-        let s = uuid::Uuid::new_v4().as_u128() as u32;
+        // The low 32 bits of a random UUID.
+        let [.., a, b, c, d] = *uuid::Uuid::new_v4().as_bytes();
+        let s = u32::from_be_bytes([a, b, c, d]);
         if s != 0 {
             return s;
         }

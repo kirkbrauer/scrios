@@ -94,10 +94,12 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, String> {
 
 fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
+        let [low, ..] = v.to_le_bytes();
+        out.push((low & 0x7f) | 0x80);
         v >>= 7;
     }
-    out.push(v as u8);
+    let [last, ..] = v.to_le_bytes(); // below 0x80
+    out.push(last);
 }
 
 pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {

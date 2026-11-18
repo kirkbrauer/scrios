@@ -99,7 +99,8 @@ pub fn unit_flags(key: bool, params: bool) -> u8 {
 /// The 13 header bytes of a frame whose payload is `len` bytes.
 fn header(len: usize, pts_us: u64, flags: u8) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
-    h[0..4].copy_from_slice(&(len as u32).to_be_bytes());
+    // A payload is at most MAX_PAYLOAD (16 MiB): the callers refuse more.
+    h[0..4].copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes());
     h[4..12].copy_from_slice(&pts_us.to_be_bytes());
     h[12] = flags;
     h

@@ -181,6 +181,11 @@ pub fn panel_position(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: 
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 0..=AXIS_MAX, which is a u16's range"
+)]
 fn to_axis(f: f64) -> u16 {
     (f * AXIS_MAX).round().clamp(0.0, AXIS_MAX) as u16
 }
@@ -403,11 +408,12 @@ impl ActionQueue {
 /// The US keyboard layout: the usage of the key that types `c`, and whether Shift is needed. Letters,
 /// digits, the printable ASCII punctuation, space, newline (Return) and tab; nothing else.
 pub fn us_layout(c: char) -> Option<(u8, bool)> {
-    let n = c as u32;
+    // Only ASCII has a usage (the arms below), so a character that is not a byte has none.
+    let n = u8::try_from(c).ok()?;
     Some(match c {
-        'a'..='z' => (0x04 + (n - 'a' as u32) as u8, false),
-        'A'..='Z' => (0x04 + (n - 'A' as u32) as u8, true),
-        '1'..='9' => (0x1E + (n - '1' as u32) as u8, false),
+        'a'..='z' => (0x04 + (n - b'a'), false),
+        'A'..='Z' => (0x04 + (n - b'A'), true),
+        '1'..='9' => (0x1E + (n - b'1'), false),
         '0' => (0x27, false),
         '\n' => (0x28, false), // Return
         '\t' => (0x2B, false), // Tab
@@ -949,6 +955,12 @@ impl Hid {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "the tests number packets, bytes and times with small loop counters, so a cast does not truncate or lose precision"
+    )]
     use super::*;
 
     fn ms(t0: Instant, n: u64) -> Instant {

@@ -398,17 +398,17 @@ pub mod testutil {
         pub fn nal(&self) -> Vec<u8> {
             let mut w = BitWriter::default();
             w.u(4, 0); // sps_video_parameter_set_id
-            w.u(3, self.max_sub_layers_minus1 as u64);
+            w.u(3, u64::from(self.max_sub_layers_minus1));
             w.u(1, 1); // sps_temporal_id_nesting_flag
             // profile_tier_level
             w.u(2, 0);
-            w.u(1, self.tier_high as u64);
-            w.u(5, self.profile_idc as u64);
-            w.u(32, self.compat_flags as u64);
+            w.u(1, u64::from(self.tier_high));
+            w.u(5, u64::from(self.profile_idc));
+            w.u(32, u64::from(self.compat_flags));
             for b in self.constraint {
-                w.u(8, b as u64);
+                w.u(8, u64::from(b));
             }
-            w.u(8, self.level_idc as u64);
+            w.u(8, u64::from(self.level_idc));
             for _ in 0..self.max_sub_layers_minus1 {
                 w.bit(1); // sub_layer_profile_present_flag
                 w.bit(1); // sub_layer_level_present_flag
