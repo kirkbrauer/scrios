@@ -5,6 +5,8 @@
 //! * `touch down|move|up <x> <y> <id>`: a finger, in pixels of the upright picture (see `hid`).
 //! * `key <name> [short|long]`: a hardware button, one of [`Key::NAMES`], pressed briefly (the
 //!   default) or held.
+//! * `kb down|up <usage>`: a key of the HID keyboard page, by its usage in hex (`04` is A, `e1` is
+//!   Left Shift); `kb type <base64>`: type a UTF-8 string.
 //! * End of input is `stop`.
 //! * Anything else is logged and ignored; a `touch` or `key` that is malformed is reported.
 
@@ -14,8 +16,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-/// A longer line is not a command (and is not buffered whole).
-const MAX_LINE: usize = 1024;
+/// A longer line is not a command (and is not buffered whole). The longest command is `kb type` with
+/// 4096 characters of up to 4 bytes each in base64 (about 22 KB).
+const MAX_LINE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -23,8 +26,24 @@ pub enum Command {
     Stop,
     Touch(Touch),
     Key(Key, Press),
+    Kb(Kb),
     /// A `touch` or `key` command that did not parse; the message says why.
     Invalid(String),
+}
+
+/// The most characters one `kb type` may carry.
+pub const MAX_TYPE_CHARS: usize = 4096;
+/// The HID keyboard page's usages the device's keyboard takes: 0x01 to 0xE7.
+pub const MAX_KEY_USAGE: u8 = 0xE7;
+
+/// A keyboard command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kb {
+    /// A key goes down (and stays down, like on a physical keyboard, until its `up`).
+    Down(u8),
+    Up(u8),
+    /// A string to type through the US layout.
+    Type(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +188,39 @@ fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
     Ok((key, press))
 }
 
+/// A HID keyboard usage in hex, `04` or `0x04`.
+fn parse_usage(s: &str) -> Result<u8, String> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("usage {s:?} is not a hex number"));
+    }
+    match u16::from_str_radix(hex, 16) {
+        Ok(v) if (1..=u16::from(MAX_KEY_USAGE)).contains(&v) => Ok(v as u8),
+        _ => Err(format!("usage {s:?} is out of range (01 to {MAX_KEY_USAGE:02x})")),
+    }
+}
+
+fn parse_kb(args: &[&str]) -> Result<Kb, String> {
+    use base64::Engine as _;
+    match args {
+        ["down", usage] => Ok(Kb::Down(parse_usage(usage)?)),
+        ["up", usage] => Ok(Kb::Up(parse_usage(usage)?)),
+        ["type", text] => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
+                .map_err(|_| "kb type: the text is not valid base64".to_string())?;
+            let text = String::from_utf8(bytes).map_err(|_| "kb type: the text is not valid UTF-8".to_string())?;
+            let chars = text.chars().count();
+            if chars > MAX_TYPE_CHARS {
+                return Err(format!("kb type: {chars} characters, at most {MAX_TYPE_CHARS}"));
+            }
+            Ok(Kb::Type(text))
+        }
+        _ => Err("usage: kb down <usage>, kb up <usage> (hex), or kb type <base64>".to_string()),
+    }
+}
+
 pub fn parse_line(line: &[u8]) -> Parsed {
     let text = String::from_utf8_lossy(line);
     let text = text.trim();
@@ -181,6 +233,13 @@ pub fn parse_line(line: &[u8]) -> Parsed {
             let args: Vec<&str> = words.collect();
             match parse_touch(&args) {
                 Ok(t) => Parsed::Command(Command::Touch(t)),
+                Err(e) => Parsed::Bad(e),
+            }
+        }
+        Some("kb") => {
+            let args: Vec<&str> = words.collect();
+            match parse_kb(&args) {
+                Ok(k) => Parsed::Command(Command::Kb(k)),
                 Err(e) => Parsed::Bad(e),
             }
         }
@@ -415,6 +474,102 @@ mod tests {
         }
     }
 
+    fn b64(s: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[test]
+    fn kb_down_and_up_take_hex_usages() {
+        let cmd = |l: &str| match touch(l) {
+            Parsed::Command(Command::Kb(k)) => k,
+            other => panic!("{l:?} parsed as {other:?}"),
+        };
+        assert_eq!(cmd("kb down 04"), Kb::Down(0x04));
+        assert_eq!(cmd("kb up 04"), Kb::Up(0x04));
+        assert_eq!(cmd("kb down 28"), Kb::Down(0x28)); // Enter
+        assert_eq!(cmd("kb down 2a"), Kb::Down(0x2A)); // Backspace
+        assert_eq!(cmd("kb down 2B"), Kb::Down(0x2B)); // Tab, upper-case hex
+        assert_eq!(cmd("kb down 0x4f"), Kb::Down(0x4F)); // Right
+        assert_eq!(cmd("kb up e0"), Kb::Up(0xE0)); // Left Control
+        assert_eq!(cmd("kb down e7"), Kb::Down(0xE7)); // Right GUI, the last one
+        assert_eq!(cmd("kb down 0001"), Kb::Down(1));
+        assert_eq!(cmd("  kb   down   e1 \r"), Kb::Down(0xE1));
+    }
+
+    #[test]
+    fn bad_kb_usages_are_reported() {
+        let bad = |l: &str| match touch(l) {
+            Parsed::Bad(why) => why,
+            other => panic!("{l:?} parsed as {other:?}"),
+        };
+        assert!(bad("kb down").contains("usage"));
+        assert!(bad("kb down 04 05").contains("usage"));
+        assert!(bad("kb press 04").contains("usage"));
+        assert!(bad("kb").contains("usage"));
+        assert!(bad("kb down zz").contains("not a hex number"));
+        assert!(bad("kb down 4g").contains("not a hex number"));
+        assert!(bad("kb down -4").contains("not a hex number"));
+        assert!(bad("kb down 0x").contains("not a hex number"));
+        assert!(bad("kb down 00").contains("out of range"), "usage 0 is no key");
+        assert!(bad("kb down e8").contains("out of range"));
+        assert!(bad("kb up ff").contains("out of range"));
+        assert!(bad("kb down 100").contains("out of range"));
+        assert!(bad("kb down ffff").contains("out of range"));
+        assert!(bad("kb down fffffffffff").contains("not a hex number"), "more than 4 digits");
+        assert!(matches!(touch("KB down 04"), Parsed::Unknown(_)));
+    }
+
+    #[test]
+    fn kb_type_decodes_base64_utf8() {
+        let cmd = |l: &str| match touch(l) {
+            Parsed::Command(Command::Kb(k)) => k,
+            other => panic!("{l:?} parsed as {other:?}"),
+        };
+        assert_eq!(cmd(&format!("kb type {}", b64("Hello, World!\n"))), Kb::Type("Hello, World!\n".into()));
+        assert_eq!(cmd(&format!("kb type {}", b64("grüße \u{1F600}"))), Kb::Type("grüße \u{1F600}".into()));
+        // Padding may be left off.
+        assert_eq!(cmd("kb type aGk"), Kb::Type("hi".into()));
+        assert_eq!(cmd("kb type aGk="), Kb::Type("hi".into()));
+    }
+
+    #[test]
+    fn bad_kb_type_input_is_reported() {
+        let bad = |l: &str| match touch(l) {
+            Parsed::Bad(why) => why,
+            other => panic!("{l:?} parsed as {other:?}"),
+        };
+        assert!(bad("kb type !!!!").contains("base64"));
+        assert!(bad("kb type aGk$").contains("base64"));
+        assert!(bad("kb type a").contains("base64"), "one character is no base64");
+        assert!(bad("kb type").contains("usage"));
+        assert!(bad(&format!("kb type {}", b64(""))).contains("usage"), "an empty string is no text");
+        assert!(bad("kb type aGk aGk").contains("usage"), "the text is one word of base64");
+        // Valid base64 of bytes that are not UTF-8.
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0x41]);
+        assert!(bad(&format!("kb type {raw}")).contains("UTF-8"));
+        // Exactly the limit passes; one more is too long.
+        let ok = "a".repeat(MAX_TYPE_CHARS);
+        assert!(matches!(touch(&format!("kb type {}", b64(&ok))), Parsed::Command(Command::Kb(Kb::Type(_)))));
+        let long = "a".repeat(MAX_TYPE_CHARS + 1);
+        let why = bad(&format!("kb type {}", b64(&long)));
+        assert!(why.contains("4097 characters") && why.contains("4096"), "{why}");
+        // The limit counts characters, not bytes: 4096 four-byte characters fit.
+        let wide = "\u{1F600}".repeat(MAX_TYPE_CHARS);
+        assert!(matches!(touch(&format!("kb type {}", b64(&wide))), Parsed::Command(Command::Kb(Kb::Type(_)))));
+    }
+
+    #[tokio::test]
+    async fn the_longest_kb_type_line_is_read_whole() {
+        let wide = "\u{1F600}".repeat(MAX_TYPE_CHARS);
+        let line = format!("kb type {}\n", b64(&wide));
+        assert!(line.len() < MAX_LINE, "{} bytes", line.len());
+        let v = run(line.as_bytes()).await;
+        assert_eq!(v.len(), 2);
+        assert!(matches!(&v[0], Command::Kb(Kb::Type(t)) if t.chars().count() == MAX_TYPE_CHARS));
+    }
+
     #[tokio::test]
     async fn bad_hid_commands_reach_the_receiver_as_invalid() {
         let v = run(b"touch down 1 2 0\ntouch bogus\nkey home\nkey nope\n").await;
@@ -465,12 +620,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_overlong_line_is_discarded_without_buffering_it_all() {
-        let mut input = vec![b'k'; 100_000];
+        let mut input = vec![b'k'; 200_000];
         input.extend_from_slice(b"\nkeyframe\n");
         assert_eq!(run(&input).await, vec![Command::Keyframe, Command::Stop]);
         // An overlong line that happens to start with a command word is still no command.
         let mut input = b"keyframe".to_vec();
-        input.extend(std::iter::repeat(b' ').take(5000));
+        input.extend(std::iter::repeat(b' ').take(70_000));
         input.extend_from_slice(b"\nstop\n");
         assert_eq!(run(&input).await, vec![Command::Stop, Command::Stop]);
     }

@@ -8,7 +8,7 @@
 //! framebuffer has been turned by the `config` event's `rotation`. [`map_touch`] undoes that turn and
 //! normalizes to the digitizer's 0..=65535 space.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 
-use crate::commands::{Key, Press, Touch, TouchPhase};
+use crate::commands::{Kb, Key, MAX_TYPE_CHARS, Press, Touch, TouchPhase};
 use crate::frame::{Event, Frame, HidEvent};
 use crate::outqueue::OutQueue;
 
@@ -29,6 +29,15 @@ pub const MOVE_INTERVAL: Duration = Duration::from_millis(8);
 pub const SEND_TIMEOUT: Duration = Duration::from_millis(500);
 /// Key presses waiting for their release (held down for the button's hold time) at most.
 const MAX_KEYS_HELD: usize = 8;
+/// While typing, a key is down this long, and the next character follows this long after its release.
+pub const TYPE_KEY_HOLD: Duration = Duration::from_millis(8);
+pub const TYPE_CHAR_GAP: Duration = Duration::from_millis(4);
+/// Keys held without any keyboard command for this long are let go (a stuck key must not outlive the viewer).
+pub const KEYBOARD_IDLE_RELEASE: Duration = Duration::from_secs(30);
+/// Typing that has fallen this far behind its schedule (a busy loop) shifts the rest of the schedule instead of bursting.
+const TYPE_LAG: Duration = Duration::from_millis(50);
+/// Left Shift in the HID keyboard page.
+pub const LEFT_SHIFT: u8 = 0xE1;
 /// Rate limit on commands that send a report: a burst, then this many a second.
 const BURST: f64 = 100.0;
 const REFILL_PER_SEC: f64 = 250.0;
@@ -252,6 +261,71 @@ pub enum Action {
     Touch { down: bool, x: u16, y: u16 },
     /// A hardware button state change.
     Button { page: u64, code: u64, down: bool },
+    /// A key of the keyboard page (by usage) goes down or up in the virtual keyboard's pressed set.
+    Key { usage: u8, down: bool },
+    /// Every key of the virtual keyboard up (an empty report, then the device's own reset).
+    KeyboardRelease,
+    /// The virtual keyboard is taken down (the end of the session).
+    KeyboardRemove,
+}
+
+impl Action {
+    /// How long the backend may take to perform it.
+    pub fn timeout(self) -> Duration {
+        match self {
+            // Taking the keyboard down asks the device to list its surfaces to confirm it is gone.
+            Action::KeyboardRemove => Duration::from_secs(2),
+            _ => SEND_TIMEOUT,
+        }
+    }
+}
+
+/// The US keyboard layout: the usage of the key that types `c`, and whether Shift is needed. Letters,
+/// digits, the printable ASCII punctuation, space, newline (Return) and tab; nothing else.
+pub fn us_layout(c: char) -> Option<(u8, bool)> {
+    let n = c as u32;
+    Some(match c {
+        'a'..='z' => (0x04 + (n - 'a' as u32) as u8, false),
+        'A'..='Z' => (0x04 + (n - 'A' as u32) as u8, true),
+        '1'..='9' => (0x1E + (n - '1' as u32) as u8, false),
+        '0' => (0x27, false),
+        '\n' => (0x28, false), // Return
+        '\t' => (0x2B, false), // Tab
+        ' ' => (0x2C, false),
+        '!' => (0x1E, true),
+        '@' => (0x1F, true),
+        '#' => (0x20, true),
+        '$' => (0x21, true),
+        '%' => (0x22, true),
+        '^' => (0x23, true),
+        '&' => (0x24, true),
+        '*' => (0x25, true),
+        '(' => (0x26, true),
+        ')' => (0x27, true),
+        '-' => (0x2D, false),
+        '_' => (0x2D, true),
+        '=' => (0x2E, false),
+        '+' => (0x2E, true),
+        '[' => (0x2F, false),
+        '{' => (0x2F, true),
+        ']' => (0x30, false),
+        '}' => (0x30, true),
+        '\\' => (0x31, false),
+        '|' => (0x31, true),
+        ';' => (0x33, false),
+        ':' => (0x33, true),
+        '\'' => (0x34, false),
+        '"' => (0x34, true),
+        '`' => (0x35, false),
+        '~' => (0x35, true),
+        ',' => (0x36, false),
+        '<' => (0x36, true),
+        '.' => (0x37, false),
+        '>' => (0x37, true),
+        '/' => (0x38, false),
+        '?' => (0x38, true),
+        _ => return None,
+    })
 }
 
 /// Where actions go: the device's HID services, or a fake.
@@ -263,8 +337,14 @@ pub trait HidBackend {
 pub struct NoHid;
 
 impl HidBackend for NoHid {
-    fn perform(&mut self, _: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
-        Box::pin(async { Err("HID is not enabled (start with --hid)".to_string()) })
+    fn perform(&mut self, action: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
+        Box::pin(async move {
+            // Letting go of what was never pressed is nothing to complain about.
+            if matches!(action, Action::KeyboardRelease | Action::KeyboardRemove) {
+                return Ok(());
+            }
+            Err("HID is not enabled (start with --hid)".to_string())
+        })
     }
 }
 
@@ -276,6 +356,21 @@ struct KeyUp {
     at: Instant,
     page: u64,
     code: u64,
+}
+
+/// One step of a string being typed, at the time it is due.
+#[derive(Debug, Clone, Copy)]
+struct TypeStep {
+    at: Instant,
+    op: TypeOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeOp {
+    ShiftDown,
+    KeyDown(u8),
+    KeyUp(u8),
+    ShiftUp,
 }
 
 /// Lets a repeating message through once a second.
@@ -297,9 +392,21 @@ pub struct Hid {
     tokens: f64,
     tokens_at: Option<Instant>,
     replies: ReplyLimit,
+    warnings: ReplyLimit,
     actions: Vec<Action>,
     /// The mapping the client was last told about (None until announced).
     announced: Option<Effective>,
+    /// The keys of the virtual keyboard that are down, as the device's pressed set has them.
+    kb_pressed: BTreeSet<u8>,
+    /// When the last keyboard command (or typing step) was.
+    kb_last: Option<Instant>,
+    /// The string being typed: the steps still to come, and how many characters they hold.
+    typing: VecDeque<TypeStep>,
+    typing_chars: usize,
+    /// Whether the typing owns the Shift and the key it has pressed (it does not let go of what the
+    /// viewer is holding).
+    owns_shift: bool,
+    owns_key: bool,
 }
 
 impl Hid {
@@ -317,8 +424,18 @@ impl Hid {
                 last: None,
                 held: 0,
             },
+            warnings: ReplyLimit {
+                last: None,
+                held: 0,
+            },
             actions: Vec::new(),
             announced: None,
+            kb_pressed: BTreeSet::new(),
+            kb_last: None,
+            typing: VecDeque::new(),
+            typing_chars: 0,
+            owns_shift: false,
+            owns_key: false,
         }
     }
 
@@ -344,7 +461,11 @@ impl Hid {
             .and(self.last_touch_sent)
             .map(|t| t + MOVE_INTERVAL);
         let key_due = self.keys_down.iter().map(|k| k.at).min();
-        [move_due, key_due].into_iter().flatten().min()
+        let type_due = self.typing.front().map(|s| s.at);
+        let idle_due = (!self.kb_pressed.is_empty())
+            .then(|| self.kb_last.map(|t| t + KEYBOARD_IDLE_RELEASE))
+            .flatten();
+        [move_due, key_due, type_due, idle_due].into_iter().flatten().min()
     }
 
     #[cfg(test)]
@@ -397,9 +518,160 @@ impl Hid {
         self.fail(now, message);
     }
 
-    /// An action the backend could not perform.
-    pub fn on_action_failed(&mut self, now: Instant, message: &str) {
+    /// An action the backend could not perform. A keyboard action that failed lets go of every key
+    /// (the device and this side may no longer agree on what is pressed).
+    pub fn on_action_failed(&mut self, now: Instant, message: &str, action: Action) {
         self.fail(now, message);
+        if matches!(action, Action::Key { .. }) {
+            self.release_keyboard();
+        }
+    }
+
+    /// Writes `{"event":"hid","warning":...}`, at most once a second.
+    fn warn(&mut self, now: Instant, message: String) {
+        let quiet = self
+            .warnings
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1));
+        if quiet {
+            self.warnings.held += 1;
+            return;
+        }
+        let held = std::mem::take(&mut self.warnings.held);
+        self.warnings.last = Some(now);
+        let message = if held > 0 { format!("{message} ({held} more warnings)") } else { message };
+        tracing::warn!("hid: {message}");
+        self.queue.push_droppable_control(Frame::control(&Event::Hid(HidEvent {
+            warning: Some(message),
+            ..HidEvent::default()
+        })));
+    }
+
+    // ---- the keyboard ----------------------------------------------------------------------
+
+    /// A `kb` command.
+    pub fn on_kb(&mut self, now: Instant, kb: Kb) {
+        match kb {
+            Kb::Down(usage) => {
+                if !self.take_token(now) {
+                    return self.fail(now, "too many commands: key dropped");
+                }
+                self.kb_last = Some(now);
+                // A key held down repeats its `down` (as a browser does): the device knows already.
+                if self.kb_pressed.insert(usage) {
+                    self.actions.push(Action::Key { usage, down: true });
+                }
+            }
+            Kb::Up(usage) => {
+                self.kb_last = Some(now);
+                if self.kb_pressed.remove(&usage) {
+                    self.actions.push(Action::Key { usage, down: false });
+                }
+            }
+            Kb::Type(text) => self.start_typing(now, &text),
+        }
+    }
+
+    /// Schedules a string: for each character that the layout has, the key goes down (with Shift if
+    /// needed), 8 ms later up, and 4 ms after that the next one follows.
+    fn start_typing(&mut self, now: Instant, text: &str) {
+        if !self.take_token(now) {
+            return self.fail(now, "too many commands: kb type dropped");
+        }
+        let mut steps = Vec::new();
+        let mut skipped = 0usize;
+        let mut chars = 0usize;
+        let mut at = self.typing.back().map_or(now, |s| s.at.max(now) + TYPE_CHAR_GAP);
+        for c in text.chars() {
+            let Some((usage, shift)) = us_layout(c) else {
+                skipped += 1;
+                continue;
+            };
+            if shift {
+                steps.push(TypeStep { at, op: TypeOp::ShiftDown });
+            }
+            steps.push(TypeStep { at, op: TypeOp::KeyDown(usage) });
+            steps.push(TypeStep { at: at + TYPE_KEY_HOLD, op: TypeOp::KeyUp(usage) });
+            if shift {
+                steps.push(TypeStep { at: at + TYPE_KEY_HOLD, op: TypeOp::ShiftUp });
+            }
+            at += TYPE_KEY_HOLD + TYPE_CHAR_GAP;
+            chars += 1;
+        }
+        if self.typing_chars + chars > MAX_TYPE_CHARS {
+            return self.fail(
+                now,
+                &format!("kb type: {} characters are waiting to be typed, at most {MAX_TYPE_CHARS}", self.typing_chars),
+            );
+        }
+        if skipped > 0 {
+            self.warn(
+                now,
+                format!("kb type: {skipped} characters are not in the US layout table and were skipped"),
+            );
+        }
+        self.kb_last = Some(now);
+        self.typing_chars += chars;
+        self.typing.extend(steps);
+    }
+
+    /// Runs the typing steps that are due.
+    fn run_typing(&mut self, now: Instant) {
+        // Behind schedule (the loop was busy): move the rest of the schedule, do not burst.
+        if let Some(front) = self.typing.front() {
+            let lag = now.saturating_duration_since(front.at);
+            if lag > TYPE_LAG {
+                self.typing.iter_mut().for_each(|s| s.at += lag);
+            }
+        }
+        while self.typing.front().is_some_and(|s| s.at <= now) {
+            let step = self.typing.pop_front().expect("checked");
+            self.kb_last = Some(now);
+            match step.op {
+                TypeOp::ShiftDown => {
+                    self.owns_shift = self.kb_pressed.insert(LEFT_SHIFT);
+                    if self.owns_shift {
+                        self.actions.push(Action::Key { usage: LEFT_SHIFT, down: true });
+                    }
+                }
+                TypeOp::KeyDown(usage) => {
+                    self.typing_chars = self.typing_chars.saturating_sub(1);
+                    self.owns_key = self.kb_pressed.insert(usage);
+                    if self.owns_key {
+                        self.actions.push(Action::Key { usage, down: true });
+                    }
+                }
+                TypeOp::KeyUp(usage) => {
+                    if std::mem::take(&mut self.owns_key) && self.kb_pressed.remove(&usage) {
+                        self.actions.push(Action::Key { usage, down: false });
+                    }
+                }
+                TypeOp::ShiftUp => {
+                    if std::mem::take(&mut self.owns_shift) && self.kb_pressed.remove(&LEFT_SHIFT) {
+                        self.actions.push(Action::Key { usage: LEFT_SHIFT, down: false });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops the typing in progress and every key that is down, and has the device let go too.
+    fn release_keyboard(&mut self) {
+        let was_busy = !self.kb_pressed.is_empty() || !self.typing.is_empty();
+        self.kb_pressed.clear();
+        self.typing.clear();
+        self.typing_chars = 0;
+        self.owns_shift = false;
+        self.owns_key = false;
+        if was_busy {
+            self.actions.push(Action::KeyboardRelease);
+        }
+    }
+
+    /// Lets go of everything and takes the virtual keyboard down: for the end of the session.
+    pub fn shutdown(&mut self) {
+        self.release_all();
+        self.actions.push(Action::KeyboardRemove);
     }
 
     /// A `touch` command. Only finger 0 is handled.
@@ -493,6 +765,21 @@ impl Hid {
 
     /// The clock reached [`next_deadline`](Self::next_deadline).
     pub fn on_tick(&mut self, now: Instant) {
+        self.run_typing(now);
+        if !self.kb_pressed.is_empty()
+            && self
+                .kb_last
+                .is_some_and(|t| now.saturating_duration_since(t) >= KEYBOARD_IDLE_RELEASE)
+        {
+            self.release_keyboard();
+            self.warn(
+                now,
+                format!(
+                    "keys held for {} s without a keyboard command were released",
+                    KEYBOARD_IDLE_RELEASE.as_secs()
+                ),
+            );
+        }
         if let Some((x, y)) = self.pending_move {
             let due = self
                 .last_touch_sent
@@ -515,6 +802,7 @@ impl Hid {
     /// Lets go of everything: a finger still down is lifted where it is, and held keys are released.
     /// For a stop, the end of stdin, or a failure.
     pub fn release_all(&mut self) {
+        self.release_keyboard();
         self.pending_move = None;
         if let Some((x, y)) = self.finger.take() {
             self.actions.push(Action::Touch {
@@ -1129,15 +1417,382 @@ mod tests {
     fn failures_are_reported_at_most_once_a_second() {
         let (mut h, q, t0) = rig();
         for i in 0..10u64 {
-            h.on_action_failed(ms(t0, i * 10), "the service is gone");
+            h.on_action_failed(ms(t0, i * 10), "the service is gone", Action::Touch { down: true, x: 0, y: 0 });
         }
-        h.on_action_failed(ms(t0, 1500), "the service is gone");
+        h.on_action_failed(ms(t0, 1500), "the service is gone", Action::Touch { down: true, x: 0, y: 0 });
         let c = controls(&q);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0]["message"], "the service is gone");
         assert_eq!(c[1]["message"], "the service is gone (9 more failures)");
         h.on_bad_command(ms(t0, 5000), "bad touch command");
         assert_eq!(controls(&q)[0]["message"], "bad touch command");
+    }
+
+    // ---- the keyboard -----------------------------------------------------------------------
+
+    fn kb_down(u: u8) -> Action {
+        Action::Key { usage: u, down: true }
+    }
+
+    fn kb_up(u: u8) -> Action {
+        Action::Key { usage: u, down: false }
+    }
+
+    #[test]
+    fn the_us_layout_has_every_printable_ascii_character_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for b in 0x20u8..=0x7E {
+            let c = b as char;
+            let key = us_layout(c).unwrap_or_else(|| panic!("{c:?} has no key"));
+            assert!(seen.insert(key), "{c:?} shares its key with another character");
+            assert!((0x04..=0x38).contains(&key.0), "{c:?}: usage {:#x}", key.0);
+        }
+        assert_eq!(seen.len(), 95);
+        // Newline is Return, tab is Tab: keys of their own.
+        assert_eq!(us_layout('\n'), Some((0x28, false)));
+        assert_eq!(us_layout('\t'), Some((0x2B, false)));
+        assert!(!seen.contains(&(0x28, false)) && !seen.contains(&(0x2B, false)));
+    }
+
+    #[test]
+    fn letters_digits_and_punctuation_follow_the_us_layout() {
+        for (i, c) in ('a'..='z').enumerate() {
+            assert_eq!(us_layout(c), Some((0x04 + i as u8, false)), "{c}");
+            assert_eq!(us_layout(c.to_ascii_uppercase()), Some((0x04 + i as u8, true)), "{c}");
+        }
+        for (i, c) in ('1'..='9').enumerate() {
+            assert_eq!(us_layout(c), Some((0x1E + i as u8, false)), "{c}");
+        }
+        assert_eq!(us_layout('0'), Some((0x27, false)));
+        // The digit row with Shift.
+        for (c, usage) in "!@#$%^&*()".chars().zip(0x1Eu8..) {
+            assert_eq!(us_layout(c), Some((usage, true)), "{c}");
+        }
+        for (c, key) in [
+            (' ', (0x2C, false)),
+            ('-', (0x2D, false)),
+            ('_', (0x2D, true)),
+            ('=', (0x2E, false)),
+            ('+', (0x2E, true)),
+            ('[', (0x2F, false)),
+            ('{', (0x2F, true)),
+            (']', (0x30, false)),
+            ('}', (0x30, true)),
+            ('\\', (0x31, false)),
+            ('|', (0x31, true)),
+            (';', (0x33, false)),
+            (':', (0x33, true)),
+            ('\'', (0x34, false)),
+            ('"', (0x34, true)),
+            ('`', (0x35, false)),
+            ('~', (0x35, true)),
+            (',', (0x36, false)),
+            ('<', (0x36, true)),
+            ('.', (0x37, false)),
+            ('>', (0x37, true)),
+            ('/', (0x38, false)),
+            ('?', (0x38, true)),
+        ] {
+            assert_eq!(us_layout(c), Some(key), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn characters_outside_the_table_have_no_key() {
+        for c in ['\r', '\0', '\u{7f}', '\u{1b}', 'é', 'ß', '€', '£', '日', '\u{1F600}', '\u{a0}'] {
+            assert_eq!(us_layout(c), None, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn kb_down_and_up_accumulate_like_a_physical_keyboard() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Down(0xE1)); // Left Shift
+        h.on_kb(ms(t0, 5), Kb::Down(0xE0)); // Left Control
+        h.on_kb(ms(t0, 10), Kb::Down(0x04)); // A
+        assert_eq!(h.take_actions(), vec![kb_down(0xE1), kb_down(0xE0), kb_down(0x04)]);
+        // Let go in another order.
+        h.on_kb(ms(t0, 20), Kb::Up(0x04));
+        h.on_kb(ms(t0, 25), Kb::Up(0xE1));
+        h.on_kb(ms(t0, 30), Kb::Up(0xE0));
+        assert_eq!(h.take_actions(), vec![kb_up(0x04), kb_up(0xE1), kb_up(0xE0)]);
+        assert_eq!(h.next_deadline(), None, "nothing is held");
+    }
+
+    #[test]
+    fn a_repeated_down_and_an_up_without_a_down_are_no_ops() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Down(0x04));
+        // A browser repeats keydown while a key is held.
+        for i in 1..20u64 {
+            h.on_kb(ms(t0, i * 30), Kb::Down(0x04));
+        }
+        assert_eq!(h.take_actions(), vec![kb_down(0x04)]);
+        h.on_kb(ms(t0, 700), Kb::Up(0x05));
+        assert!(h.take_actions().is_empty());
+        h.on_kb(ms(t0, 710), Kb::Up(0x04));
+        h.on_kb(ms(t0, 720), Kb::Up(0x04));
+        assert_eq!(h.take_actions(), vec![kb_up(0x04)]);
+    }
+
+    #[test]
+    fn typing_follows_the_8_and_4_ms_schedule_with_shift_where_needed() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Type("Hi!".into()));
+        assert!(h.take_actions().is_empty(), "nothing happens until the clock ticks");
+        assert_eq!(h.next_deadline(), Some(t0));
+        // 'H': Shift and h down together.
+        h.on_tick(t0);
+        assert_eq!(h.take_actions(), vec![kb_down(0xE1), kb_down(0x0B)]);
+        assert_eq!(h.next_deadline(), Some(ms(t0, 8)));
+        h.on_tick(ms(t0, 7));
+        assert!(h.take_actions().is_empty());
+        // 8 ms later both up.
+        h.on_tick(ms(t0, 8));
+        assert_eq!(h.take_actions(), vec![kb_up(0x0B), kb_up(0xE1)]);
+        // 4 ms after that, 'i' (no Shift).
+        assert_eq!(h.next_deadline(), Some(ms(t0, 12)));
+        h.on_tick(ms(t0, 12));
+        assert_eq!(h.take_actions(), vec![kb_down(0x0C)]);
+        h.on_tick(ms(t0, 20));
+        assert_eq!(h.take_actions(), vec![kb_up(0x0C)]);
+        // '!' is Shift 1.
+        assert_eq!(h.next_deadline(), Some(ms(t0, 24)));
+        h.on_tick(ms(t0, 24));
+        assert_eq!(h.take_actions(), vec![kb_down(0xE1), kb_down(0x1E)]);
+        h.on_tick(ms(t0, 32));
+        assert_eq!(h.take_actions(), vec![kb_up(0x1E), kb_up(0xE1)]);
+        assert_eq!(h.next_deadline(), None);
+        // Newline and tab are Return and Tab.
+        h.on_kb(ms(t0, 100), Kb::Type("\n\t".into()));
+        h.on_tick(ms(t0, 100));
+        h.on_tick(ms(t0, 108));
+        h.on_tick(ms(t0, 112));
+        h.on_tick(ms(t0, 120));
+        assert_eq!(h.take_actions(), vec![kb_down(0x28), kb_up(0x28), kb_down(0x2B), kb_up(0x2B)]);
+    }
+
+    #[test]
+    fn typing_does_not_let_go_of_a_shift_the_viewer_is_holding() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Down(0xE1));
+        h.take_actions();
+        h.on_kb(ms(t0, 10), Kb::Type("Ab".into()));
+        for t in [10, 18, 22, 30] {
+            h.on_tick(ms(t0, t));
+        }
+        // The key presses, with no second Shift down and no Shift up between them.
+        assert_eq!(
+            h.take_actions(),
+            vec![kb_down(0x04), kb_up(0x04), kb_down(0x05), kb_up(0x05)]
+        );
+        // Shift is still down: the 30 s idle release has a deadline.
+        assert!(h.next_deadline().is_some());
+    }
+
+    #[test]
+    fn characters_that_cannot_be_typed_are_skipped_and_counted_in_one_warning() {
+        let (mut h, q, t0) = rig();
+        h.on_kb(t0, Kb::Type("aé€b\r😀".into()));
+        let c = controls(&q);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["event"], "hid");
+        assert!(c[0]["warning"].as_str().unwrap().contains("4 characters"), "{c:?}");
+        assert!(c[0].get("ok").is_none(), "a warning, not an error");
+        // The two that can be typed are.
+        for t in [0, 8, 12, 20] {
+            h.on_tick(ms(t0, t));
+        }
+        assert_eq!(h.take_actions(), vec![kb_down(0x04), kb_up(0x04), kb_down(0x05), kb_up(0x05)]);
+        // Nothing to skip: no warning.
+        h.on_kb(ms(t0, 100), Kb::Type("ok".into()));
+        assert!(controls(&q).is_empty());
+    }
+
+    #[test]
+    fn a_long_string_is_typed_in_steps_not_in_one_go() {
+        let (mut h, _q, t0) = rig();
+        let text: String = "a".repeat(MAX_TYPE_CHARS);
+        h.on_kb(t0, Kb::Type(text));
+        assert!(h.take_actions().is_empty());
+        // One tick does one character's worth (and only what is due).
+        h.on_tick(t0);
+        assert_eq!(h.take_actions().len(), 1);
+        assert_eq!(h.next_deadline(), Some(ms(t0, 8)));
+        // 4096 characters at 12 ms each: the last one is done at 4095 * 12 + 8 ms.
+        let mut now = t0;
+        let mut actions = 1;
+        while let Some(d) = h.next_deadline() {
+            now = d;
+            h.on_tick(now);
+            actions += h.take_actions().len();
+        }
+        assert_eq!(actions, 2 * MAX_TYPE_CHARS - 1 + 1);
+        assert_eq!(now - t0, Duration::from_millis(4095 * 12 + 8));
+    }
+
+    #[test]
+    fn the_typing_queue_is_bounded() {
+        let (mut h, q, t0) = rig();
+        h.on_kb(t0, Kb::Type("a".repeat(MAX_TYPE_CHARS)));
+        assert!(controls(&q).is_empty());
+        h.on_kb(ms(t0, 1), Kb::Type("b".into()));
+        let c = controls(&q);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["ok"], false);
+        assert!(c[0]["message"].as_str().unwrap().contains("4096"));
+        // The first string is not disturbed: it ends with an 'a'.
+        let mut last = None;
+        let mut now = t0;
+        while let Some(d) = h.next_deadline() {
+            now = d;
+            h.on_tick(now);
+            for a in h.take_actions() {
+                last = Some(a);
+            }
+        }
+        assert_eq!(last, Some(kb_up(0x04)));
+        // Once it is typed there is room again.
+        h.on_kb(now, Kb::Type("b".into()));
+        assert!(controls(&q).is_empty());
+    }
+
+    #[test]
+    fn a_second_string_waits_behind_the_first() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Type("a".into()));
+        h.on_kb(ms(t0, 1), Kb::Type("b".into()));
+        let mut actions = Vec::new();
+        while let Some(d) = h.next_deadline() {
+            h.on_tick(d);
+            actions.extend(h.take_actions());
+        }
+        assert_eq!(actions, vec![kb_down(0x04), kb_up(0x04), kb_down(0x05), kb_up(0x05)]);
+    }
+
+    #[test]
+    fn a_loop_that_fell_behind_shifts_the_typing_instead_of_bursting() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Type("abc".into()));
+        // The first tick comes a whole second late.
+        h.on_tick(ms(t0, 1000));
+        assert_eq!(h.take_actions(), vec![kb_down(0x04)], "one step, then the schedule moves on");
+        assert_eq!(h.next_deadline(), Some(ms(t0, 1008)));
+    }
+
+    #[test]
+    fn release_all_aborts_the_typing_and_lets_go_of_every_key() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Type("abcdef".into()));
+        h.on_tick(t0);
+        assert_eq!(h.take_actions(), vec![kb_down(0x04)]);
+        h.on_kb(ms(t0, 3), Kb::Down(0xE0));
+        h.take_actions();
+        h.release_all();
+        assert_eq!(h.take_actions(), vec![Action::KeyboardRelease]);
+        assert_eq!(h.next_deadline(), None);
+        h.on_tick(ms(t0, 500));
+        assert!(h.take_actions().is_empty(), "the rest of the string is not typed");
+        // Nothing down, nothing to release.
+        h.release_all();
+        assert!(h.take_actions().is_empty());
+    }
+
+    #[test]
+    fn shutdown_releases_and_takes_the_keyboard_down() {
+        let (mut h, _q, t0) = rig();
+        h.on_kb(t0, Kb::Down(0x04));
+        h.on_touch(t0, touch(TouchPhase::Down, 5.0, 5.0), VIEW);
+        h.take_actions();
+        h.shutdown();
+        assert_eq!(
+            h.take_actions(),
+            vec![Action::KeyboardRelease, Action::Touch { down: false, x: to_axis(0.005), y: to_axis(0.0025) }, Action::KeyboardRemove]
+        );
+        // With nothing held it is only the removal.
+        h.shutdown();
+        assert_eq!(h.take_actions(), vec![Action::KeyboardRemove]);
+    }
+
+    #[test]
+    fn keys_held_for_30_seconds_without_a_keyboard_command_are_released() {
+        let (mut h, q, t0) = rig();
+        h.on_kb(t0, Kb::Down(0xE1));
+        h.take_actions();
+        assert_eq!(h.next_deadline(), Some(ms(t0, 30_000)));
+        // Another keyboard command moves the deadline (the repeat of a held key counts).
+        h.on_kb(ms(t0, 20_000), Kb::Down(0x04));
+        h.take_actions();
+        assert_eq!(h.next_deadline(), Some(ms(t0, 50_000)));
+        h.on_tick(ms(t0, 49_999));
+        assert!(h.take_actions().is_empty());
+        h.on_tick(ms(t0, 50_000));
+        assert_eq!(h.take_actions(), vec![Action::KeyboardRelease]);
+        let c = controls(&q);
+        assert_eq!(c.len(), 1);
+        assert!(c[0]["warning"].as_str().unwrap().contains("30 s"), "{c:?}");
+        assert_eq!(h.next_deadline(), None);
+        // Touch and buttons do not count as keyboard activity, and nothing is pressed now.
+        h.on_tick(ms(t0, 100_000));
+        assert!(h.take_actions().is_empty());
+    }
+
+    #[test]
+    fn a_failed_key_action_releases_everything_once() {
+        let (mut h, q, t0) = rig();
+        h.on_kb(t0, Kb::Down(0xE1));
+        h.on_kb(t0, Kb::Down(0x04));
+        h.take_actions();
+        h.on_action_failed(ms(t0, 5), "keyboard: transport", kb_down(0x04));
+        assert_eq!(h.take_actions(), vec![Action::KeyboardRelease]);
+        assert_eq!(h.next_deadline(), None);
+        let c = controls(&q);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["ok"], false);
+        // The release itself failing does not queue another release.
+        h.on_action_failed(ms(t0, 2000), "keyboard: transport", Action::KeyboardRelease);
+        assert!(h.take_actions().is_empty());
+        // Touch failures do not touch the keyboard.
+        h.on_kb(ms(t0, 3000), Kb::Down(0x05));
+        h.take_actions();
+        h.on_action_failed(ms(t0, 4000), "x", Action::Touch { down: true, x: 0, y: 0 });
+        assert!(h.take_actions().is_empty());
+        assert!(h.next_deadline().is_some());
+    }
+
+    #[test]
+    fn a_flood_of_key_downs_is_rate_limited_but_ups_are_not() {
+        let (mut h, q, t0) = rig();
+        for i in 0..200u8 {
+            h.on_kb(t0, Kb::Down(0x04 + (i % 100)));
+        }
+        let downs = h.take_actions().len();
+        assert!(downs <= BURST as usize, "{downs}");
+        for i in 0..100u8 {
+            h.on_kb(t0, Kb::Up(0x04 + i));
+        }
+        assert_eq!(h.take_actions().len(), downs, "every key that went down comes up");
+        assert!(!controls(&q).is_empty());
+    }
+
+    #[test]
+    fn the_ready_event_carries_the_keyboard_flag() {
+        let eff = HidMapping::default().effective(Some(270));
+        let mut ev = mapping_event(Some(true), None, &eff);
+        if let Event::Hid(h) = &mut ev {
+            h.keyboard = Some(true);
+        }
+        assert_eq!(
+            Frame::control(&ev).payload,
+            br#"{"event":"hid","ready":true,"keyboard":true,"mapping":"auto","swap_xy":true,"flip_x":true,"flip_y":false}"#
+        );
+        let mut ev = mapping_event(Some(true), Some("keyboard: no".into()), &eff);
+        if let Event::Hid(h) = &mut ev {
+            h.keyboard = Some(false);
+        }
+        let json: serde_json::Value = serde_json::from_slice(&Frame::control(&ev).payload).unwrap();
+        assert_eq!((json["ready"].as_bool(), json["keyboard"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(json["message"], "keyboard: no");
     }
 
     #[test]

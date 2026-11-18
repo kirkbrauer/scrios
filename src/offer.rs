@@ -37,13 +37,23 @@ const F_BANK_FEATURES: u32 = 3;
 const HEVC_PAYLOAD_TYPE: u64 = 100;
 const LTR_FEATURE: &[u8] = b"LTR;";
 
-/// The two settings this module decides.
+/// Which codec banks the offer names. The stock offer names both; the device picks HEVC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    /// The stock offer: an H.264 bank (payload type 123) and an HEVC bank (payload type 100).
+    Hevc,
+    /// Only the H.264 bank: the HEVC bank is taken out, so a device that can do H.264 has to answer with it.
+    H264,
+}
+
+/// What this module decides about the offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OfferFlags {
     /// `allowRTCPFB`: the device honours RTCP feedback (PLI/FIR).
     pub allow_rtcp_fb: bool,
     /// Long-term reference pictures (`ltrpEnabled` and the `LTR;` feature).
     pub ltr: bool,
+    pub codec: Codec,
 }
 
 impl Default for OfferFlags {
@@ -52,6 +62,7 @@ impl Default for OfferFlags {
         OfferFlags {
             allow_rtcp_fb: false,
             ltr: true,
+            codec: Codec::Hevc,
         }
     }
 }
@@ -200,8 +211,40 @@ pub fn patch_blob(raw: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
             tracing::debug!("the HEVC feature string had no `LTR;` to remove");
         }
     }
+    if flags.codec == Codec::H264 {
+        let before = settings.len();
+        let mut hevc_banks = Vec::new();
+        for (i, f) in settings.iter().enumerate() {
+            if f.num == F_CODEC_BANK && bank_payload_type(f)? == Some(HEVC_PAYLOAD_TYPE) {
+                hevc_banks.push(i);
+            }
+        }
+        for i in hevc_banks.into_iter().rev() {
+            settings.remove(i);
+        }
+        if settings.len() == before {
+            return Err("the offer has no HEVC bank to take out".into());
+        }
+        let left = settings.iter().filter(|f| f.num == F_CODEC_BANK).count();
+        if left == 0 {
+            return Err("the offer has no H.264 bank to keep".into());
+        }
+    }
     video.wire = Wire::Len(encode(&settings));
     Ok(encode(&top))
+}
+
+/// The RTP payload type of a codec bank (field 1 of the bank message).
+fn bank_payload_type(bank: &Field) -> Result<Option<u64>, String> {
+    let Wire::Len(bytes) = &bank.wire else {
+        return Ok(None);
+    };
+    Ok(parse(bytes)?
+        .iter()
+        .find_map(|f| match (f.num, &f.wire) {
+            (F_BANK_PAYLOAD, Wire::Varint(v)) => Some(*v),
+            _ => None,
+        }))
 }
 
 /// Drops `LTR;` from the feature string of the HEVC codec bank; other banks are not touched.
@@ -343,6 +386,7 @@ mod tests {
     const RTCP_FB_NO_LTR: OfferFlags = OfferFlags {
         allow_rtcp_fb: true,
         ltr: false,
+        codec: Codec::Hevc,
     };
 
     #[test]
@@ -421,10 +465,64 @@ mod tests {
         assert_eq!(sb.iter().find(|b| b.0 == 123), ob.iter().find(|b| b.0 == 123));
     }
 
+    const H264_ONLY: OfferFlags = OfferFlags {
+        allow_rtcp_fb: false,
+        ltr: true,
+        codec: Codec::H264,
+    };
+
+    #[test]
+    fn the_h264_offer_has_only_the_h264_bank_and_nothing_else_changes() {
+        let stock_offer = build_screen_video_offer("CALL-ID", &call_info(), SSRC).unwrap();
+        let stock = plist_blob(&stock_offer);
+        let ours = plist_blob(&patch_offer(&stock_offer, H264_ONLY).unwrap());
+
+        // Only payload type 123 is left, and it is the bank the stock offer had, byte for byte.
+        let (sv, ov) = (video_settings(&stock), video_settings(&ours));
+        let (sb, ob) = (banks(&sv), banks(&ov));
+        assert_eq!(sb.iter().map(|b| b.0).collect::<Vec<_>>(), vec![123, 100]);
+        assert_eq!(ob.iter().map(|b| b.0).collect::<Vec<_>>(), vec![123]);
+        assert_eq!(sb[0], ob[0]);
+        assert_eq!(features(&ob[0].1), "FLS;SW:1;");
+        // Our SSRC, and every other field of the video settings as the builder wrote it.
+        assert_eq!(varint(&ov, F_SSRC), u64::from(SSRC));
+        let others = |v: &[Field]| v.iter().filter(|f| f.num != F_CODEC_BANK).cloned().collect::<Vec<_>>();
+        assert_eq!(others(&sv), others(&ov));
+        // Top level: everything but field 5 is identical.
+        let (st, ot) = (parse(&stock).unwrap(), parse(&ours).unwrap());
+        assert_eq!(st.len(), ot.len());
+        for (a, b) in st.iter().zip(&ot) {
+            if a.num != VIDEO_SETTINGS {
+                assert_eq!(a, b, "top-level field {}", a.num);
+            }
+        }
+        // The plist around the blob is unchanged too.
+        let a: plist::Value = plist::from_bytes(&stock_offer).unwrap();
+        let b: plist::Value = plist::from_bytes(&patch_offer(&stock_offer, H264_ONLY).unwrap()).unwrap();
+        for (k, v) in a.as_dictionary().unwrap() {
+            if k != BLOB_KEY {
+                assert_eq!(b.as_dictionary().unwrap().get(k), Some(v), "key {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_codec_combines_with_the_other_flags() {
+        let both = OfferFlags { allow_rtcp_fb: true, ltr: false, codec: Codec::H264 };
+        let offer = build_video_offer("C", &call_info(), SSRC, both).unwrap();
+        let vs = video_settings(&plist_blob(&offer));
+        assert_eq!(varint(&vs, F_ALLOW_RTCP_FB), 1);
+        assert_eq!(varint(&vs, F_LTRP_ENABLED), 0);
+        assert_eq!(banks(&vs).iter().map(|b| b.0).collect::<Vec<_>>(), vec![123]);
+        // Taking the HEVC bank out twice is an error (nothing to take out), not a silent no-op.
+        let once = patch_blob(&stock_blob(), H264_ONLY).unwrap();
+        assert!(patch_blob(&once, H264_ONLY).unwrap_err().contains("no HEVC bank"));
+    }
+
     #[test]
     fn the_flags_are_independent() {
         for (fb, ltr) in [(false, false), (false, true), (true, false), (true, true)] {
-            let offer = build_video_offer("C", &call_info(), SSRC, OfferFlags { allow_rtcp_fb: fb, ltr }).unwrap();
+            let offer = build_video_offer("C", &call_info(), SSRC, OfferFlags { allow_rtcp_fb: fb, ltr, ..OfferFlags::default() }).unwrap();
             let vs = video_settings(&plist_blob(&offer));
             assert_eq!(varint(&vs, F_ALLOW_RTCP_FB), u64::from(fb));
             assert_eq!(varint(&vs, F_LTRP_ENABLED), u64::from(ltr));

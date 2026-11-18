@@ -15,7 +15,8 @@ use idevice::{
     IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::{
         ButtonState, CallInfoBlob, CoreDeviceServiceClient, DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
-        DisplayServiceClient, HidSurface, IndigoHidClient, MediaNegotiationBlob,
+        DisplayServiceClient, HidSurface, IndigoHidClient, KeyboardUsage, MainKeyboardService,
+        MediaNegotiationBlob,
         TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
         build_screen_audio_offer, build_start_audio_parameters, build_start_video_parameters,
     },
@@ -227,6 +228,83 @@ pub fn answer_info(answer: &plist::Value) -> StreamInfo {
         clock_hz: negotiated_clock_hz(answer),
         rtcp_timeout_secs: find_u32(answer, "RTCPTimeoutInterval"),
     }
+}
+
+/// Words in a key that make its value worth showing when the answer is read for what it says of
+/// the codec and the stream.
+const SUMMARY_WORDS: [&str; 12] = [
+    "payload", "codec", "ssrc", "port", "frame", "rtcp", "bitrate", "width", "height", "profile", "level", "ip",
+];
+
+fn collect_summary(v: &plist::Value, path: &str, depth: u32, out: &mut Vec<String>) {
+    if depth > 8 || out.len() >= 80 {
+        return;
+    }
+    match v {
+        plist::Value::Dictionary(d) => {
+            for (k, inner) in d {
+                let here = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                let lower = k.to_ascii_lowercase();
+                let scalar = !matches!(inner, plist::Value::Dictionary(_) | plist::Value::Array(_) | plist::Value::Data(_));
+                if scalar && SUMMARY_WORDS.iter().any(|w| lower.contains(w)) {
+                    out.push(format!("{here} = {inner:?}"));
+                }
+                collect_summary(inner, &here, depth + 1, out);
+            }
+        }
+        plist::Value::Array(a) => {
+            for (i, inner) in a.iter().enumerate() {
+                collect_summary(inner, &format!("{path}[{i}]"), depth + 1, out);
+            }
+        }
+        plist::Value::Data(bytes) if bytes.starts_with(b"bplist") => {
+            if let Ok(inner) = plist::from_bytes::<plist::Value>(bytes) {
+                collect_summary(&inner, &format!("{path}(plist)"), depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the negotiation blob in the answer says: for each stream group, its payloads (payload type,
+/// codec type, sample rate, RTCP flags) and streams (SSRC).
+fn negotiation_lines(answer: &plist::Value) -> Vec<String> {
+    let Some(plist::Value::Data(blob)) = find_key(answer, "avcMediaStreamNegotiatorMediaBlob", 0) else {
+        return vec!["the answer has no media negotiation blob".to_string()];
+    };
+    let parsed = MediaNegotiationBlob::from_negotiator_offer(&blob)
+        .ok()
+        .filter(|b| !b.stream_groups.is_empty())
+        .unwrap_or_else(|| MediaNegotiationBlob::decode(&blob));
+    if parsed.stream_groups.is_empty() {
+        return vec!["the answer's media blob has no stream groups".to_string()];
+    }
+    let mut out = Vec::new();
+    for (i, g) in parsed.stream_groups.iter().enumerate() {
+        for p in &g.payloads {
+            out.push(format!(
+                "stream group {i} (type {}): payload type {}, codec type {}, sample rate {}, rtcp flags {}, media flags {}, profile level id {}",
+                g.stream_group, p.rtp_payload, p.codec_type, p.rtp_sample_rate, p.rtcp_flags, p.media_flags, p.profile_level_id
+            ));
+        }
+        for s in &g.streams {
+            out.push(format!(
+                "stream group {i}: stream ssrc {:#x}, max network bitrate {}, stream id {}",
+                s.rtp_ssrc, s.max_network_bitrate, s.stream_id
+            ));
+        }
+    }
+    out
+}
+
+/// The parts of the device's answer that say which codec and stream it chose: the scalar values whose
+/// key names a payload, codec, SSRC, port, frame rate, RTCP, bitrate, size, profile or level, and the
+/// negotiation blob's payloads and streams.
+pub fn answer_summary(answer: &plist::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_summary(answer, "", 0, &mut out);
+    out.extend(negotiation_lines(answer));
+    out
 }
 
 impl StreamInfo {
@@ -514,6 +592,9 @@ impl Session {
         let mut info_from = answer_info(&answer);
         if opts.log_answer {
             info!("answer: {answer:?}");
+            for line in answer_summary(&answer) {
+                info!("answer says: {line}");
+            }
         }
         if info_from.source_port.is_none() || info_from.device_ssrc.is_none() {
             // The same stream config is in the server status while the session is active.
@@ -521,6 +602,9 @@ impl Session {
                 Ok(Ok(status)) => {
                     if opts.log_answer {
                         info!("server status: {status:?}");
+                        for line in answer_summary(&status) {
+                            info!("server status says: {line}");
+                        }
                     }
                     info_from.fill_from(answer_info(&status));
                 }
@@ -576,6 +660,13 @@ impl Session {
                     Ok(Err(e)) => warn!("the HID surfaces could not be listed: {e:?}"),
                     Err(e) => warn!("{e}"),
                 }
+                // The virtual keyboard: created once here, taken down when the session ends. Touch and
+                // buttons work without it.
+                match timed("creating the keyboard", HID_CONNECT_TIMEOUT, c.create_main_keyboard()).await {
+                    Ok(Ok(kb)) => hid.keyboard = Some(kb),
+                    Ok(Err(e)) => hid.keyboard_error = Some(format!("the keyboard could not be created: {e}")),
+                    Err(e) => hid.keyboard_error = Some(e),
+                }
                 hid.touch = Some(c);
             }
             Ok(Err(e)) => hid.touch_error = Some(format!("the touch service did not open: {e:?}")),
@@ -630,8 +721,11 @@ impl Session {
 pub struct DeviceHid {
     touch: Option<UniversalHidServiceClient<Box<dyn ReadWrite>>>,
     buttons: Option<IndigoHidClient<Box<dyn ReadWrite>>>,
+    /// The virtual keyboard created on the universal HID service (it uses the same client as touch).
+    keyboard: Option<MainKeyboardService>,
     pub touch_error: Option<String>,
     pub buttons_error: Option<String>,
+    pub keyboard_error: Option<String>,
     /// The HID surfaces the device lists (id, product, usage: the crate reads nothing else of them).
     pub surfaces: Vec<HidSurface>,
     /// Where those surfaces differ from what the touch path expects.
@@ -670,6 +764,16 @@ impl DeviceHid {
     pub fn ready(&self) -> bool {
         self.touch.is_some()
     }
+
+    /// The keyboard was created and can be used.
+    pub fn keyboard_ready(&self) -> bool {
+        self.keyboard.is_some()
+    }
+}
+
+/// A keyboard failure as a message.
+fn kb_error(e: impl std::fmt::Display) -> String {
+    format!("keyboard: {e}")
 }
 
 impl HidBackend for DeviceHid {
@@ -690,6 +794,39 @@ impl HidBackend for DeviceHid {
                         .send_touchscreen(state, x, y, None)
                         .await
                         .map_err(|e| format!("touch report failed: {e:?}"))
+                }
+                Action::Key { usage, down } => {
+                    let (Some(client), Some(kb)) = (self.touch.as_mut(), self.keyboard.as_mut()) else {
+                        return Err(self
+                            .keyboard_error
+                            .clone()
+                            .unwrap_or_else(|| "the keyboard is not connected".into()));
+                    };
+                    let usage = KeyboardUsage::new(u16::from(usage)).map_err(kb_error)?;
+                    if down {
+                        client.main_keyboard_key_down(kb, usage).await.map_err(kb_error)
+                    } else {
+                        client.main_keyboard_key_up(kb, usage).await.map_err(kb_error)
+                    }
+                }
+                Action::KeyboardRelease => {
+                    let (Some(client), Some(kb)) = (self.touch.as_mut(), self.keyboard.as_mut()) else {
+                        return Ok(()); // no keyboard: nothing is down
+                    };
+                    // An empty report lets go of every key (the device's reset alone is not known to).
+                    let emptied = client.set_main_keyboard_usages(kb, []).await.map_err(kb_error);
+                    let reset = client.reset_main_keyboard(kb).await.map_err(kb_error);
+                    emptied.and(reset)
+                }
+                Action::KeyboardRemove => {
+                    let (Some(client), Some(kb)) = (self.touch.as_mut(), self.keyboard.as_mut()) else {
+                        return Ok(());
+                    };
+                    let result = client.remove_main_keyboard(kb).await.map_err(kb_error);
+                    if result.is_ok() {
+                        self.keyboard = None;
+                    }
+                    result
                 }
                 Action::Button { page, code, down } => {
                     let Some(client) = self.buttons.as_mut() else {
@@ -966,6 +1103,49 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("257") && w[0].contains("1281") && w[0].contains("gesture"), "{w:?}");
         assert!(surface_warnings(&[])[0].contains("no HID surface"));
+    }
+
+    #[test]
+    fn the_answer_summary_picks_out_the_codec_and_stream_values() {
+        use idevice::core_device::display_stream::negotiation::{StreamGroup, StreamGroupPayload, StreamGroupStream};
+        let mut blob = MediaNegotiationBlob::default();
+        let mut group = StreamGroup::default();
+        group.stream_group = 3;
+        group.payloads.push(StreamGroupPayload {
+            rtp_payload: 123,
+            codec_type: 2,
+            rtp_sample_rate: 90_000,
+            rtcp_flags: 1,
+            ..Default::default()
+        });
+        group.streams.push(StreamGroupStream { rtp_ssrc: 0xABCD, ..Default::default() });
+        blob.stream_groups.push(group);
+        let answer = dict(vec![
+            ("something", int(1)),
+            (
+                "streamConfig",
+                dict(vec![
+                    ("PayloadType", int(123)),
+                    ("SourcePort", int(50001)),
+                    ("LocalSSRC", int(7)),
+                    ("Framerate", int(60)),
+                    ("RTCPTimeoutInterval", int(20)),
+                    ("Unrelated", int(9)),
+                    ("Codec", plist::Value::String("H264".into())),
+                ]),
+            ),
+            ("avcMediaStreamNegotiatorMediaBlob", plist::Value::Data(blob.to_negotiator_offer().unwrap())),
+        ]);
+        let lines = answer_summary(&answer);
+        let text = lines.join("\n");
+        for want in ["streamConfig.PayloadType = ", "streamConfig.SourcePort", "streamConfig.LocalSSRC", "streamConfig.Framerate", "streamConfig.RTCPTimeoutInterval", "streamConfig.Codec = String(\"H264\")"] {
+            assert!(text.contains(want), "{want} missing from {text}");
+        }
+        assert!(!text.contains("Unrelated") && !text.contains("something"));
+        assert!(text.contains("payload type 123, codec type 2, sample rate 90000, rtcp flags 1"), "{text}");
+        assert!(text.contains("stream ssrc 0xabcd"), "{text}");
+        // Nothing to say is still an answer.
+        assert_eq!(answer_summary(&plist::Value::Boolean(true)), vec!["the answer has no media negotiation blob"]);
     }
 
     #[tokio::test]

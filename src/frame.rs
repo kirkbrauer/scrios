@@ -156,6 +156,9 @@ pub enum Event {
 pub struct HidEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    /// With `ready`: the keyboard (`kb` commands) can be used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

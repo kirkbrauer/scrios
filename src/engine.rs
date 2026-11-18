@@ -14,13 +14,13 @@ use idevice::core_device::{
 };
 use tracing::{debug, info, warn};
 
-use crate::depack::{AccessUnit, Assembler, DropReason, Output, PacketMeta};
+use crate::codec::{CodecKind, SpsDescription};
+use crate::depack::{AccessUnit, Depacketizer, DropReason, Output, PacketMeta};
 use crate::displayinfo::{DisplayInfo, orientation_degrees, primary};
 use crate::frame::{Event, Frame, Stats};
 use crate::keyframe::{Decision, KeyframeLimiter};
 use crate::outqueue::{OutQueue, Pushed};
 use crate::rtpstats::{RtpStats, SenderReportInfo, parse_sender_report};
-use crate::sps::{SpsInfo, parse_sps};
 
 /// RTP payload type of the display stream's HEVC.
 pub const PAYLOAD_TYPE: u8 = 100;
@@ -65,6 +65,8 @@ pub struct EngineConfig {
     pub our_ssrc: u32,
     /// RTCP SDES CNAME.
     pub cname: String,
+    /// The codec of the stream (HEVC unless the offer named only H.264).
+    pub codec: CodecKind,
     pub payload_type: u8,
     pub clock_hz: u32,
     pub clock_source: ClockSource,
@@ -92,10 +94,18 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// For another codec: its depacketizer, its SPS and its RTP payload type.
+    pub fn for_codec(mut self, codec: CodecKind) -> Self {
+        self.codec = codec;
+        self.payload_type = codec.payload_type();
+        self
+    }
+
     pub fn new(our_ssrc: u32) -> Self {
         EngineConfig {
             our_ssrc,
             cname: format!("{our_ssrc:08x}@jumpstarter-ios-display"),
+            codec: CodecKind::Hevc,
             payload_type: PAYLOAD_TYPE,
             clock_hz: DEFAULT_CLOCK_HZ,
             clock_source: ClockSource::Default,
@@ -252,7 +262,7 @@ fn clock_correction(current: u32, measured: f64) -> Option<u32> {
 pub struct Engine {
     cfg: EngineConfig,
     queue: Arc<OutQueue>,
-    asm: Assembler,
+    asm: Box<dyn Depacketizer>,
     rtp: RtpStats,
     limiter: KeyframeLimiter,
     pts: PtsClock,
@@ -272,7 +282,7 @@ pub struct Engine {
     /// Delta units are withheld until a keyframe: set at start and after every loss or overflow.
     need_key: bool,
     /// The SPS the `config` event was built from (and what it said).
-    announced: Option<(Vec<u8>, SpsInfo)>,
+    announced: Option<(Vec<u8>, SpsDescription)>,
     /// The last `config` event written (a repeat of the same event is not written again).
     last_config: Option<Event>,
     /// The primary display, once the device has said.
@@ -300,7 +310,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(cfg: EngineConfig, queue: Arc<OutQueue>, now: Instant) -> Self {
         Engine {
-            asm: Assembler::new(),
+            asm: cfg.codec.depacketizer(),
             rtp: RtpStats::new(cfg.clock_hz),
             limiter: KeyframeLimiter::new(cfg.keyframe_min_interval),
             pts: PtsClock::new(cfg.clock_hz),
@@ -710,7 +720,11 @@ impl Engine {
 
     /// Parses the SPS and sends the `config` control frame.
     fn announce(&mut self, sps_nal: &[u8]) -> Result<(), String> {
-        let sps = parse_sps(sps_nal).map_err(|e| format!("{e} (SPS bytes: {})", hex(sps_nal)))?;
+        let sps = self
+            .cfg
+            .codec
+            .describe_sps(sps_nal)
+            .map_err(|e| format!("{e} (SPS bytes: {})", hex(sps_nal)))?;
         let changed = self.announced.is_some();
         self.announced = Some((sps_nal.to_vec(), sps));
         // The SPS changed: the display probably turned. Ask again (the first query was made at start).
@@ -770,23 +784,23 @@ impl Engine {
         let Some((_, sps)) = &self.announced else {
             return;
         };
-        let codec = sps.codec_string("hev1");
-        // `--visible-size`, else the display's own size, else the SPS (its conformance window).
+        let codec = sps.codec.clone();
+        // `--visible-size`, else the display's own size, else the SPS (its cropping).
         let (width, height) = self
             .cfg
             .visible_size
             .or(self.display.as_ref().map(|d| d.size))
-            .unwrap_or_else(|| sps.cropped_size());
-        if width > sps.width || height > sps.height {
+            .unwrap_or(sps.visible);
+        if width > sps.coded.0 || height > sps.coded.1 {
             warn!(
                 "the visible size {width}x{height} is larger than the coded size {}x{}",
-                sps.width, sps.height
+                sps.coded.0, sps.coded.1
             );
         }
         info!(
             "stream config: {codec}, coded {}x{}, visible {width}x{height}, {} fps, clock {} Hz ({})",
-            sps.width,
-            sps.height,
+            sps.coded.0,
+            sps.coded.1,
             self.cfg.fps,
             self.clock_hz,
             self.clock_source.as_str()
@@ -795,8 +809,8 @@ impl Engine {
             codec,
             width,
             height,
-            coded_width: sps.width,
-            coded_height: sps.height,
+            coded_width: sps.coded.0,
+            coded_height: sps.coded.1,
             fps: self.cfg.fps,
             clock_hz: self.clock_hz,
             clock_source: self.clock_source.as_str().to_string(),
@@ -1792,6 +1806,160 @@ mod tests {
         assert_eq!(s.access_units, 2);
         assert_eq!(s.keyframes, 1);
         assert_eq!(s.bytes as usize, units.iter().map(|f| f.payload.len()).sum::<usize>());
+    }
+
+    // ---- H.264 ---------------------------------------------------------------------------------
+
+    mod h264 {
+        use super::*;
+        use crate::avc::testutil::{AvcSpsSpec, PPS as PPS264, avc1_box, avcc_record, fu_a, idr as idr264, make_box, slice, stap_a};
+
+        const PT: u8 = 123;
+
+        fn datagram(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+            let mut d = rtp_bytes(seq, ts, marker, DEV, payload);
+            d[1] = PT | if marker { 0x80 } else { 0 };
+            d
+        }
+
+        struct H264Rig {
+            eng: Engine,
+            q: Arc<OutQueue>,
+            t0: Instant,
+            seq: u16,
+            ts: u32,
+        }
+
+        impl H264Rig {
+            fn new() -> Self {
+                let t0 = Instant::now();
+                let q = Arc::new(OutQueue::new());
+                let cfg = EngineConfig::new(OUR).for_codec(CodecKind::H264);
+                H264Rig { eng: Engine::new(cfg, q.clone(), t0), q, t0, seq: 100, ts: 90_000 }
+            }
+
+            fn at(&self, ms: u64) -> Instant {
+                self.t0 + Duration::from_millis(ms)
+            }
+
+            fn pkt(&mut self, ms: u64, marker: bool, payload: &[u8]) {
+                let d = datagram(self.seq, self.ts, marker, payload);
+                self.seq = self.seq.wrapping_add(1);
+                self.eng.on_datagram(self.at(ms), PORT, &d);
+            }
+
+            fn sps() -> Vec<u8> {
+                AvcSpsSpec::baseline_vga().nal()
+            }
+
+            /// SPS and PPS in a STAP-A, then the IDR in three fragments.
+            fn idr(&mut self, ms: u64, with_sets: bool) {
+                if with_sets {
+                    self.pkt(ms, false, &stap_a(&[&Self::sps(), &PPS264]));
+                }
+                let frags = fu_a(&idr264(&[7; 30]), 12);
+                let n = frags.len();
+                for (i, f) in frags.iter().enumerate() {
+                    self.pkt(ms, i == n - 1, f);
+                }
+                self.ts += 3000;
+            }
+
+            fn delta(&mut self, ms: u64) {
+                self.pkt(ms, true, &slice(&[1, 2, 3, 4]));
+                self.ts += 3000;
+            }
+        }
+
+        #[test]
+        fn an_h264_stream_gets_an_avc1_config_and_the_key_and_params_flags() {
+            let mut r = H264Rig::new();
+            r.idr(0, true);
+            r.delta(10);
+            let f = r.q.drain();
+            assert_eq!(f.len(), 3);
+            let c = json(&f[0]);
+            assert_eq!(c["event"], "config");
+            assert_eq!(c["codec"], "avc1.42C01E");
+            assert_eq!((c["width"].as_u64(), c["height"].as_u64()), (Some(640), Some(480)));
+            assert_eq!((c["coded_width"].as_u64(), c["coded_height"].as_u64()), (Some(640), Some(480)));
+            assert_eq!(f[1].flags, FLAG_KEY | FLAG_PARAMS);
+            let mut want = Vec::new();
+            for nal in [&H264Rig::sps()[..], &PPS264[..]] {
+                want.extend_from_slice(&[0, 0, 0, 1]);
+                want.extend_from_slice(nal);
+            }
+            assert!(f[1].payload.starts_with(&want));
+            assert_eq!(f[2].flags, 0);
+            let s = r.eng.stats();
+            assert_eq!((s.access_units, s.keyframes, s.dropped_units), (2, 1, 0));
+        }
+
+        #[test]
+        fn the_visible_size_of_an_h264_stream_is_its_cropped_size_and_the_coded_size_its_macroblocks() {
+            let mut r = H264Rig::new();
+            let sps = AvcSpsSpec::high_1080p().nal();
+            r.pkt(0, false, &stap_a(&[&sps, &PPS264]));
+            r.pkt(0, true, &idr264(&[1; 4]));
+            let c = json(&r.q.drain()[0]);
+            assert_eq!(c["codec"], "avc1.640028");
+            assert_eq!((c["width"].as_u64(), c["height"].as_u64()), (Some(1920), Some(1080)));
+            assert_eq!((c["coded_width"].as_u64(), c["coded_height"].as_u64()), (Some(1920), Some(1088)));
+        }
+
+        #[test]
+        fn the_sets_of_the_configuration_packet_go_in_front_of_an_idr_that_has_none() {
+            let mut r = H264Rig::new();
+            let avcc = make_box(b"avcC", &avcc_record(66, 0xC0, 30, &[&H264Rig::sps()], &[&PPS264]));
+            let mut config = vec![0x92, 0xE6, 0xC0, 0xA3];
+            config.extend_from_slice(&avc1_box(640, 480, &[avcc]));
+            r.pkt(0, true, &config);
+            r.ts += 3000;
+            r.idr(10, false);
+            let f = r.q.drain();
+            assert_eq!(f.len(), 2, "config event, key unit; the config packet makes no picture: {f:?}");
+            assert_eq!(json(&f[0])["codec"], "avc1.42C01E");
+            assert_eq!(f[1].flags, FLAG_KEY | FLAG_PARAMS);
+            assert!(f[1].payload.starts_with(&[0, 0, 0, 1, 0x67]));
+        }
+
+        #[test]
+        fn loss_in_an_h264_stream_withholds_deltas_asks_for_a_keyframe_and_resumes_at_the_idr() {
+            let mut r = H264Rig::new();
+            r.idr(0, true);
+            r.delta(10);
+            r.q.drain();
+            r.eng.take_rtcp();
+            // A unit with a lost fragment.
+            let frags = fu_a(&slice(&[0; 40]), 14);
+            let seq = r.seq;
+            let d = datagram(seq, r.ts, false, &frags[0]);
+            r.eng.on_datagram(r.at(20), PORT, &d);
+            let d = datagram(seq + 2, r.ts, true, &frags[2]);
+            r.eng.on_datagram(r.at(20), PORT, &d);
+            r.seq = seq + 3;
+            r.ts += 3000;
+            assert!(r.q.drain().is_empty());
+            let s = r.eng.stats();
+            assert_eq!((s.lost, s.dropped_units, s.plis), (1, 1, 1));
+            let sent = r.eng.take_rtcp();
+            assert_eq!(sent.len(), 1);
+            r.delta(30);
+            assert!(r.q.drain().is_empty(), "a delta without its reference is withheld");
+            r.idr(50, false);
+            r.delta(60);
+            let f = r.q.drain();
+            assert_eq!(f.iter().map(|f| f.flags).collect::<Vec<_>>(), vec![FLAG_KEY | FLAG_PARAMS, 0]);
+        }
+
+        #[test]
+        fn payload_types_of_the_other_codec_are_ignored() {
+            let mut r = H264Rig::new();
+            let mut d = rtp_bytes(1, 1, true, DEV, &slice(&[1; 4]));
+            d[1] = 100 | 0x80; // an HEVC payload type
+            r.eng.on_datagram(r.at(1), PORT, &d);
+            assert_eq!(r.eng.stats().packets, 0);
+        }
     }
 
     #[test]

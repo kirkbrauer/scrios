@@ -5,6 +5,8 @@
 #![deny(clippy::print_stdout)]
 
 mod commands;
+mod avc;
+mod codec;
 mod depack;
 mod device;
 mod displayinfo;
@@ -14,6 +16,7 @@ mod hid;
 mod keyframe;
 mod offer;
 mod outqueue;
+mod probe;
 mod rtpstats;
 mod session;
 mod sps;
@@ -28,13 +31,14 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::codec::CodecKind;
 use crate::commands::{Command, read_commands, supervised};
 use crate::device::{DeviceOptions, Session};
 use crate::engine::{ClockSource, Engine, EngineConfig};
 use crate::frame::{Event, Frame};
 use crate::frame::HidEvent;
 use crate::hid::{Hid, HidBackend, HidMapping, HidSpace, NoHid, mapping_event};
-use crate::offer::OfferFlags;
+use crate::offer::{Codec, OfferFlags};
 use crate::outqueue::{OutQueue, run_writer};
 use crate::session::{Clock, DisplayLink, Exit, HidLink, Links, StopCause, TokioClock, run_session};
 
@@ -50,6 +54,21 @@ const MAX_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 const WRITER_GRACE: Duration = Duration::from_secs(3);
 /// How long the cleanup after a panic may take.
 const PANIC_CLEANUP: Duration = Duration::from_secs(8);
+
+/// The codec the offer asks for (see `--codec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CodecArg {
+    /// The stock offer, which names H.264 and HEVC; the device sends HEVC.
+    Hevc,
+    /// An offer that names only H.264 (experimental; with --probe-secs only a probe of what arrives).
+    H264,
+}
+
+/// The codec when `--codec` is not given. One line to change; the README and the tests name it.
+const DEFAULT_CODEC: CodecArg = CodecArg::Hevc;
+
+/// The longest probe window accepted.
+const MAX_PROBE_SECS: u64 = 600;
 
 /// Where the digitizer's axes lie (see `--hid-space`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -155,6 +174,23 @@ struct Args {
     #[arg(long)]
     hid_swap_xy: bool,
 
+    /// The codec to ask for: hevc (the stock offer, byte for byte) or h264 (an offer that leaves the HEVC
+    /// bank out; experimental: the H.264 stream, or with --probe-secs only a probe of what arrives)
+    #[arg(long, value_enum, value_name = "CODEC", default_value_t = DEFAULT_CODEC)]
+    codec: CodecArg,
+
+    /// Probe: start the stream (with --codec h264), count for this many seconds what arrives (RTP packets
+    /// per payload type, the first payload bytes, H.264 NAL types, the first SPS), log it, stop cleanly
+    /// and exit (0 if it was H.264, 1 with an `error` event if not). No frames are written. 0 = off.
+    #[arg(long, value_name = "SECS", default_value_t = 0)]
+    probe_secs: u64,
+
+    /// With the probe: write every datagram received during the window, RTP and RTCP, to this file, each as
+    /// a 4-byte big-endian length followed by its bytes; every RTP packet whose payload kind is not
+    /// 1, 5 or 28 is also logged in full (up to 400 payload bytes)
+    #[arg(long, value_name = "PATH")]
+    probe_raw: Option<std::path::PathBuf>,
+
     /// Log the device's answer, server status and media support info to stderr (diagnostics)
     #[arg(long)]
     log_answer: bool,
@@ -198,6 +234,26 @@ impl Args {
         OfferFlags {
             allow_rtcp_fb: self.rtcp_fb,
             ltr: !self.no_ltr,
+            codec: match self.codec {
+                CodecArg::Hevc => Codec::Hevc,
+                CodecArg::H264 => Codec::H264,
+            },
+        }
+    }
+
+    /// The probe window, if a probe was asked for.
+    fn probe_window(&self) -> Option<Duration> {
+        (self.probe_secs > 0).then(|| Duration::from_secs(self.probe_secs.min(MAX_PROBE_SECS)))
+    }
+
+    /// Options that do not go together.
+    fn check(&self) -> Result<(), String> {
+        if self.probe_raw.is_some() && self.probe_secs == 0 {
+            return Err("--probe-raw is for the probe: add --codec h264 --probe-secs N".into());
+        }
+        match (self.codec, self.probe_secs > 0) {
+            (CodecArg::Hevc, true) => Err("--probe-secs is for --codec h264".into()),
+            _ => Ok(()),
         }
     }
 }
@@ -321,6 +377,52 @@ fn fail(queue: &OutQueue, code: i32, message: String) -> i32 {
     code
 }
 
+/// The codec probe: count what the device sends for `window`, log it, stop the stream, and say by the
+/// exit status whether it was H.264. No frames go to stdout, only `stopped` or `error`.
+async fn run_probe(
+    sess: &mut Session,
+    window: Duration,
+    cmd_rx: &mut mpsc::Receiver<Command>,
+    gone: &Notify,
+    queue: &OutQueue,
+    raw: Option<&mut dyn std::io::Write>,
+) -> i32 {
+    info!(
+        "probing for {} s: payload type 123 (H.264) is the answer wanted, 100 (HEVC) is what the stock offer gets",
+        window.as_secs()
+    );
+    info!("stream parameters: our SSRC {:#x}, {:?}", sess.our_ssrc, sess.info);
+    let collected = match sess.video() {
+        Some(video) => Ok(probe::collect(video, window, cmd_rx, gone, raw).await),
+        None => Err("the video stream is gone".to_string()),
+    };
+    sess.shutdown().await;
+    let (report, outcome) = match collected {
+        Ok(c) => c,
+        Err(why) => return fail(queue, EXIT_FAILED, why),
+    };
+    for line in report.lines() {
+        info!("probe: {line}");
+    }
+    match outcome {
+        probe::Outcome::Failed(why) => fail(queue, EXIT_FAILED, why),
+        probe::Outcome::ConsumerGone => 0,
+        probe::Outcome::Stopped => {
+            info!("probe: stopped before the window ended");
+            queue.push_control(Frame::control(&Event::Stopped));
+            0
+        }
+        probe::Outcome::Finished => match report.verdict() {
+            Ok(summary) => {
+                info!("probe: {summary}");
+                queue.push_control(Frame::control(&Event::Stopped));
+                0
+            }
+            Err(why) => fail(queue, EXIT_FAILED, why),
+        },
+    }
+}
+
 /// Waits for a `stop` (or for the command channel to close), ignoring other commands.
 async fn wait_for_stop(commands: &mut mpsc::Receiver<Command>) {
     loop {
@@ -357,11 +459,27 @@ async fn run(
         _ => {}
     }
 
+    if let Err(why) = args.check() {
+        return fail(&queue, EXIT_START_FAILED, why);
+    }
+    let probe_window = args.probe_window();
+    // The raw dump file is opened first: a path that cannot be written should not cost a run on the device.
+    let mut raw_dump = match &args.probe_raw {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => {
+                return fail(&queue, EXIT_START_FAILED, format!("cannot write --probe-raw {}: {e}", path.display()));
+            }
+        },
+        None => None,
+    };
+
     let opts = DeviceOptions {
         udid: args.udid.clone(),
         usbmuxd: args.usbmuxd.clone(),
         display_id: args.display_id,
-        log_answer: args.log_answer,
+        // A probe is about reading the answer.
+        log_answer: args.log_answer || probe_window.is_some(),
         offer: args.offer_flags(),
     };
 
@@ -386,6 +504,26 @@ async fn run(
         Some(Ok(())) => {}
     }
 
+    if let Some(window) = probe_window {
+        let code = run_probe(
+            &mut sess,
+            window,
+            &mut cmd_rx,
+            &gone,
+            &queue,
+            raw_dump.as_mut().map(|w| w as &mut dyn std::io::Write),
+        )
+        .await;
+        if let (Some(w), Some(path)) = (raw_dump.as_mut(), &args.probe_raw) {
+            use std::io::Write as _;
+            match w.flush() {
+                Ok(()) => info!("probe: the raw datagrams are in {}", path.display()),
+                Err(e) => warn!("probe: could not finish {}: {e}", path.display()),
+            }
+        }
+        return code;
+    }
+
     // Touch and keys, if asked for: the HID services on the same tunnel. They never stop the stream.
     let mut hid = Hid::new(args.hid_mapping(), queue.clone());
     let mut backend: Box<dyn HidBackend> = Box::new(NoHid);
@@ -402,8 +540,12 @@ async fn run(
             queue.push_control(Frame::control(&Event::Stopped));
             return 0;
         };
-        let message = [device_hid.touch_error.clone(), device_hid.buttons_error.clone()]
-            .into_iter()
+        let message = [
+            device_hid.touch_error.clone(),
+            device_hid.buttons_error.clone(),
+            device_hid.keyboard_error.clone(),
+        ]
+        .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join("; ");
@@ -425,11 +567,11 @@ async fn run(
             "HID mapping: {} (swap {}, flip x {}, flip y {})",
             effective.label, effective.axes.swap_xy, effective.axes.flip_x, effective.axes.flip_y
         );
-        queue.push_control(Frame::control(&mapping_event(
-            Some(ready),
-            (!message.is_empty()).then_some(message),
-            &effective,
-        )));
+        let mut event = mapping_event(Some(ready), (!message.is_empty()).then_some(message), &effective);
+        if let Event::Hid(h) = &mut event {
+            h.keyboard = Some(device_hid.keyboard_ready());
+        }
+        queue.push_control(Frame::control(&event));
         hid.announce(effective);
         // What the device's own HID listing says that does not fit: a warning, not an error.
         for warning in &device_hid.warnings {
@@ -444,7 +586,10 @@ async fn run(
 
     // The engine's clocks start only now: connecting HID above can take a few seconds, during which
     // the stream's packets wait in the socket.
-    let mut cfg = EngineConfig::new(sess.our_ssrc);
+    let mut cfg = EngineConfig::new(sess.our_ssrc).for_codec(match args.codec {
+        CodecArg::Hevc => CodecKind::Hevc,
+        CodecArg::H264 => CodecKind::H264,
+    });
     cfg.rtcp_interval = rtcp_interval;
     cfg.keyframe_min_interval = interval("--keyframe-min-interval-ms", args.keyframe_min_interval_ms)
         .unwrap_or(Duration::ZERO);
@@ -574,7 +719,39 @@ mod tests {
         assert!(!a.hid);
         assert_eq!(a.hid_mapping(), HidMapping::default());
         assert_eq!(a.hid_mapping().space, HidSpace::Auto);
+        // The codec is the default one (HEVC for now: the stock offer) and no probe is asked for.
+        assert_eq!(a.codec, DEFAULT_CODEC);
+        assert_eq!(DEFAULT_CODEC, CodecArg::Hevc, "the documented default");
+        assert_eq!(a.offer_flags().codec, Codec::Hevc);
+        assert_eq!(a.probe_window(), None);
+        assert_eq!(a.check(), Ok(()));
         assert_eq!(a.display_poll_ms, 1000);
+    }
+
+    #[test]
+    fn the_codec_options_go_together_or_not() {
+        // H.264 without a probe is the (experimental) H.264 stream.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264"]);
+        assert_eq!(a.check(), Ok(()));
+        assert_eq!(a.offer_flags().codec, Codec::H264);
+        assert_eq!(a.probe_window(), None);
+        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "8"]);
+        assert_eq!(a.offer_flags().codec, Codec::H264);
+        assert_eq!(a.probe_window(), Some(Duration::from_secs(8)));
+        assert_eq!(a.check(), Ok(()));
+        // The window is capped.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "999999"]);
+        assert_eq!(a.probe_window(), Some(Duration::from_secs(MAX_PROBE_SECS)));
+        // A probe without H.264 is refused.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--probe-secs", "5"]);
+        assert!(a.check().unwrap_err().contains("--codec h264"));
+        assert!(Args::try_parse_from(["jumpstarter-ios-display", "--codec", "vp9"]).is_err());
+        // The raw dump belongs to the probe.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "8", "--probe-raw", "/tmp/x.raw"]);
+        assert_eq!(a.check(), Ok(()));
+        assert_eq!(a.probe_raw.as_deref(), Some(std::path::Path::new("/tmp/x.raw")));
+        let a = Args::parse_from(["jumpstarter-ios-display", "--probe-raw", "/tmp/x.raw"]);
+        assert!(a.check().unwrap_err().contains("--probe-raw is for the probe"));
     }
 
     #[test]
@@ -615,7 +792,8 @@ mod tests {
             a.offer_flags(),
             OfferFlags {
                 allow_rtcp_fb: true,
-                ltr: false
+                ltr: false,
+                ..OfferFlags::default()
             }
         );
         assert!(a.device_hub_feedback);
@@ -638,8 +816,8 @@ mod tests {
         assert!(Args::try_parse_from(["jumpstarter-ios-display", "--hid-space", "sideways"]).is_err());
         // Each offer flag on its own.
         let a = Args::parse_from(["jumpstarter-ios-display", "--rtcp-fb"]);
-        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, ltr: true });
+        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, ..OfferFlags::default() });
         let a = Args::parse_from(["jumpstarter-ios-display", "--no-ltr"]);
-        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: false, ltr: false });
+        assert_eq!(a.offer_flags(), OfferFlags { ltr: false, ..OfferFlags::default() });
     }
 }

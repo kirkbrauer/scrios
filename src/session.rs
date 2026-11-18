@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 use crate::commands::Command;
 use crate::displayinfo::{DisplayInfoSource, DisplayQuery};
 use crate::engine::Engine;
-use crate::hid::{self, Hid, HidBackend};
+use crate::hid::{Hid, HidBackend};
 
 /// One datagram from the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,15 +84,24 @@ pub struct Links<'a> {
     pub hid: Option<HidLink<'a>>,
 }
 
-/// Performs what the controller has queued, each action within [`hid::SEND_TIMEOUT`].
+/// Performs what the controller has queued, each action within its own time limit. A failed
+/// keyboard action makes the controller queue a release, which is performed in the next round
+/// (a few rounds at most).
 async fn perform_hid<C: Clock>(link: &mut HidLink<'_>, clock: &C) {
-    for action in link.hid.take_actions() {
-        let failure = match tokio::time::timeout(hid::SEND_TIMEOUT, link.backend.perform(action)).await {
-            Ok(Ok(())) => continue,
-            Ok(Err(e)) => e,
-            Err(_) => format!("the HID service did not answer in {} ms", hid::SEND_TIMEOUT.as_millis()),
-        };
-        link.hid.on_action_failed(clock.now(), &failure);
+    for _ in 0..4 {
+        let actions = link.hid.take_actions();
+        if actions.is_empty() {
+            return;
+        }
+        for action in actions {
+            let limit = action.timeout();
+            let failure = match tokio::time::timeout(limit, link.backend.perform(action)).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(_) => format!("the HID service did not answer in {} ms", limit.as_millis()),
+            };
+            link.hid.on_action_failed(clock.now(), &failure, action);
+        }
     }
 }
 
@@ -147,6 +156,10 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
                     Some(h) => h.hid.on_key(clock.now(), k, press),
                     None => debug!("key ignored: no HID link"),
                 },
+                Some(Command::Kb(kb)) => match hid.as_mut() {
+                    Some(h) => h.hid.on_kb(clock.now(), kb),
+                    None => debug!("kb ignored: no HID link"),
+                },
                 Some(Command::Invalid(why)) => match hid.as_mut() {
                     Some(h) => h.hid.on_bad_command(clock.now(), &why),
                     None => debug!("bad command ignored: {why}"),
@@ -195,7 +208,7 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
     };
 
     if let Some(h) = hid.as_mut() {
-        h.hid.release_all();
+        h.hid.shutdown();
         perform_hid(h, clock).await;
     }
     exit
@@ -651,6 +664,7 @@ mod tests {
         rig(|c| {
             c.rtp_stall_keyframe = None;
             c.rtp_stall_timeout = None;
+            c.no_data_timeout = Duration::from_secs(3600);
             c.rtcp_interval = None;
             c.stats_interval = None;
         })
@@ -682,6 +696,7 @@ mod tests {
                 Action::Button { page: 0x0C, code: 0xE9, down: true },  // the long volume press starts
                 Action::Touch { down: false, x: 65535, y: 0 },          // the stop lifts the finger ...
                 Action::Button { page: 0x0C, code: 0xE9, down: false }, // ... and lets go of the key
+                Action::KeyboardRemove,                                  // and takes the keyboard down
             ]
         );
     }
@@ -751,8 +766,128 @@ mod tests {
         closer.await.unwrap();
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
         let done = done.lock().unwrap();
-        assert_eq!(done.len(), 2);
+        assert_eq!(done.len(), 3);
         assert_eq!(done[1], Action::Touch { down: false, x: 0, y: 0 });
+        assert_eq!(done[2], Action::KeyboardRemove);
+    }
+
+    // ---- the keyboard through the loop ------------------------------------------------------
+
+    use crate::commands::Kb;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_type_goes_on_in_the_background_and_a_stop_aborts_it() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = TimedHid { done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        send_later(&r, 100, Command::Kb(Kb::Type("a".repeat(200)))).await;
+        // A touch in the middle of the typing is performed when it arrives, not after the string.
+        send_later(&r, 130, touch(TouchPhase::Down, 608.0, 1328.0)).await;
+        send_later(&r, 186, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+
+        let done = done.lock().unwrap();
+        let at = |a: &Action| done.iter().find(|(x, _)| x == a).map(|(_, t)| (*t - t0).as_millis() as u64);
+        assert_eq!(at(&Action::Touch { down: true, x: 32768, y: 32768 }), Some(130), "not held up by the typing");
+        // Characters typed every 12 ms from 100 ms, up to the stop at 186 ms: 100, 112, ... 184.
+        let key_downs: Vec<u64> = done
+            .iter()
+            .filter(|(a, _)| *a == Action::Key { usage: 0x04, down: true })
+            .map(|(_, t)| (*t - t0).as_millis() as u64)
+            .collect();
+        assert_eq!(key_downs, vec![100, 112, 124, 136, 148, 160, 172, 184]);
+        // Then the stop: the key that was down (184), the finger and the keyboard all let go, and nothing is typed after.
+        let tail: Vec<Action> = done.iter().rev().take(4).rev().map(|(a, _)| *a).collect();
+        assert_eq!(
+            tail,
+            vec![
+                Action::KeyboardRelease,
+                Action::Touch { down: false, x: 32768, y: 32768 },
+                Action::KeyboardRemove,
+            ][..]
+                .iter()
+                .copied()
+                .fold(vec![Action::Key { usage: 0x04, down: true }], |mut v, a| {
+                    v.push(a);
+                    v
+                })
+        );
+        assert!(done.iter().all(|(a, t)| !matches!(a, Action::Key { .. }) || (*t - t0).as_millis() <= 186));
+    }
+
+    /// Fails every key press, records the rest.
+    struct BrokenKeyboard {
+        done: Arc<Mutex<Vec<Action>>>,
+    }
+
+    impl HidBackend for BrokenKeyboard {
+        fn perform(&mut self, action: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
+            let done = self.done.clone();
+            Box::pin(async move {
+                if matches!(action, Action::Key { down: true, .. }) {
+                    return Err("keyboard: mainKeyboard transport is unavailable".to_string());
+                }
+                done.lock().unwrap().push(action);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_key_press_is_reported_and_everything_is_released() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = BrokenKeyboard { done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        send_later(&r, 100, Command::Kb(Kb::Down(0xE1))).await;
+        send_later(&r, 200, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        // The failure released the keyboard at once; at the stop there was nothing left to release.
+        assert_eq!(*done.lock().unwrap(), vec![Action::KeyboardRelease, Action::KeyboardRemove]);
+        let failure = r
+            .queue
+            .drain()
+            .iter()
+            .filter(|f| f.is_control())
+            .map(|f| serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap())
+            .find(|v| v["event"] == "hid")
+            .expect("a hid failure was reported");
+        assert_eq!(failure["ok"], false);
+        assert!(failure["message"].as_str().unwrap().contains("transport"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_held_when_the_viewer_goes_away_are_released_and_a_long_hold_is_cut_at_30_seconds() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = TimedHid { done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        send_later(&r, 100, Command::Kb(Kb::Down(0xE1))).await;
+        send_later(&r, 100, Command::Kb(Kb::Down(0x04))).await;
+        send_later(&r, 45_000, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        let done = done.lock().unwrap();
+        let release = done
+            .iter()
+            .find(|(a, _)| *a == Action::KeyboardRelease)
+            .map(|(_, t)| (*t - t0).as_millis() as u64);
+        assert_eq!(release, Some(30_100), "30 s after the last keyboard command");
+        // At the stop nothing was left down: only the keyboard is taken down.
+        assert_eq!(done.last().map(|(a, _)| *a), Some(Action::KeyboardRemove));
+        assert_eq!(done.iter().filter(|(a, _)| *a == Action::KeyboardRelease).count(), 1);
     }
 
     #[tokio::test(start_paused = true)]

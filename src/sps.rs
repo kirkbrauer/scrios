@@ -101,24 +101,24 @@ impl SpsInfo {
 }
 
 /// MSB-first bit reader over RBSP bytes.
-struct Bits<'a> {
+pub(crate) struct Bits<'a> {
     data: &'a [u8],
     pos: usize, // in bits
 }
 
 impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Bits { data, pos: 0 }
     }
 
-    fn bit(&mut self) -> Result<u32, SpsError> {
+    pub(crate) fn bit(&mut self) -> Result<u32, SpsError> {
         let byte = self.data.get(self.pos / 8).ok_or(SpsError::Truncated)?;
         let bit = (byte >> (7 - (self.pos % 8))) & 1;
         self.pos += 1;
         Ok(bit as u32)
     }
 
-    fn u(&mut self, n: u32) -> Result<u32, SpsError> {
+    pub(crate) fn u(&mut self, n: u32) -> Result<u32, SpsError> {
         debug_assert!(n <= 32);
         let mut v: u64 = 0;
         for _ in 0..n {
@@ -127,7 +127,7 @@ impl<'a> Bits<'a> {
         Ok(v as u32)
     }
 
-    fn skip(&mut self, n: usize) -> Result<(), SpsError> {
+    pub(crate) fn skip(&mut self, n: usize) -> Result<(), SpsError> {
         if self.pos + n > self.data.len() * 8 {
             return Err(SpsError::Truncated);
         }
@@ -135,8 +135,14 @@ impl<'a> Bits<'a> {
         Ok(())
     }
 
+    /// Signed Exp-Golomb `se(v)`: 1, -1, 2, -2, ...
+    pub(crate) fn se(&mut self) -> Result<i64, SpsError> {
+        let k = i64::from(self.ue()?);
+        Ok(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
+    }
+
     /// Exp-Golomb `ue(v)`.
-    fn ue(&mut self) -> Result<u32, SpsError> {
+    pub(crate) fn ue(&mut self) -> Result<u32, SpsError> {
         let mut zeros = 0;
         while self.bit()? == 0 {
             zeros += 1;
@@ -282,6 +288,11 @@ pub mod testutil {
             let len = 64 - x.leading_zeros(); // bits in x
             self.u(len - 1, 0);
             self.u(len, x);
+        }
+
+        /// Signed Exp-Golomb.
+        pub fn se(&mut self, v: i64) {
+            self.ue(if v > 0 { (2 * v - 1) as u32 } else { (-2 * v) as u32 });
         }
 
         /// rbsp_trailing_bits
