@@ -5,12 +5,17 @@
 
 use std::io::{self, Write};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Bytes before the payload: `u32 len` + `u64 pts_us` + `u8 flags`.
 pub const HEADER_LEN: usize = 13;
 /// The largest payload a frame may carry.
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// The version of the framed protocol (see `docs/protocol.md`), carried by every `config` event as `"protocol"`.
+/// It changes only when the framing, a flag or an existing event changes incompatibly; a new event or a new field
+/// does not change it.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The access unit holds an IRAP picture (NAL types 16..=21).
 pub const FLAG_KEY: u8 = 0x01;
@@ -30,21 +35,18 @@ pub struct Frame {
 impl Frame {
     /// An access-unit frame.
     pub fn unit(pts_us: u64, key: bool, params: bool, payload: Vec<u8>) -> Frame {
-        let mut flags = 0;
-        if key {
-            flags |= FLAG_KEY;
-        }
-        if params {
-            flags |= FLAG_PARAMS;
-        }
-        Frame { pts_us, flags, payload }
+        Frame { pts_us, flags: unit_flags(key, params), payload }
     }
 
-    /// A control frame carrying `event` as JSON (pts is 0).
+    /// A control frame carrying `event` as JSON (pts is 0). A `config` event carries the protocol version
+    /// ([`PROTOCOL_VERSION`]) as its last field.
     pub fn control(event: &Event) -> Frame {
         // Serializing these plain structs cannot fail; fall back to an error object anyway.
-        let payload = serde_json::to_vec(event)
-            .unwrap_or_else(|_| br#"{"event":"error","message":"internal: event encoding"}"#.to_vec());
+        let encoded = match event {
+            Event::Config { .. } => serde_json::to_vec(&Versioned { event, protocol: PROTOCOL_VERSION }),
+            _ => serde_json::to_vec(event),
+        };
+        let payload = encoded.unwrap_or_else(|_| br#"{"event":"error","message":"internal: event encoding"}"#.to_vec());
         Frame { pts_us: 0, flags: FLAG_CONTROL, payload }
     }
 
@@ -64,24 +66,13 @@ impl Frame {
 
     /// The 13 header bytes.
     pub fn header(&self) -> [u8; HEADER_LEN] {
-        let mut h = [0u8; HEADER_LEN];
-        h[0..4].copy_from_slice(&(self.payload.len() as u32).to_be_bytes());
-        h[4..12].copy_from_slice(&self.pts_us.to_be_bytes());
-        h[12] = self.flags;
-        h
+        header(self.payload.len(), self.pts_us, self.flags)
     }
 
     /// Writes header and payload with one `write_all` each (the caller buffers and flushes).
     /// A payload over [`MAX_PAYLOAD`] is an error and nothing is written.
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        if self.payload.len() > MAX_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("frame payload of {} bytes exceeds {MAX_PAYLOAD}", self.payload.len()),
-            ));
-        }
-        w.write_all(&self.header())?;
-        w.write_all(&self.payload)
+        write_frame(w, self.pts_us, self.flags, &self.payload)
     }
 
     /// The whole frame as one buffer.
@@ -93,8 +84,54 @@ impl Frame {
     }
 }
 
+/// The flags of an access-unit frame.
+pub fn unit_flags(key: bool, params: bool) -> u8 {
+    let mut flags = 0;
+    if key {
+        flags |= FLAG_KEY;
+    }
+    if params {
+        flags |= FLAG_PARAMS;
+    }
+    flags
+}
+
+/// The 13 header bytes of a frame whose payload is `len` bytes.
+fn header(len: usize, pts_us: u64, flags: u8) -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    h[0..4].copy_from_slice(&(len as u32).to_be_bytes());
+    h[4..12].copy_from_slice(&pts_us.to_be_bytes());
+    h[12] = flags;
+    h
+}
+
+/// Writes one frame from its parts (what [`Frame::write_to`] does, for a payload that is not owned by a `Frame`):
+/// the header and the payload with one `write_all` each. A payload over [`MAX_PAYLOAD`] is an error and nothing
+/// is written.
+pub fn write_frame<W: Write>(w: &mut W, pts_us: u64, flags: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame payload of {} bytes exceeds {MAX_PAYLOAD}", payload.len()),
+        ));
+    }
+    w.write_all(&header(payload.len(), pts_us, flags))?;
+    w.write_all(payload)
+}
+
+/// A `config` event as it is written: the event, then the protocol version.
+#[derive(Serialize)]
+struct Versioned<'a> {
+    #[serde(flatten)]
+    event: &'a Event,
+    protocol: u32,
+}
+
 /// The control events of the protocol (`{"event": ...}`).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// They are read back as well as written (a program that embeds the library gets them as values);
+/// the `protocol` field of a `config` event is not part of the value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// Sent once before the first access unit, and again whenever the SPS changes.
@@ -144,7 +181,7 @@ pub enum Event {
 }
 
 /// The fields of a `hid` event; only those that are set are written.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HidEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
@@ -171,7 +208,7 @@ pub struct HidEvent {
 }
 
 /// The counters of a `stats` event (all since start).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     /// RTP packets accepted.
     pub packets: u64,
@@ -295,7 +332,7 @@ mod tests {
         let json = String::from_utf8(Frame::control(&e).payload).unwrap();
         assert_eq!(
             json,
-            r#"{"event":"config","codec":"hev1.1.6.L150.B0","width":1206,"height":2622,"coded_width":1216,"coded_height":2656,"fps":60,"clock_hz":24000,"clock_source":"default","ssrc":123,"device_ssrc":456}"#
+            r#"{"event":"config","codec":"hev1.1.6.L150.B0","width":1206,"height":2622,"coded_width":1216,"coded_height":2656,"fps":60,"clock_hz":24000,"clock_source":"default","ssrc":123,"device_ssrc":456,"protocol":1}"#
         );
     }
 
@@ -319,7 +356,7 @@ mod tests {
         };
         let json = String::from_utf8(Frame::control(&e).payload).unwrap();
         assert!(
-            json.ends_with(r#""device_ssrc":2,"rotation":180,"point_scale":2.0,"current_orientation":"rot90","native_orientation":"rot270"}"#),
+            json.ends_with(r#""device_ssrc":2,"rotation":180,"point_scale":2.0,"current_orientation":"rot90","native_orientation":"rot270","protocol":1}"#),
             "{json}"
         );
     }
@@ -347,6 +384,85 @@ mod tests {
             String::from_utf8(Frame::control(&e).payload).unwrap(),
             r#"{"event":"error","message":"boom \"x\""}"#
         );
+    }
+
+    fn sample_config() -> Event {
+        Event::Config {
+            codec: "avc1.640033".into(),
+            width: 1206,
+            height: 2622,
+            coded_width: 1216,
+            coded_height: 2656,
+            fps: 60,
+            clock_hz: 24000,
+            clock_source: "negotiated".into(),
+            ssrc: 1,
+            device_ssrc: 2,
+            rotation: Some(90),
+            point_scale: Some(3.0),
+            current_orientation: Some("rot90".into()),
+            native_orientation: Some("rot0".into()),
+        }
+    }
+
+    #[test]
+    fn only_the_config_event_carries_the_protocol_version() {
+        assert_eq!(PROTOCOL_VERSION, 1, "the documented version");
+        let config = String::from_utf8(Frame::control(&sample_config()).payload).unwrap();
+        assert!(config.starts_with(r#"{"event":"config","codec":"avc1.640033""#), "{config}");
+        assert!(config.ends_with(r#","protocol":1}"#), "{config}");
+        let value: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(value["protocol"], 1);
+        for e in [Event::Stopped, Event::Error { message: "x".into() }, Event::Hid(HidEvent::default())] {
+            let json = String::from_utf8(Frame::control(&e).payload).unwrap();
+            assert!(!json.contains("protocol"), "{json}");
+        }
+    }
+
+    #[test]
+    fn events_read_back_as_the_values_that_were_written() {
+        let events = vec![
+            sample_config(),
+            Event::Stats(Stats { packets: 1, access_units: 2, bytes: 3, edge_downs: 10, ..Stats::default() }),
+            Event::Hid(HidEvent {
+                ready: Some(true),
+                keyboard: Some(false),
+                message: Some("the keyboard did not open".into()),
+                mapping: Some("auto".into()),
+                swap_xy: Some(true),
+                flip_x: Some(true),
+                flip_y: Some(false),
+                ..HidEvent::default()
+            }),
+            Event::Hid(HidEvent { ok: Some(false), message: Some("bad".into()), ..HidEvent::default() }),
+            Event::Error { message: "boom".into() },
+            Event::Stopped,
+        ];
+        for e in events {
+            let frame = Frame::control(&e);
+            let back: Event = serde_json::from_slice(&frame.payload).unwrap();
+            assert_eq!(back, e);
+            // Written again, a read-back event is the same bytes: a program may pass events through.
+            assert_eq!(Frame::control(&back), frame);
+        }
+    }
+
+    #[test]
+    fn a_frame_written_from_its_parts_is_the_frame_written_whole() {
+        for f in [
+            Frame::unit(40_000, true, true, vec![0, 0, 0, 1, 0x65, 1, 2, 3]),
+            Frame::unit(80_000, false, false, vec![9; 100]),
+            Frame::control(&Event::Stopped),
+        ] {
+            let mut parts = Vec::new();
+            write_frame(&mut parts, f.pts_us, f.flags, &f.payload).unwrap();
+            assert_eq!(parts, f.encode().unwrap());
+        }
+        assert_eq!(unit_flags(true, true), FLAG_KEY | FLAG_PARAMS);
+        assert_eq!(unit_flags(false, false), 0);
+        let mut sink = Vec::new();
+        assert!(write_frame(&mut sink, 0, 0, &vec![0; MAX_PAYLOAD + 1]).is_err());
+        assert!(sink.is_empty());
     }
 
     #[test]
