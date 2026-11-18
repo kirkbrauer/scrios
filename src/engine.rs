@@ -848,8 +848,14 @@ fn describe(reason: DropReason) -> &'static str {
     }
 }
 
+/// How many bytes of a NAL unit that could not be read are written out in the message.
+const MAX_HEX_BYTES: usize = 32;
+
+/// The bytes in hex, the first [`MAX_HEX_BYTES`] of them, then `...` and the length if there are more (the
+/// device can send an SPS of any size up to the packet's, and the message goes to the log).
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    let shown: String = b.iter().take(MAX_HEX_BYTES).map(|x| format!("{x:02x}")).collect();
+    if b.len() > MAX_HEX_BYTES { format!("{shown}... ({} bytes in all)", b.len()) } else { shown }
 }
 
 #[cfg(test)]
@@ -1370,6 +1376,28 @@ mod tests {
         assert_eq!(r.eng.stats().packets, 0);
         assert!(r.frames().is_empty());
         assert_eq!(r.eng.device_ssrc(), None);
+    }
+
+    #[test]
+    fn an_sps_that_cannot_be_read_is_dumped_in_the_message_only_up_to_a_limit() {
+        let mut r = Rig::new();
+        // Short: all of it.
+        let short = vec![0x42, 0x01, 0xAB, 0xCD];
+        let why = r.eng.announce(&short).unwrap_err();
+        assert!(why.ends_with("(SPS bytes: 4201abcd)"), "{why}");
+        // Exactly the limit: all of it, nothing added.
+        let mut exact = vec![0x42, 0x01];
+        exact.resize(MAX_HEX_BYTES, 0xAB);
+        let why = r.eng.announce(&exact).unwrap_err();
+        assert!(why.ends_with(&format!("(SPS bytes: {})", hex(&exact))) && !why.contains("..."), "{why}");
+        assert_eq!(hex(&exact).len(), 2 * MAX_HEX_BYTES);
+        // Long: the first 32 bytes, an ellipsis and the size.
+        let mut long = vec![0x42, 0x01];
+        long.resize(5000, 0xAB);
+        let why = r.eng.announce(&long).unwrap_err();
+        assert!(why.len() < 250, "{} bytes: {why}", why.len());
+        assert!(why.ends_with(&format!("(SPS bytes: 4201{}... (5000 bytes in all))", "ab".repeat(30))), "{why}");
+        assert!(r.frames().is_empty(), "nothing was announced");
     }
 
     #[test]
