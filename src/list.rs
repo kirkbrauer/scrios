@@ -91,8 +91,14 @@ mod tests {
 
     #[tokio::test]
     async fn no_usbmuxd_is_an_error_that_says_where() {
-        let err = list_devices(Some("/nonexistent/usbmuxd")).await.unwrap_err();
-        assert!(err.contains("cannot connect to usbmuxd at /nonexistent/usbmuxd"), "{err}");
+        let err = list_devices(Some("127.0.0.1:1")).await.unwrap_err();
+        assert!(err.contains("cannot connect to usbmuxd at 127.0.0.1:1"), "{err}");
         assert!(list_devices(Some("host:notaport")).await.is_err());
+        // A unix socket that is not there (only on a platform that has them).
+        #[cfg(unix)]
+        {
+            let err = list_devices(Some("/nonexistent/usbmuxd")).await.unwrap_err();
+            assert!(err.contains("cannot connect to usbmuxd at /nonexistent/usbmuxd"), "{err}");
+        }
     }
 }

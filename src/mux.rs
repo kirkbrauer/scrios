@@ -120,6 +120,12 @@ fn tcp_socket(hostport: &str) -> Result<UsbmuxdAddr, String> {
         .ok_or_else(|| format!("usbmuxd host {host:?} has no address"))
 }
 
+/// The forms of usbmuxd address this platform takes, for a message: a unix socket is only on unix.
+#[must_use]
+pub fn address_forms() -> &'static str {
+    if cfg!(unix) { "UNIX:/path, /path, host:port or TCP:host:port" } else { "host:port or TCP:host:port" }
+}
+
 /// What to try when usbmuxd cannot be reached, for this platform.
 #[must_use]
 pub fn usbmuxd_hint() -> &'static str {
@@ -422,5 +428,6 @@ mod tests {
         assert!(e.contains("cannot connect to usbmuxd at 127.0.0.1:1"), "{e}");
         assert!(mux.pair_record(UDID).await.is_err());
         assert!(!usbmuxd_hint().is_empty());
+        assert!(address_forms().contains("TCP:host:port") && address_forms().contains("UNIX:") == cfg!(unix));
     }
 }

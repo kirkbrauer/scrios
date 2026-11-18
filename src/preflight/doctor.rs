@@ -155,7 +155,7 @@ async fn check_usbmuxd(target: &Target, report: &mut Report) -> Option<Mux> {
     let mux = match Mux::resolve(target.usbmuxd.as_deref()) {
         Ok(mux) => mux,
         Err(why) => {
-            report.push(Check::fail("usbmuxd", why, "give --usbmuxd as UNIX:/path, /path, host:port or TCP:host:port"));
+            report.push(Check::fail("usbmuxd", why, format!("give --usbmuxd as {}", crate::mux::address_forms())));
             return None;
         }
     };

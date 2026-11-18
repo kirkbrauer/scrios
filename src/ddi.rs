@@ -446,11 +446,16 @@ impl DdiSources {
     #[must_use]
     pub fn not_found(&self) -> String {
         let cache = self.cache.as_ref().map_or_else(|| "its cache folder".to_string(), |p| p.display().to_string());
+        // The manifest's place in the cache, with the separators of this host.
+        let manifest = self.cache.as_ref().map_or_else(
+            || format!("{cache}/Restore/{MANIFEST}"),
+            |p| p.join("Restore").join(MANIFEST).display().to_string(),
+        );
         let mut looked = vec!["--ddi-dir".to_string(), format!("${ENV_DIR}")];
         looked.extend(self.xcode.iter().map(|p| p.display().to_string()));
         looked.push(cache.clone());
         format!(
-            "no developer disk image (DDI) found (looked in {}). scrios does not ship Apple's image and has no default place to download it from: copy the iOS_DDI folder from a Mac with Xcode (/Library/Developer/DeveloperDiskImages/iOS_DDI) into {cache} so that {cache}/Restore/{MANIFEST} exists, or point --ddi-dir (or ${ENV_DIR}) at it, or give --ddi-download-url with --ddi-sha256 for an archive of it you host",
+            "no developer disk image (DDI) found (looked in {}). scrios does not ship Apple's image and has no default place to download it from: copy the iOS_DDI folder from a Mac with Xcode (/Library/Developer/DeveloperDiskImages/iOS_DDI) into {cache} so that {manifest} exists, or point --ddi-dir (or ${ENV_DIR}) at it, or give --ddi-download-url with --ddi-sha256 for an archive of it you host",
             looked.join(", ")
         )
     }
@@ -667,9 +672,15 @@ mod tests {
             cache_dir_for(Platform::Other, &env(&[("HOME", "/home/me")])),
             Some(PathBuf::from("/home/me/.cache/scrios/ddi"))
         );
+        // An absolute path is one with a drive on Windows, so the test's own absolute path is the host's.
+        let absolute = if cfg!(windows) { "C:\\var\\cache\\me" } else { "/var/cache/me" };
         assert_eq!(
-            cache_dir_for(Platform::Other, &env(&[("HOME", "/home/me"), ("XDG_CACHE_HOME", "/var/cache/me")])),
-            Some(PathBuf::from("/var/cache/me/scrios/ddi"))
+            cache_dir_for(Platform::Other, &|name| match name {
+                "HOME" => Some("/home/me".to_string()),
+                "XDG_CACHE_HOME" => Some(absolute.to_string()),
+                _ => None,
+            }),
+            Some(PathBuf::from(absolute).join("scrios").join("ddi"))
         );
         // A relative XDG_CACHE_HOME is ignored, as the spec says.
         assert_eq!(
@@ -734,12 +745,14 @@ mod tests {
             ..DdiSources::default()
         };
         let why = sources.locate().unwrap_err();
+        // The manifest's path is written with this host's separators.
+        let manifest = Path::new("/nonexistent/cache/scrios/ddi").join("Restore").join("BuildManifest.plist");
         for want in [
             "no developer disk image",
             "--ddi-dir",
             "$SCRIOS_DDI_DIR",
             "/nonexistent/xcode",
-            "/nonexistent/cache/scrios/ddi/Restore/BuildManifest.plist",
+            &manifest.display().to_string(),
             "copy the iOS_DDI folder from a Mac with Xcode",
         ] {
             assert!(why.contains(want), "{want} missing from {why}");
