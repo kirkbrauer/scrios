@@ -35,6 +35,7 @@ idevice = { version = "=0.1.68", default-features = false, features = [
   "xpc",
   "mobile_image_mounter",
   "tss",
+  "amfi",
 ] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }

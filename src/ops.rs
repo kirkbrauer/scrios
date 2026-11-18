@@ -6,12 +6,15 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
-use idevice::IdeviceError;
-use idevice::IdeviceService;
+use idevice::amfi::AmfiClient;
+use idevice::core_device::DisplayServiceClient;
+use idevice::core_device_proxy::CoreDeviceProxy;
 use idevice::lockdown::LockdownClient;
 use idevice::mobile_image_mounter::ImageMounter;
 use idevice::provider::{IdeviceProvider, UsbmuxdProvider};
+use idevice::rsd::RsdHandshake;
 use idevice::usbmuxd::UsbmuxdDevice;
+use idevice::{IdeviceError, IdeviceService, ReadWrite, RsdService};
 
 use crate::ddi::DdiFolder;
 use crate::mux::Mux;
@@ -20,6 +23,8 @@ use crate::mux::Mux;
 const LABEL: &str = "scrios";
 /// How long one query of the device may take.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long opening the tunnel and its handshake may take.
+const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a mount may take: the image goes over USB, and Apple's signing server answers in between.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Apple's signing server, which mounting the personalized image asks for a ticket (over plain HTTP, port 80).
@@ -230,7 +235,7 @@ impl Device {
     pub async fn mount_ddi(
         &self,
         folder: &DdiFolder,
-        progress: &(dyn Fn(u8) + Send + Sync),
+        progress: &mut (dyn FnMut(u8) + Send),
     ) -> Result<Mounted, DevError> {
         let version = self.product_version().await?;
         if major(&version) < FIRST_PERSONALIZED_IOS {
@@ -245,7 +250,7 @@ impl Device {
     async fn mount_personalized(
         &self,
         folder: &DdiFolder,
-        progress: &(dyn Fn(u8) + Send + Sync),
+        progress: &mut (dyn FnMut(u8) + Send),
     ) -> Result<Mounted, DevError> {
         let mut lockdown = self.lockdown().await?;
         let chip = lockdown
@@ -277,6 +282,8 @@ impl Device {
         let (image, trust_cache) = (read(&files.image)?, read(&files.trust_cache)?);
         let (manifest, _) = folder.read_manifest().map_err(DevError::Failed)?;
         progress(0);
+        // The upload calls back through a shared reference.
+        let progress = std::sync::Mutex::new(progress);
         let outcome = Box::pin(mounter.mount_personalized_with_callback(
             &self.provider,
             image,
@@ -287,7 +294,9 @@ impl Device {
             |((sent, total), ())| {
                 let (sent, total) = (u64::try_from(sent).unwrap_or(u64::MAX), u64::try_from(total).unwrap_or(1));
                 let percent = sent.saturating_mul(100) / total.max(1);
-                progress(u8::try_from(percent.min(100)).unwrap_or(100));
+                if let Ok(mut report) = progress.lock() {
+                    (*report)(u8::try_from(percent.min(100)).unwrap_or(100));
+                }
                 std::future::ready(())
             },
             (),
@@ -307,6 +316,75 @@ impl Device {
                 other => Err(other),
             },
         }
+    }
+
+    /// Shows the Developer Mode switch in the device's Settings (Privacy & Security > Developer Mode), which iOS hides
+    /// until a developer tool asks for it. It does not turn Developer Mode on (AMFI's `reveal` action).
+    ///
+    /// # Errors
+    ///
+    /// Why the device could not be asked, or refused.
+    pub async fn reveal_developer_mode(&self) -> Result<(), DevError> {
+        limited("revealing the Developer Mode switch", QUERY_TIMEOUT, async {
+            let mut amfi = AmfiClient::connect(&self.provider)
+                .await
+                .map_err(|e| DevError::from_idevice("cannot connect to the device's AMFI service", &e))?;
+            amfi.reveal_developer_mode_option_in_ui()
+                .await
+                .map_err(|e| DevError::from_idevice("cannot reveal the Developer Mode switch", &e))
+        })
+        .await
+    }
+
+    /// Turns Developer Mode on (AMFI's `enable` action): the device restarts, and works only on a device without a
+    /// passcode. scrios only does this when it is asked to by name (`scrios developer-mode --enable --yes`).
+    ///
+    /// # Errors
+    ///
+    /// Why the device could not be asked, or refused.
+    pub async fn enable_developer_mode(&self) -> Result<(), DevError> {
+        limited("turning Developer Mode on", QUERY_TIMEOUT, async {
+            let mut amfi = AmfiClient::connect(&self.provider)
+                .await
+                .map_err(|e| DevError::from_idevice("cannot connect to the device's AMFI service", &e))?;
+            amfi.enable_developer_mode().await.map_err(|e| DevError::from_idevice("cannot turn Developer Mode on", &e))
+        })
+        .await
+    }
+
+    /// Whether the device offers the display service: the `CoreDevice` tunnel is opened, and the services its RSD
+    /// handshake lists are looked through. This is what the stream needs, and the one answer to "is everything in
+    /// place" (it needs iOS 27 or later, Developer Mode on and the developer disk image mounted).
+    ///
+    /// # Errors
+    ///
+    /// Why the tunnel could not be opened.
+    pub async fn display_service_offered(&self) -> Result<bool, DevError> {
+        limited("opening the CoreDevice tunnel", TUNNEL_TIMEOUT, async {
+            let tunnel_error = |what: &str, e: &dyn fmt::Debug| DevError::Failed(format!("{what}: {e:?}"));
+            let proxy = Box::pin(CoreDeviceProxy::connect(&self.provider))
+                .await
+                .map_err(|e| DevError::from_idevice("cannot open the CoreDevice tunnel", &e))?;
+            let rsd_port = proxy.tunnel_info().server_rsd_port;
+            let adapter =
+                proxy.create_software_tunnel().map_err(|e| tunnel_error("cannot create the tunnel adapter", &e))?;
+            let mut adapter = adapter.to_async_handle();
+            let offered = async {
+                let stream = adapter
+                    .connect(rsd_port)
+                    .await
+                    .map_err(|e| tunnel_error(&format!("cannot connect to the RSD port {rsd_port}"), &e))?;
+                let handshake = Box::pin(RsdHandshake::new(stream))
+                    .await
+                    .map_err(|e| DevError::from_idevice("the RSD handshake failed", &e))?;
+                let name = <DisplayServiceClient<Box<dyn ReadWrite>> as RsdService>::rsd_service_name();
+                Ok(handshake.services.contains_key(name.as_ref()))
+            }
+            .await;
+            let _ = adapter.close().await;
+            offered
+        })
+        .await
     }
 
     /// Unmounts the developer disk image (`/System/Developer` on iOS 17 and later, `/Developer` before).

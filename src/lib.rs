@@ -43,3 +43,5 @@ pub mod stream;
 mod testdir;
 #[cfg(test)]
 mod testmux;
+#[cfg(test)]
+mod testops;

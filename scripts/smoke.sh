@@ -5,8 +5,10 @@
 #     (`host:port` or `TCP:host:port`), and --usbmuxd wins over $USBMUXD_SOCKET_ADDRESS;
 #   * a start-up failure (no usbmuxd at the given path, or no such UDID) in the framed format writes exactly one
 #     `error` control frame to stdout, logs to stderr, and exits 2; in the raw format stdout stays empty;
-#   * the device commands (`ddi-status`, `mount-ddi`, `unmount-ddi`) say what is missing (a device with no pair
-#     record in usbmuxd is "not trusted"), and a DDI download without its SHA-256 is refused;
+#   * the device commands (`ddi-status`, `mount-ddi`, `unmount-ddi`, `developer-mode`, `doctor`) say what is missing
+#     (a device with no pair record in usbmuxd is "not trusted"), and a DDI download without its SHA-256 is refused;
+#   * a plain `scrios` waits for what is missing and says so (once), and a SIGTERM while it waits is a clean stop;
+#     with --no-wait it fails at once with the same words;
 #   * options that do not go together are refused, with an `error` event in the framed format;
 #   * the video is never written to a terminal.
 # Runs the binary on this host, so give it one built for this host:
@@ -29,10 +31,12 @@ out="$(mktemp)"; err="$(mktemp)"; dir="$(mktemp -d)"
 exec 3< <(sleep 600)
 sleeper=${!:-}
 mux_pid=
+waiter=
 cleanup() {
   rm -rf "$out" "$err" "$dir"
   [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null || true
   [ -z "$mux_pid" ] || kill "$mux_pid" 2>/dev/null || true
+  [ -z "$waiter" ] || kill "$waiter" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -197,4 +201,61 @@ code=$?
 set -e
 [ "$code" -eq 2 ] && grep -q "SHA-256" "$err" || { echo "a download without a hash was not refused"; cat "$err"; exit 1; }
 echo "ok: a DDI download without its SHA-256 is refused"
+
+# The stream's own preflight: a device that is listed but not trusted. With --no-wait it fails at once (exit 2) ...
+set +e
+run $BIN --no-wait --usbmuxd "$sock" --record "$dir/never.h264" < /dev/null 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] && grep -q "tap Trust" "$err" || { echo "--no-wait: expected exit 2 and the Trust hint, got $code"; cat "$err"; exit 1; }
+[ ! -e "$dir/never.h264" ] || [ ! -s "$dir/never.h264" ] || { echo "a recording was written"; exit 1; }
+# ... and without it, it waits, says what it waits for once, and a SIGTERM is a clean stop.
+"$BIN" --usbmuxd "$sock" --record "$dir/waits.h264" < /dev/null 2> "$err" &
+waiter=$!
+sleep 2.5
+kill -0 "$waiter" 2>/dev/null || { echo "scrios stopped instead of waiting for Trust"; cat "$err"; exit 1; }
+[ "$(grep -c "Unlock the device and tap Trust" "$err")" -eq 1 ] || { echo "the wait was not said exactly once"; cat "$err"; exit 1; }
+kill -TERM "$waiter"
+set +e
+wait "$waiter"
+code=$?
+set -e
+waiter=
+[ "$code" -eq 0 ] || { echo "a SIGTERM while waiting should be a clean stop, got $code"; cat "$err"; exit 1; }
+echo "ok: scrios waits for Trust, says so once, and stops cleanly on SIGTERM"
+# --no-preflight skips the checks: the stream starts, and the fake usbmuxd has no tunnel to give it.
+set +e
+run $BIN --no-preflight --no-control --usbmuxd "$sock" --record "$dir/nopre.h264" <&3 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] && ! grep -q "tap Trust" "$err" || { echo "--no-preflight still made the checks (exit $code)"; cat "$err"; exit 1; }
+echo "ok: --no-preflight does not make the checks"
+
+# doctor: every check, with its fix; exit 1 if one fails.
+set +e
+got="$(run $BIN doctor --usbmuxd "$sock" 2> "$err")"
+code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "doctor: expected exit 1, got $code"; echo "$got"; exit 1; }
+echo "$got" | grep -q "^ok    usbmuxd" && echo "$got" | grep -q "^ok    device" && echo "$got" | grep -q "^FAIL  pairing" \
+  && echo "$got" | grep -q "fix: .*tap Trust" || { echo "doctor printed:"; echo "$got"; exit 1; }
+set +e
+got="$(run $BIN doctor --usbmuxd /nonexistent/usbmuxd 2> "$err")"
+code=$?
+set -e
+[ "$code" -eq 1 ] && echo "$got" | grep -q "^FAIL  usbmuxd" && echo "$got" | grep -q "^skip  device" || { echo "doctor without usbmuxd printed:"; echo "$got"; exit 1; }
+echo "ok: scrios doctor reports each check with its fix"
+
+# Developer Mode is never turned on without --enable and --yes.
+set +e
+run $BIN developer-mode --enable --usbmuxd "$sock" 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] && grep -q -- "--yes" "$err" || { echo "--enable without --yes was not refused"; cat "$err"; exit 1; }
+set +e
+run $BIN developer-mode --yes --usbmuxd "$sock" 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] || { echo "--yes alone should be a usage error, got $code"; exit 1; }
+echo "ok: developer-mode --enable needs --yes"
 echo "smoke test passed"

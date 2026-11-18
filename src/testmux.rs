@@ -116,6 +116,11 @@ impl FakeMux {
         self.attach(udid, id, "Network", Some(ip));
     }
 
+    /// Takes every device away (it was unplugged, or is restarting).
+    pub(crate) fn detach_all(&self) {
+        self.with(|s| s.devices.clear());
+    }
+
     /// The pair record usbmuxd holds for `udid`.
     pub(crate) fn set_pair_record(&self, udid: &str, data: Vec<u8>) {
         self.with(|s| {

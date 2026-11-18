@@ -16,12 +16,13 @@ use tracing_subscriber::EnvFilter;
 
 mod device_cmds;
 
-use device_cmds::{DdiArgs, TargetArgs};
+use device_cmds::{DdiArgs, DeveloperModeArgs, PreflightEnd, TargetArgs};
 use scrios::codec::CodecKind;
 use scrios::commands::{Command, read_commands, supervised};
 use scrios::frame::Event;
 use scrios::hid::{HidMapping, HidSpace};
 use scrios::list;
+use scrios::preflight::PreflightOptions;
 use scrios::sink::{Format, Sink};
 use scrios::stream::{EXIT_START_FAILED, Input, Item, Probe, Stream, StreamOptions};
 
@@ -94,6 +95,11 @@ Commands on stdin (one per line; end of input is `stop`):
   kb type BASE64               type a UTF-8 string through the US layout
 touch, key and kb need control (the default; see --no-control). docs/protocol.md has the details.
 
+Before it connects, `scrios` makes sure the device is ready and waits for what is missing, saying what it waits
+for (plug in the device, tap Trust, turn Developer Mode on) and mounting the developer disk image if it is not
+mounted (--no-wait fails at once instead; --no-preflight and --format framed make none of these checks).
+`scrios doctor` checks it all and says how to fix what is missing.
+
 Exit status: 0 after a clean stop, 1 if the stream failed while running, 2 if it could not be
 started (or the options do not go together), 101 after an internal error.
 
@@ -146,6 +152,11 @@ enum Cmd {
     MountDdi(DdiCommandArgs),
     /// Unmount the developer disk image
     UnmountDdi(TargetArgs),
+    /// Check everything the stream needs (usbmuxd, the device, trust, Developer Mode, the developer disk image, the
+    /// display service) and say how to fix what is missing
+    Doctor(DdiCommandArgs),
+    /// Show whether Developer Mode is on and reveal its switch in Settings; --enable --yes turns it on
+    DeveloperMode(DeveloperModeArgs),
 }
 
 /// A device and the image folder for the commands that mount or look at the developer disk image.
@@ -176,6 +187,8 @@ enum Action {
     DdiStatus(DdiCommandArgs),
     MountDdi(DdiCommandArgs),
     UnmountDdi(TargetArgs),
+    Doctor(DdiCommandArgs),
+    DeveloperMode(DeveloperModeArgs),
 }
 
 impl Cli {
@@ -186,6 +199,8 @@ impl Cli {
             Some(Cmd::DdiStatus(a)) => Action::DdiStatus(a),
             Some(Cmd::MountDdi(a)) => Action::MountDdi(a),
             Some(Cmd::UnmountDdi(a)) => Action::UnmountDdi(a),
+            Some(Cmd::Doctor(a)) => Action::Doctor(a),
+            Some(Cmd::DeveloperMode(a)) => Action::DeveloperMode(a),
             None if self.list_devices => Action::List { usbmuxd: self.stream.usbmuxd },
             None => Action::Stream(Box::new(self.stream)),
         }
@@ -234,6 +249,12 @@ struct StreamArgs {
     #[arg(short = 'n', long)]
     no_control: bool,
 
+    #[command(flatten, next_help_heading = "Device set-up")]
+    setup: SetupArgs,
+
+    #[command(flatten, next_help_heading = "Developer disk image")]
+    ddi: DdiArgs,
+
     /// Accepted for compatibility and ignored: control is on by default (see --no-control)
     #[arg(long, hide = true)]
     hid: bool,
@@ -247,6 +268,19 @@ struct StreamArgs {
 
     #[command(flatten, next_help_heading = "Diagnostics")]
     probe: ProbeArgs,
+}
+
+/// What is checked, and waited for, before the stream starts.
+#[derive(Args, Debug)]
+struct SetupArgs {
+    /// Fail at once when the device is not ready, instead of waiting for it (plug in, Trust, Developer Mode)
+    #[arg(long)]
+    no_wait: bool,
+
+    /// Do not check Developer Mode and the developer disk image before connecting, and never mount one (what
+    /// `--format framed` does)
+    #[arg(long)]
+    no_preflight: bool,
 }
 
 #[derive(Args, Debug)]
@@ -395,6 +429,21 @@ impl StreamArgs {
     /// Whether touch and keys are connected.
     fn control(&self) -> bool {
         !self.no_control
+    }
+
+    /// The checks to make before the stream starts, if any: `scrios` waits for the device and mounts the developer
+    /// disk image when it must; the framed format (which a program reads) and `--no-preflight` make none, so the
+    /// stream is started as it always was and its errors are the events of the protocol.
+    fn preflight_options(&self) -> Result<Option<PreflightOptions>, String> {
+        if self.format() == Format::Framed || self.setup.no_preflight {
+            return Ok(None);
+        }
+        Ok(Some(PreflightOptions {
+            target: scrios::preflight::Target { udid: self.udid.clone(), usbmuxd: self.usbmuxd.clone() },
+            wait: !self.setup.no_wait,
+            ddi: self.ddi.sources()?,
+            ..PreflightOptions::default()
+        }))
     }
 
     /// The format of the output.
@@ -639,7 +688,18 @@ fn run_stream(args: &StreamArgs) -> i32 {
         }
     }
 
-    let stream = match Stream::start(args.stream_options()) {
+    let mut options = args.stream_options();
+    match args.preflight_options() {
+        Err(why) => return refuse(outputs.first_mut(), why),
+        Ok(None) => {}
+        Ok(Some(preflight)) => match device_cmds::run_preflight(&preflight) {
+            PreflightEnd::Ready(device) => options = device.stream_options(options),
+            // Given up on while it waited: a clean stop.
+            PreflightEnd::Interrupted => return 0,
+            PreflightEnd::Failed(why) => return refuse(outputs.first_mut(), why),
+        },
+    }
+    let stream = match Stream::start(options) {
         Ok(s) => s,
         Err(e) => return refuse(outputs.first_mut(), format!("cannot start the stream: {e}")),
     };
@@ -699,6 +759,8 @@ fn main() {
         Action::DdiStatus(a) => device_cmds::run_ddi_status(&a.target, &a.ddi),
         Action::MountDdi(a) => device_cmds::run_mount_ddi(&a.target, &a.ddi),
         Action::UnmountDdi(target) => device_cmds::run_unmount_ddi(&target),
+        Action::Doctor(a) => device_cmds::run_doctor(&a.target, &a.ddi),
+        Action::DeveloperMode(a) => device_cmds::run_developer_mode(&a),
     };
     std::process::exit(code);
 }
@@ -950,6 +1012,53 @@ mod tests {
             offer(&options(&["--no-ltr"])),
             OfferFlags { ltr: false, codec: Codec::H264, ..OfferFlags::default() }
         );
+    }
+
+    #[test]
+    fn the_preflight_belongs_to_the_raw_stream_and_waits_unless_told_not_to() {
+        let preflight = stream_args(&[]).preflight_options().unwrap().unwrap();
+        assert!(preflight.wait && preflight.mount_ddi);
+        assert_eq!(preflight.target, scrios::preflight::Target::default());
+        let args = stream_args(&["--no-wait", "-s", "U", "--usbmuxd", "UNIX:/tmp/mux", "--ddi-dir", "/x/iOS_DDI"]);
+        let preflight = args.preflight_options().unwrap().unwrap();
+        assert!(!preflight.wait);
+        assert_eq!(preflight.target.udid.as_deref(), Some("U"));
+        assert_eq!(preflight.target.usbmuxd.as_deref(), Some("UNIX:/tmp/mux"));
+        assert_eq!(preflight.ddi.dir.as_deref(), Some(Path::new("/x/iOS_DDI")));
+        // A program that reads the framed format gets the stream as it always was: no checks, no waiting, no mount.
+        assert!(stream_args(&["--format", "framed"]).preflight_options().unwrap().is_none());
+        assert!(stream_args(&["--no-preflight"]).preflight_options().unwrap().is_none());
+        // A download needs its hash.
+        let half = stream_args(&["--ddi-download-url", "https://example.com/ddi.tar.gz"]);
+        assert!(half.preflight_options().unwrap_err().contains("SHA-256"));
+        // And the flags do not exist for the other subcommands that have no use for them.
+        assert!(Cli::try_parse_from(["scrios", "doctor", "--no-wait"]).is_err());
+    }
+
+    #[test]
+    fn the_device_commands_parse_with_their_options() {
+        assert!(matches!(Cli::parse_from(["scrios", "doctor"]).action(), Action::Doctor(_)));
+        assert!(
+            matches!(Cli::parse_from(["scrios", "ddi-status", "-s", "U"]).action(), Action::DdiStatus(a) if a.target.udid.as_deref() == Some("U"))
+        );
+        match Cli::parse_from(["scrios", "mount-ddi", "--ddi-dir", "/d", "--usbmuxd", "127.0.0.1:27015"]).action() {
+            Action::MountDdi(a) => {
+                assert_eq!(a.ddi.dir.as_deref(), Some(Path::new("/d")));
+                assert_eq!(a.target.usbmuxd.as_deref(), Some("127.0.0.1:27015"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(Cli::parse_from(["scrios", "unmount-ddi"]).action(), Action::UnmountDdi(_)));
+        // Turning Developer Mode on is a thing to ask for by name, twice.
+        match Cli::parse_from(["scrios", "developer-mode"]).action() {
+            Action::DeveloperMode(a) => assert!(!a.enable && !a.yes),
+            other => panic!("{other:?}"),
+        }
+        match Cli::parse_from(["scrios", "developer-mode", "--enable", "--yes"]).action() {
+            Action::DeveloperMode(a) => assert!(a.enable && a.yes),
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["scrios", "developer-mode", "--yes"]).is_err(), "--yes confirms --enable");
     }
 
     #[test]

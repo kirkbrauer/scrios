@@ -94,7 +94,8 @@ impl Download {
 }
 
 /// The host of a URL, for messages: nothing else of it (a URL can carry a token).
-fn host_of(url: &str) -> String {
+#[must_use]
+pub fn host_of(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     authority.rsplit('@').next().unwrap_or(authority).to_string()
@@ -454,12 +455,13 @@ impl DdiSources {
         )
     }
 
-    /// [`DdiSources::locate`], and if there is none and a download is configured, the download into the cache.
+    /// [`DdiSources::locate`], and if there is none and a download is configured, the download into the cache
+    /// (`downloading` is told the host it is downloaded from first: the rest of the URL can carry a secret).
     ///
     /// # Errors
     ///
     /// The reason there is no usable DDI folder: what [`DdiSources::locate`] says, or why the download failed.
-    pub async fn find_or_download(&self, say: &mut dyn FnMut(&str)) -> Result<Found, String> {
+    pub async fn find_or_download(&self, downloading: &mut (dyn FnMut(&str) + Send)) -> Result<Found, String> {
         let first = self.locate();
         let (Err(why), Some(download)) = (&first, &self.download) else { return first };
         let Some(cache) = &self.cache else {
@@ -470,10 +472,7 @@ impl DdiSources {
         if self.dir.is_some() || self.env_dir.is_some() {
             return first; // an explicit folder that does not work is not replaced by a download
         }
-        say(&format!(
-            "Downloading the developer disk image from {} (checked against the SHA-256 you gave)",
-            host_of(&download.url)
-        ));
+        downloading(&host_of(&download.url));
         let folder = Box::pin(fetch(download, cache)).await?;
         Ok(Found { folder, origin: Origin::Cache })
     }
@@ -886,7 +885,7 @@ mod tests {
             .unwrap();
         assert_eq!(found.origin, Origin::Cache);
         assert_eq!(found.folder.root(), dest.join("Restore"));
-        assert!(said.iter().any(|l| l.contains("127.0.0.1:") && !l.contains("ddi.tar.gz")), "{said:?}");
+        assert_eq!(said, vec![format!("127.0.0.1:{port}")], "only the host is said");
         // The wrong hash is refused, and the cache keeps nothing of it.
         let _ = std::fs::remove_dir_all(&dest);
         let why = Box::pin(sources("0".repeat(64)).find_or_download(&mut |_| {})).await.unwrap_err();

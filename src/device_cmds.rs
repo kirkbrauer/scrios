@@ -4,14 +4,14 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use clap::Args;
 use tracing::error;
 
 use scrios::ddi::{DdiSources, Found};
 use scrios::ops::{DevError, Device, Mounted};
-use scrios::preflight::{Target, open_device};
+use scrios::preflight::doctor::{self, DoctorOptions};
+use scrios::preflight::{Blocker, PreflightOptions, PreflightStep, Target, ensure_ready, open_device};
 use scrios::stream::EXIT_START_FAILED;
 
 /// The exit status of `ddi-status` when the device is reachable and something is missing.
@@ -162,7 +162,8 @@ pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
         };
         let device = Device::new(&mux, &found);
         let mut report = Report::default();
-        report.line("Device", &format!("{} ({:?})", found.udid, found.connection_type));
+        let listed = scrios::list::Listed::from(&found);
+        report.line("Device", &format!("{} ({})", listed.udid, listed.connection));
         let mut complete = true;
         let mut failed = false;
         match device.product_version().await {
@@ -241,7 +242,10 @@ pub fn run_mount_ddi(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
                 return EXIT_START_FAILED;
             }
         }
-        let folder = match sources.find_or_download(&mut |line| say(line)).await {
+        let downloading = &mut |host: &str| {
+            say(&PreflightStep::Downloading { host: host.to_string() }.line().unwrap_or_default());
+        };
+        let folder = match Box::pin(sources.find_or_download(downloading)).await {
             Ok(folder) => folder,
             Err(why) => {
                 error!("{why}");
@@ -271,14 +275,15 @@ pub fn run_mount_ddi(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
 
 /// Mounts `folder`'s image on `device`, saying how far the upload is every tenth.
 async fn mount_with_progress(device: &Device, folder: &Found) -> Result<Mounted, DevError> {
-    let last = AtomicU8::new(u8::MAX);
-    let progress = move |percent: u8| {
+    let mut last = u8::MAX;
+    let mut progress = move |percent: u8| {
         let tenth = percent / 10;
-        if last.swap(tenth, Ordering::Relaxed) != tenth {
+        if tenth != last {
+            last = tenth;
             say(&format!("Uploading the image: {}%", u32::from(tenth) * 10));
         }
     };
-    device.mount_ddi(&folder.folder, &progress).await
+    Box::pin(device.mount_ddi(&folder.folder, &mut progress)).await
 }
 
 /// `scrios unmount-ddi`: unmounts the developer disk image.
@@ -302,6 +307,148 @@ pub fn run_unmount_ddi(target: &TargetArgs) -> i32 {
             }
         }
     })
+}
+
+/// `scrios doctor`: every check of the preflight, with its fix. Exit status 0 if all passed, 1 if one failed.
+pub fn run_doctor(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
+    let sources = match ddi.sources() {
+        Ok(s) => s,
+        Err(why) => {
+            error!("{why}");
+            return EXIT_START_FAILED;
+        }
+    };
+    run_async(async {
+        let opts = DoctorOptions { target: target.target(), ddi: sources };
+        let report = Box::pin(doctor::run(&opts)).await;
+        // TODO(viewer): the viewer adds its decoder check here with `report.push(..)` before it is printed.
+        out(&report.render());
+        if report.passed() { 0 } else { EXIT_MISSING }
+    })
+}
+
+/// What `scrios developer-mode` is asked to do.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DeveloperModeArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    #[arg(
+        long,
+        help = "Turn Developer Mode on: the device RESTARTS (needs --yes). Works only on a device without a passcode"
+    )]
+    pub enable: bool,
+
+    #[arg(long, requires = "enable", help = "Confirm --enable: yes, restart the device")]
+    pub yes: bool,
+}
+
+/// `scrios developer-mode`: says whether Developer Mode is on and, if it is off, reveals the switch in the device's
+/// Settings and says the steps. With `--enable --yes` it turns Developer Mode on (AMFI), which restarts the device and
+/// works only without a passcode; `--enable` without `--yes` only says what it would do. Exit status 0 if Developer
+/// Mode is on (or is being turned on), 1 if it is off, 2 if it could not be done.
+pub fn run_developer_mode(args: &DeveloperModeArgs) -> i32 {
+    if args.enable && !args.yes {
+        error!(
+            "--enable turns Developer Mode on and RESTARTS the device; it works only on a device without a passcode. Add --yes to do it"
+        );
+        return EXIT_START_FAILED;
+    }
+    run_async(async {
+        let (mux, found) = match open_device(&args.target.target()).await {
+            Ok(opened) => opened,
+            Err(stop) => {
+                error!("{}", stop.message());
+                return EXIT_START_FAILED;
+            }
+        };
+        let device = Device::new(&mux, &found);
+        let on = match device.developer_mode().await {
+            Ok(on) => on,
+            Err(e) => {
+                dev_error("cannot read Developer Mode", &e);
+                return EXIT_START_FAILED;
+            }
+        };
+        if on {
+            say("Developer Mode is on.");
+            return 0;
+        }
+        if args.enable {
+            return match device.enable_developer_mode().await {
+                Ok(()) => {
+                    say(
+                        "Developer Mode is being turned on: the device restarts now. When it is back, tap Turn On and enter its passcode if it asks.",
+                    );
+                    0
+                }
+                Err(e) => {
+                    dev_error("cannot turn Developer Mode on", &e);
+                    EXIT_START_FAILED
+                }
+            };
+        }
+        match device.reveal_developer_mode().await {
+            Ok(()) => say("The Developer Mode switch is now in the device's Settings (Privacy & Security)."),
+            Err(e) => dev_error("cannot reveal the Developer Mode switch", &e),
+        }
+        let off = Blocker::DeveloperModeOff { udid: found.udid, after_restart: false };
+        say(&format!("Developer Mode is off. {}", off.wait_line()));
+        say(
+            "scrios does not turn it on by itself: `scrios developer-mode --enable --yes` does, on a device without a passcode.",
+        );
+        EXIT_MISSING
+    })
+}
+
+/// What the stream's preflight ended with.
+pub enum PreflightEnd {
+    /// The device is ready: the options of the stream to go to it.
+    Ready(Box<scrios::preflight::ReadyDevice>),
+    /// The user gave up (Ctrl-C, SIGTERM) while it waited.
+    Interrupted,
+    /// It could not be done (the message).
+    Failed(String),
+}
+
+/// Runs the preflight for a stream, printing its steps (one plain line each) on standard error.
+pub fn run_preflight(opts: &PreflightOptions) -> PreflightEnd {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => return PreflightEnd::Failed(format!("cannot build the async runtime: {e}")),
+    };
+    rt.block_on(async {
+        let mut print = |step: &PreflightStep| {
+            if let Some(line) = step.line() {
+                say(&line);
+            }
+        };
+        tokio::select! {
+            ready = Box::pin(ensure_ready(opts, &mut print)) => match ready {
+                Ok(ready) => PreflightEnd::Ready(Box::new(ready)),
+                Err(why) => PreflightEnd::Failed(why.message()),
+            },
+            () = interrupted() => PreflightEnd::Interrupted,
+        }
+    })
+}
+
+/// Completes when SIGINT or SIGTERM arrives (Ctrl-C elsewhere).
+#[cfg(unix)]
+async fn interrupted() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn interrupted() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]
