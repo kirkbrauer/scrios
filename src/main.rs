@@ -1,58 +1,73 @@
-//! `scrios`: streams an iPhone's screen to stdout as length-framed Annex-B HEVC
-//! access units. See README.md for the protocol.
+//! `scrios`: mirrors an iOS device's screen as an H.264 or HEVC stream, with touch and keys.
+//! This is the command line over the library (`scrios::stream`); see `docs/cli.md` and `docs/protocol.md`.
 
-// stdout is the frame channel: nothing else may be printed there.
+// A raw or framed stream may go to stdout: nothing else may be printed there while it does.
 #![deny(clippy::print_stdout)]
 
 use std::fs::File;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
-use tokio::sync::{Notify, mpsc};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use scrios::codec::CodecKind;
 use scrios::commands::{Command, read_commands, supervised};
-use scrios::device::{DeviceOptions, Session};
-use scrios::engine::{ClockSource, Engine, EngineConfig};
-use scrios::frame::HidEvent;
-use scrios::frame::{Event, Frame};
-use scrios::hid::{Hid, HidBackend, HidMapping, HidSpace, NoHid, mapping_event};
-use scrios::offer::{Codec, OfferFlags};
-use scrios::outqueue::{OutQueue, run_writer};
-use scrios::session::{Clock, DisplayLink, Exit, HidLink, Links, StopCause, TokioClock, run_session};
-use scrios::{displayinfo, engine, probe};
+use scrios::frame::Event;
+use scrios::hid::{HidMapping, HidSpace};
+use scrios::list;
+use scrios::sink::{Format, Sink};
+use scrios::stream::{EXIT_START_FAILED, Input, Item, Probe, Stream, StreamOptions};
 
-/// Exit status: the stream could not be started.
-const EXIT_START_FAILED: i32 = 2;
-/// Exit status: the stream failed while running.
-const EXIT_FAILED: i32 = 1;
-/// Exit status: an internal error (a panic).
-const EXIT_INTERNAL: i32 = 101;
 /// The longest interval accepted for the millisecond options (a day); longer ones are clamped.
 const MAX_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 /// How long the writer may take to finish at exit.
 const WRITER_GRACE: Duration = Duration::from_secs(3);
-/// How long the cleanup after a panic may take.
-const PANIC_CLEANUP: Duration = Duration::from_secs(8);
-
-/// The codec the offer asks for (see `--codec`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CodecArg {
-    /// The stock offer, which names H.264 and HEVC; the device sends HEVC (needs hardware decoding in a browser).
-    Hevc,
-    /// An offer that names only H.264, which every browser decodes (with --probe-secs: a probe of what arrives).
-    H264,
-}
-
-/// The codec when `--codec` is not given. One line to change; the README and the tests name it.
-const DEFAULT_CODEC: CodecArg = CodecArg::H264;
-
 /// The longest probe window accepted.
 const MAX_PROBE_SECS: u64 = 600;
+
+/// The video codec to ask for (see `--video-codec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CodecArg {
+    /// An offer that names only H.264, which every browser and player decodes.
+    H264,
+    /// The stock offer, which names H.264 and HEVC; the device sends HEVC (needs hardware decoding in a browser).
+    #[value(name = "h265", alias = "hevc")]
+    H265,
+}
+
+/// The codec when `--video-codec` is not given. One line to change; the docs and the tests name it.
+const DEFAULT_CODEC: CodecArg = CodecArg::H264;
+
+impl CodecArg {
+    fn kind(self) -> CodecKind {
+        match self {
+            CodecArg::H264 => CodecKind::H264,
+            CodecArg::H265 => CodecKind::Hevc,
+        }
+    }
+}
+
+/// What is written to the output (see `--format`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FormatArg {
+    /// A plain Annex-B elementary stream, which ffplay, mpv and ffmpeg read as it is.
+    Raw,
+    /// The machine protocol of docs/protocol.md: length-framed access units and JSON events.
+    Framed,
+}
+
+impl FormatArg {
+    fn format(self) -> Format {
+        match self {
+            FormatArg::Raw => Format::Raw,
+            FormatArg::Framed => Format::Framed,
+        }
+    }
+}
 
 /// Where the digitizer's axes lie (see `--hid-space`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -65,21 +80,91 @@ enum SpaceArg {
     Ui,
 }
 
+const AFTER_HELP: &str = "\
+Commands on stdin (one per line; end of input is `stop`):
+  keyframe                     ask the device for a fresh keyframe
+  stop                         stop cleanly (SIGINT and SIGTERM do too; it can take about 8 seconds)
+  touch down|move|up X Y ID    a finger, in pixels of the upright picture (finger 0 only)
+  key NAME [short|long]        a hardware button: home, app-switcher (switcher), lock, power, sleep,
+                               volume-up, volume-down, mute, siri
+  kb down|up USAGE             a key of the HID keyboard page, by its usage in hex (04 is A)
+  kb type BASE64               type a UTF-8 string through the US layout
+touch, key and kb need control (the default; see --no-control). docs/protocol.md has the details.
+
+Exit status: 0 after a clean stop, 1 if the stream failed while running, 2 if it could not be
+started (or the options do not go together), 101 after an internal error.
+
+Examples:
+  scrios list
+  scrios | ffplay -f h264 -
+  scrios --udid 00008110-001234567890401E --record screen.h264
+  scrios --format framed --output - | my-program";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "scrios",
     version,
-    about = "Streams an iPhone's screen (HEVC over RTP, CoreDevice displayservice) to stdout as length-framed Annex-B access units",
-    long_about = "Connects to the phone through usbmuxd (using the pair record usbmuxd already has), opens the \
-CoreDevice tunnel, starts the display stream and writes each picture to stdout as one frame: \
-[u32 len][u64 pts_us][u8 flags][payload], big-endian. Control events are JSON frames (flag 0x80). \
-Commands arrive on stdin, one per line: `keyframe`, `stop` (end of input also stops) and, with --hid, \
-`touch down|move|up <x> <y> <id>` and `key <name> [short|long]` (names: home, app-switcher or switcher (the Home button \
-twice: short|long is ignored), lock, power, sleep, volume-up, volume-down, mute, siri). Logs go to stderr. A clean stop can take up to about 8 seconds."
+    about = "Mirror and control an iOS device's screen: H.264 or HEVC video, touch and keys, over CoreDevice",
+    long_about = "Mirror and control an iOS device's screen. Connects to the device through usbmuxd (with the pair \
+record usbmuxd already has), opens the CoreDevice tunnel, starts the display stream and writes it as video: by \
+default a raw Annex-B H.264 stream on stdout, which a player reads directly (`scrios | ffplay -f h264 -`). \
+--record FILE records it as well, --output FILE writes it to a file instead of stdout, and --format framed is the \
+length-framed machine protocol (access units and JSON events) for programs. Touch and keys are sent to the \
+device through the commands on stdin (see below), unless --no-control. Logs go to stderr.\n\n\
+Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows.",
+    after_long_help = AFTER_HELP,
+    args_conflicts_with_subcommands = true
 )]
-struct Args {
-    /// UDID of the phone (default: the only device usbmuxd lists)
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
+    /// List the devices usbmuxd knows, then exit (the same as `scrios list`)
     #[arg(long)]
+    list_devices: bool,
+
+    #[command(flatten)]
+    stream: StreamArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Stream the device's screen (what `scrios` does without a subcommand)
+    #[command(after_long_help = AFTER_HELP)]
+    Stream(StreamArgs),
+    /// List the devices usbmuxd knows: UDID and how each is connected
+    List(ListArgs),
+}
+
+#[derive(Args, Debug)]
+struct ListArgs {
+    /// usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)
+    #[arg(long, value_name = "PATH|HOST:PORT")]
+    usbmuxd: Option<String>,
+}
+
+/// What the command line asks for.
+#[derive(Debug)]
+enum Action {
+    List { usbmuxd: Option<String> },
+    Stream(Box<StreamArgs>),
+}
+
+impl Cli {
+    fn action(self) -> Action {
+        match self.command {
+            Some(Cmd::List(l)) => Action::List { usbmuxd: l.usbmuxd },
+            Some(Cmd::Stream(s)) => Action::Stream(Box::new(s)),
+            None if self.list_devices => Action::List { usbmuxd: self.stream.usbmuxd },
+            None => Action::Stream(Box::new(self.stream)),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct StreamArgs {
+    /// UDID of the device (default: the only device usbmuxd lists; see `scrios list`)
+    #[arg(short = 's', long, value_name = "UDID")]
     udid: Option<String>,
 
     /// usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)
@@ -90,10 +175,48 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 1)]
     display_id: i64,
 
-    /// A ceiling for the bitrate (the display offer has no such field: logged and ignored)
-    #[arg(long, value_name = "BPS")]
+    /// The video codec to ask for: h264 (an offer that leaves the HEVC bank out) or h265 (alias hevc: the stock
+    /// offer, byte for byte)
+    #[arg(long = "video-codec", alias = "codec", value_enum, value_name = "CODEC", default_value_t = DEFAULT_CODEC)]
+    video_codec: CodecArg,
+
+    /// Also record the video to FILE as a raw Annex-B stream (.h264, or .h265 for HEVC), flushed picture by picture.
+    /// Given alone, it is all that is written: add --output or --format to stream as well
+    #[arg(short = 'r', long, value_name = "FILE")]
+    record: Option<PathBuf>,
+
+    /// Where the stream goes: `-` for stdout or a file. Default: stdout, which is refused when it is a terminal
+    /// (the video is binary); with --record alone, nowhere
+    #[arg(short = 'o', long, value_name = "-|FILE")]
+    output: Option<String>,
+
+    /// What is written to the output: raw (a plain Annex-B stream: `scrios | ffplay -f h264 -`) or framed
+    /// (the machine protocol of docs/protocol.md). Default: raw
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    format: Option<FormatArg>,
+
+    /// Do not connect the touch and key services: the touch, key and kb commands do nothing (a stream that
+    /// only watches). Control is on by default; if it cannot be connected the stream runs without it and says so
+    #[arg(short = 'n', long)]
+    no_control: bool,
+
+    /// Accepted for compatibility and ignored: control is on by default (see --no-control)
+    #[arg(long, hide = true)]
+    hid: bool,
+
+    /// Accepted for compatibility and ignored: the display offer has no bitrate field
+    #[arg(long, hide = true, value_name = "BPS")]
     max_bitrate: Option<u32>,
 
+    #[command(flatten, next_help_heading = "Advanced")]
+    advanced: AdvancedArgs,
+
+    #[command(flatten, next_help_heading = "Diagnostics")]
+    probe: ProbeArgs,
+}
+
+#[derive(Args, Debug)]
+struct AdvancedArgs {
     /// Override of the picture's visible size, e.g. 1206x2622 (default: the primary display's size from
     /// the device, else the conformance window of the SPS, else its size)
     #[arg(long, value_name = "WxH", value_parser = parse_size)]
@@ -107,7 +230,7 @@ struct Args {
     #[arg(long, value_name = "MS", default_value_t = 2000)]
     keyframe_min_interval_ms: u64,
 
-    /// Emit a stats event this often, in ms (0 = never)
+    /// Emit a stats event this often, in ms (0 = never; the events are only written by --format framed)
     #[arg(long, value_name = "MS", default_value_t = 5000)]
     stats_interval_ms: u64,
 
@@ -119,27 +242,10 @@ struct Args {
     #[arg(long, value_name = "MS", default_value_t = 15000)]
     rtp_stall_timeout_ms: u64,
 
-    /// Offer allowRTCPFB = 1 (the stock offer has 0; a keyframe request is answered with the stock
-    /// offer already, so this is only for comparing on a device)
-    #[arg(long)]
-    rtcp_fb: bool,
-
-    /// Offer without long-term reference pictures (ltrpEnabled 0, no `LTR;` in the feature string)
-    #[arg(long)]
-    no_ltr: bool,
-
-    /// Also send Device Hub's per-frame acknowledgements and RCTL reports (experimental, off by default)
-    #[arg(long)]
-    device_hub_feedback: bool,
-
     /// Ask the device for its display's size and orientation this often, in ms (0 = only at start
     /// and when the SPS changes). A change makes a new `config` event.
     #[arg(long, value_name = "MS", default_value_t = 1000)]
     display_poll_ms: u64,
-
-    /// Accept `touch` and `key` commands: connect the device's HID services on the stream's tunnel
-    #[arg(long)]
-    hid: bool,
 
     /// Where the digitizer's axes lie. auto: the panel's native axes, worked out from the display's
     /// reported native orientation (checked on one iPad only); panel: the framebuffer's own axes;
@@ -159,14 +265,34 @@ struct Args {
     #[arg(long)]
     hid_swap_xy: bool,
 
-    /// The codec to ask for: h264 (an offer that leaves the HEVC bank out; the default) or hevc (the stock
-    /// offer, byte for byte)
-    #[arg(long, value_enum, value_name = "CODEC", default_value_t = DEFAULT_CODEC)]
-    codec: CodecArg,
+    /// Do not read commands from stdin. Without it, the end of stdin is a `stop`, so a stream started with stdin
+    /// closed (`< /dev/null`, nohup, a background job) would stop at once; stop it with SIGINT or SIGTERM instead
+    #[arg(long)]
+    no_stdin: bool,
 
-    /// Probe: start the stream (needs --codec h264, the default), count for this many seconds what arrives (RTP packets
-    /// per payload type, the first payload bytes, H.264 NAL types, the first SPS), log it, stop cleanly
-    /// and exit (0 if it was H.264, 1 with an `error` event if not). No frames are written. 0 = off.
+    /// Offer allowRTCPFB = 1 (the stock offer has 0; a keyframe request is answered with the stock
+    /// offer already, so this is only for comparing on a device)
+    #[arg(long)]
+    rtcp_fb: bool,
+
+    /// Offer without long-term reference pictures (ltrpEnabled 0, no `LTR;` in the feature string)
+    #[arg(long)]
+    no_ltr: bool,
+
+    /// Also send Device Hub's per-frame acknowledgements and RCTL reports (experimental, off by default)
+    #[arg(long)]
+    device_hub_feedback: bool,
+
+    /// Log the device's answer, server status and media support info to stderr
+    #[arg(long)]
+    log_answer: bool,
+}
+
+#[derive(Args, Debug)]
+struct ProbeArgs {
+    /// Probe: start the stream (needs --video-codec h264, the default), count for this many seconds what arrives
+    /// (RTP packets per payload type, the first payload bytes, H.264 NAL types, the first SPS), log it, stop cleanly
+    /// and exit (0 if it was H.264, 1 with an `error` event if not). No video is written. 0 = off.
     #[arg(long, value_name = "SECS", default_value_t = 0)]
     probe_secs: u64,
 
@@ -174,11 +300,7 @@ struct Args {
     /// a 4-byte big-endian length followed by its bytes; every RTP packet whose payload kind is not
     /// 1, 5 or 28 is also logged in full (up to 400 payload bytes)
     #[arg(long, value_name = "PATH")]
-    probe_raw: Option<std::path::PathBuf>,
-
-    /// Log the device's answer, server status and media support info to stderr (diagnostics)
-    #[arg(long)]
-    log_answer: bool,
+    probe_raw: Option<PathBuf>,
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
@@ -199,7 +321,19 @@ fn interval(name: &str, ms: u64) -> Option<Duration> {
     (ms > 0).then(|| Duration::from_millis(ms.min(MAX_INTERVAL_MS)))
 }
 
-impl Args {
+/// Where the stream is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    Stdout,
+    File(PathBuf),
+    /// Nowhere: only `--record` (or nothing at all, for a probe) is written.
+    Nothing,
+}
+
+/// Containers that `--record` does not write (it writes a raw Annex-B stream).
+const CONTAINERS: [&str; 6] = ["mp4", "m4v", "mov", "mkv", "webm", "avi"];
+
+impl AdvancedArgs {
     fn hid_mapping(&self) -> HidMapping {
         HidMapping {
             space: match self.hid_space {
@@ -212,31 +346,99 @@ impl Args {
             swap_xy: self.hid_swap_xy,
         }
     }
+}
 
-    fn offer_flags(&self) -> OfferFlags {
-        OfferFlags {
-            allow_rtcp_fb: self.rtcp_fb,
-            ltr: !self.no_ltr,
-            codec: match self.codec {
-                CodecArg::Hevc => Codec::Hevc,
-                CodecArg::H264 => Codec::H264,
-            },
-        }
-    }
-
+impl StreamArgs {
     /// The probe window, if a probe was asked for.
     fn probe_window(&self) -> Option<Duration> {
-        (self.probe_secs > 0).then(|| Duration::from_secs(self.probe_secs.min(MAX_PROBE_SECS)))
+        (self.probe.probe_secs > 0).then(|| Duration::from_secs(self.probe.probe_secs.min(MAX_PROBE_SECS)))
+    }
+
+    /// Whether touch and keys are connected.
+    fn control(&self) -> bool {
+        !self.no_control
+    }
+
+    /// The format of the output.
+    fn format(&self) -> Format {
+        self.format.unwrap_or(FormatArg::Raw).format()
     }
 
     /// Options that do not go together.
     fn check(&self) -> Result<(), String> {
-        if self.probe_raw.is_some() && self.probe_secs == 0 {
+        if self.probe.probe_raw.is_some() && self.probe.probe_secs == 0 {
             return Err("--probe-raw is for the probe: add --probe-secs N".into());
         }
-        match (self.codec, self.probe_secs > 0) {
-            (CodecArg::Hevc, true) => Err("--probe-secs is for --codec h264".into()),
+        match (self.video_codec, self.probe.probe_secs > 0) {
+            (CodecArg::H265, true) => Err("--probe-secs is for --video-codec h264".into()),
             _ => Ok(()),
+        }
+    }
+
+    /// Where the stream goes, given whether stdout is a terminal.
+    fn target(&self, stdout_is_terminal: bool) -> Result<Target, String> {
+        match self.output.as_deref() {
+            Some("-") => return Ok(Target::Stdout),
+            Some(path) => return Ok(Target::File(PathBuf::from(path))),
+            None => {}
+        }
+        // Only --record was asked for: the stream is not written anywhere else. A probe writes no video.
+        let record_only = self.record.is_some() && self.format.is_none();
+        let probe_without_events = self.probe_window().is_some() && self.format() == Format::Raw;
+        if record_only || probe_without_events {
+            return Ok(Target::Nothing);
+        }
+        if stdout_is_terminal {
+            return Err("refusing to write the video to a terminal: pipe it (`scrios | ffplay -f h264 -`), or give \
+                        --output FILE or --record FILE (--output - writes to the terminal anyway)"
+                .into());
+        }
+        Ok(Target::Stdout)
+    }
+
+    /// What `--record` may be.
+    fn check_record(&self) -> Result<(), String> {
+        let Some(path) = &self.record else { return Ok(()) };
+        if path == Path::new("-") {
+            return Err("--record needs a file (the stream itself goes to stdout with --output -)".into());
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if CONTAINERS.contains(&ext.as_str()) {
+            return Err(format!(
+                "--record writes a raw Annex-B stream, not .{ext}: record to .h264 (or .h265) and wrap it, \
+                 e.g. `ffmpeg -i {0}.h264 -c copy {0}.{ext}`",
+                path.with_extension("").display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The options of the library's stream.
+    fn stream_options(&self) -> StreamOptions {
+        let a = &self.advanced;
+        if let Some(bps) = self.max_bitrate {
+            warn!("--max-bitrate {bps} ignored: the display offer has no bitrate ceiling to set");
+        }
+        StreamOptions {
+            udid: self.udid.clone(),
+            usbmuxd: self.usbmuxd.clone(),
+            display_id: self.display_id,
+            codec: self.video_codec.kind(),
+            allow_rtcp_fb: a.rtcp_fb,
+            ltr: !a.no_ltr,
+            log_answer: a.log_answer,
+            control: self.control(),
+            hid_mapping: a.hid_mapping(),
+            visible_size: a.visible_size,
+            rtcp_interval: interval("--rtcp-interval-ms", a.rtcp_interval_ms),
+            keyframe_min_interval: interval("--keyframe-min-interval-ms", a.keyframe_min_interval_ms)
+                .unwrap_or(Duration::ZERO),
+            stats_interval: interval("--stats-interval-ms", a.stats_interval_ms),
+            rtp_stall_keyframe: interval("--rtp-stall-keyframe-ms", a.rtp_stall_keyframe_ms),
+            rtp_stall_timeout: interval("--rtp-stall-timeout-ms", a.rtp_stall_timeout_ms),
+            device_hub_feedback: a.device_hub_feedback,
+            display_poll: interval("--display-poll-ms", a.display_poll_ms),
+            probe: self.probe_window().map(|window| Probe { window, raw_dump: self.probe.probe_raw.clone() }),
         }
     }
 }
@@ -251,10 +453,10 @@ fn init_logging() {
         .init();
 }
 
-/// Takes stdout for the frame channel: the descriptor is duplicated and fd 1 is pointed at stderr,
-/// so a stray print anywhere in the process cannot corrupt a frame.
+/// Takes stdout for the stream: the descriptor is duplicated and fd 1 is pointed at stderr,
+/// so a stray print anywhere in the process cannot corrupt the stream.
 #[cfg(unix)]
-fn take_frame_channel() -> std::io::Result<File> {
+fn take_stdout() -> std::io::Result<File> {
     use std::os::fd::FromRawFd;
     // SAFETY: dup and dup2 on this process's own standard descriptors; the new descriptor is
     // handed to exactly one File.
@@ -273,346 +475,43 @@ fn take_frame_channel() -> std::io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn take_frame_channel() -> std::io::Result<File> {
+fn take_stdout() -> std::io::Result<File> {
     Err(std::io::Error::other("only unix hosts are supported"))
 }
 
-fn main() {
-    let args = Args::parse();
-    init_logging();
-
-    let out = match take_frame_channel() {
-        Ok(f) => f,
-        Err(e) => {
-            error!("cannot take over stdout: {e}");
-            std::process::exit(EXIT_START_FAILED);
-        }
-    };
-
-    let queue = Arc::new(OutQueue::new());
-    let gone = Arc::new(Notify::new());
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    {
-        let queue = queue.clone();
-        let gone = gone.clone();
-        std::thread::Builder::new()
-            .name("frame-writer".into())
-            .spawn(move || {
-                if let Err(e) = run_writer(&queue, out) {
-                    // Nobody reads the frames any more.
-                    warn!("writing to stdout failed: {e}");
-                    queue.close();
-                    gone.notify_one();
-                }
-                let _ = done_tx.send(());
-            })
-            .expect("spawn the writer thread");
-    }
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build the tokio runtime");
-
-    // The session lives out here, so that a panic inside `run` cannot take with it the means to
-    // stop the stream on the device.
-    // Shared only between this thread and the runtime's tasks it blocks on, never sent to another thread.
-    #[allow(clippy::arc_with_non_send_sync)]
-    let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
-    let result =
-        catch_unwind(AssertUnwindSafe(|| rt.block_on(run(args, queue.clone(), gone.clone(), session.clone()))));
-    let code = match result {
-        Ok(code) => code,
-        Err(_) => {
-            error!("internal error (a panic); stopping the stream");
-            queue.push_control(Frame::control(&Event::Error { message: "internal error".into() }));
-            let cleanup = catch_unwind(AssertUnwindSafe(|| {
-                rt.block_on(async {
-                    let _ = tokio::time::timeout(PANIC_CLEANUP, async {
-                        session.lock().await.shutdown().await;
-                    })
-                    .await;
-                })
-            }));
-            if cleanup.is_err() {
-                error!("the cleanup panicked too");
-            }
-            EXIT_INTERNAL
-        }
-    };
-
-    // Let the writer finish what is queued (the access units are stale now: only controls are
-    // kept), but never wait long for a reader that does not read.
-    queue.close_discarding_units();
-    let _ = done_rx.recv_timeout(WRITER_GRACE);
-    // The stdin reader may be blocked in a read that cannot be cancelled.
-    rt.shutdown_background();
-    std::process::exit(code);
+/// One output of the stream: a name for the log and the writer.
+struct Output {
+    name: String,
+    sink: Sink<Box<dyn Write + Send>>,
 }
 
-/// Reports a failure on the frame channel and returns the exit status.
-fn fail(queue: &OutQueue, code: i32, message: String) -> i32 {
-    error!("{message}");
-    queue.push_control(Frame::control(&Event::Error { message }));
-    code
-}
-
-/// The codec probe: count what the device sends for `window`, log it, stop the stream, and say by the
-/// exit status whether it was H.264. No frames go to stdout, only `stopped` or `error`.
-async fn run_probe(
-    sess: &mut Session,
-    window: Duration,
-    cmd_rx: &mut mpsc::Receiver<Command>,
-    gone: &Notify,
-    queue: &OutQueue,
-    raw: Option<&mut dyn std::io::Write>,
-) -> i32 {
-    info!(
-        "probing for {} s: payload type 123 (H.264) is the answer wanted, 100 (HEVC) is what the stock offer gets",
-        window.as_secs()
-    );
-    info!("stream parameters: our SSRC {:#x}, {:?}", sess.our_ssrc, sess.info);
-    let collected = match sess.video() {
-        Some(video) => Ok(probe::collect(video, window, cmd_rx, gone, raw).await),
-        None => Err("the video stream is gone".to_string()),
-    };
-    sess.shutdown().await;
-    let (report, outcome) = match collected {
-        Ok(c) => c,
-        Err(why) => return fail(queue, EXIT_FAILED, why),
-    };
-    for line in report.lines() {
-        info!("probe: {line}");
-    }
-    match outcome {
-        probe::Outcome::Failed(why) => fail(queue, EXIT_FAILED, why),
-        probe::Outcome::ConsumerGone => 0,
-        probe::Outcome::Stopped => {
-            info!("probe: stopped before the window ended");
-            queue.push_control(Frame::control(&Event::Stopped));
-            0
-        }
-        probe::Outcome::Finished => match report.verdict() {
-            Ok(summary) => {
-                info!("probe: {summary}");
-                queue.push_control(Frame::control(&Event::Stopped));
-                0
-            }
-            Err(why) => fail(queue, EXIT_FAILED, why),
-        },
+impl Output {
+    fn new(name: String, format: Format, out: impl Write + Send + 'static) -> Output {
+        Output { name, sink: Sink::new(format, Box::new(out)) }
     }
 }
 
-/// Waits for a `stop` (or for the command channel to close), ignoring other commands.
-async fn wait_for_stop(commands: &mut mpsc::Receiver<Command>) {
-    loop {
-        match commands.recv().await {
-            Some(Command::Stop) | None => return,
-            // Anything else before the stream is up has nothing to act on.
-            Some(_) => {}
-        }
-    }
-}
-
-async fn run(args: Args, queue: Arc<OutQueue>, gone: Arc<Notify>, session: Arc<tokio::sync::Mutex<Session>>) -> i32 {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);
-    tokio::spawn(supervised(read_commands(tokio::io::stdin(), cmd_tx.clone()), cmd_tx.clone()));
-    tokio::spawn(stop_on_signals(cmd_tx));
-
-    if let Some(bps) = args.max_bitrate {
-        warn!("--max-bitrate {bps} ignored: the display offer has no bitrate ceiling to set");
-    }
-    let rtcp_interval = interval("--rtcp-interval-ms", args.rtcp_interval_ms);
-    match rtcp_interval {
-        Some(d) if d > Duration::from_secs(15) => {
-            warn!("--rtcp-interval-ms is above 15 s: the device stops a stream without receiver reports after 20 s");
-        }
-        None => warn!("receiver reports are off: the device stops a stream without them after 20 s"),
-        _ => {}
-    }
-
-    if let Err(why) = args.check() {
-        return fail(&queue, EXIT_START_FAILED, why);
-    }
-    let probe_window = args.probe_window();
-    // The raw dump file is opened first: a path that cannot be written should not cost a run on the device.
-    let mut raw_dump = match &args.probe_raw {
-        Some(path) => match std::fs::File::create(path) {
-            Ok(f) => Some(std::io::BufWriter::new(f)),
+/// Writes what the stream yields to every output, until it ends or no output is left to write to (the reader of
+/// stdout went away, the disk is full): then the stream is told that nobody is reading and stops.
+fn consume(stream: &Stream, mut outputs: Vec<Output>) {
+    let had_outputs = !outputs.is_empty();
+    while let Some(item) = stream.recv() {
+        outputs.retain_mut(|o| match o.sink.write_item(&item) {
+            Ok(()) => true,
             Err(e) => {
-                return fail(&queue, EXIT_START_FAILED, format!("cannot write --probe-raw {}: {e}", path.display()));
+                warn!("writing to {} failed: {e}", o.name);
+                false
             }
-        },
-        None => None,
-    };
-
-    let opts = DeviceOptions {
-        udid: args.udid.clone(),
-        usbmuxd: args.usbmuxd.clone(),
-        display_id: args.display_id,
-        // A probe is about reading the answer.
-        log_answer: args.log_answer || probe_window.is_some(),
-        offer: args.offer_flags(),
-    };
-
-    let mut sess = session.lock().await;
-    // Start, but a stop (a command, the end of stdin, a signal) ends it at once.
-    let started = tokio::select! {
-        r = sess.start(&opts) => Some(r),
-        _ = wait_for_stop(&mut cmd_rx) => None,
-    };
-    match started {
-        None => {
-            info!("stop requested while starting");
-            sess.shutdown().await;
-            queue.push_control(Frame::control(&Event::Stopped));
-            return 0;
-        }
-        Some(Err(e)) => {
-            // Whatever was started on the device is stopped before the failure is reported.
-            sess.shutdown().await;
-            return fail(&queue, EXIT_START_FAILED, e);
-        }
-        Some(Ok(())) => {}
-    }
-
-    if let Some(window) = probe_window {
-        let code = run_probe(
-            &mut sess,
-            window,
-            &mut cmd_rx,
-            &gone,
-            &queue,
-            raw_dump.as_mut().map(|w| w as &mut dyn std::io::Write),
-        )
-        .await;
-        if let (Some(w), Some(path)) = (raw_dump.as_mut(), &args.probe_raw) {
-            use std::io::Write as _;
-            match w.flush() {
-                Ok(()) => info!("probe: the raw datagrams are in {}", path.display()),
-                Err(e) => warn!("probe: could not finish {}: {e}", path.display()),
-            }
-        }
-        return code;
-    }
-
-    // Touch and keys, if asked for: the HID services on the same tunnel. They never stop the stream.
-    let mut hid = Hid::new(args.hid_mapping(), queue.clone());
-    let mut backend: Box<dyn HidBackend> = Box::new(NoHid);
-    // What the device said about its display at start: the touch mapping needs the native orientation.
-    let first_display = sess.take_first_display();
-    if args.hid {
-        let connected = tokio::select! {
-            h = sess.connect_hid() => Some(h),
-            _ = wait_for_stop(&mut cmd_rx) => None,
-        };
-        let Some(device_hid) = connected else {
-            info!("stop requested while connecting HID");
-            sess.shutdown().await;
-            queue.push_control(Frame::control(&Event::Stopped));
-            return 0;
-        };
-        let message =
-            [device_hid.touch_error.clone(), device_hid.buttons_error.clone(), device_hid.keyboard_error.clone()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("; ");
-        let ready = device_hid.ready();
-        if ready {
-            info!("HID ready{}", if message.is_empty() { String::new() } else { format!(" ({message})") });
-        } else {
-            warn!("HID not ready: {message}");
-        }
-        // The mapping in effect, from the display info that is in by now (without it, the identity).
-        let native = first_display
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|displays| displayinfo::primary(displays))
-            .and_then(|d| d.native_orientation.as_deref())
-            .and_then(displayinfo::orientation_degrees);
-        let effective = hid.effective(native);
-        info!(
-            "HID mapping: {} (swap {}, flip x {}, flip y {})",
-            effective.label, effective.axes.swap_xy, effective.axes.flip_x, effective.axes.flip_y
-        );
-        let mut event = mapping_event(Some(ready), (!message.is_empty()).then_some(message), &effective);
-        if let Event::Hid(h) = &mut event {
-            h.keyboard = Some(device_hid.keyboard_ready());
-        }
-        queue.push_control(Frame::control(&event));
-        hid.announce(effective);
-        // What the device's own HID listing says that does not fit: a warning, not an error.
-        for warning in &device_hid.warnings {
-            warn!("HID: {warning}");
-            queue.push_control(Frame::control(&Event::Hid(HidEvent {
-                warning: Some(warning.clone()),
-                ..HidEvent::default()
-            })));
-        }
-        backend = Box::new(device_hid);
-    }
-
-    // The engine's clocks start only now: connecting HID above can take a few seconds, during which
-    // the stream's packets wait in the socket.
-    let mut cfg = EngineConfig::new(sess.our_ssrc).for_codec(match args.codec {
-        CodecArg::Hevc => CodecKind::Hevc,
-        CodecArg::H264 => CodecKind::H264,
-    });
-    cfg.rtcp_interval = rtcp_interval;
-    cfg.keyframe_min_interval =
-        interval("--keyframe-min-interval-ms", args.keyframe_min_interval_ms).unwrap_or(Duration::ZERO);
-    cfg.stats_interval = interval("--stats-interval-ms", args.stats_interval_ms);
-    cfg.rtp_stall_keyframe = interval("--rtp-stall-keyframe-ms", args.rtp_stall_keyframe_ms);
-    cfg.rtp_stall_timeout = interval("--rtp-stall-timeout-ms", args.rtp_stall_timeout_ms);
-    cfg.visible_size = args.visible_size;
-    cfg.device_hub_feedback = args.device_hub_feedback;
-    cfg.device_ssrc = sess.info.device_ssrc;
-    cfg.rtcp_port = Some(sess.info.source_port.unwrap_or(Session::FALLBACK_RTCP_PORT));
-    cfg.fps = sess.info.fps.unwrap_or(engine::DEFAULT_FPS);
-    if let Some(hz) = sess.info.clock_hz {
-        cfg.clock_hz = hz;
-        cfg.clock_source = ClockSource::Negotiated;
-    }
-    cfg.display_info = sess.display_source().is_some();
-
-    let mut engine = Engine::new(cfg, queue.clone(), TokioClock.now());
-    if let Some(first) = first_display {
-        engine.on_display_info(first);
-    }
-    let pending = sess.take_pending_display();
-
-    let exit = {
-        let Some(video) = sess.video() else {
-            return fail(&queue, EXIT_FAILED, "the video stream is gone".into());
-        };
-        let display = sess.display_source().map(|source| DisplayLink {
-            source,
-            poll_interval: interval("--display-poll-ms", args.display_poll_ms),
-            pending,
         });
-        run_session(
-            video,
-            &mut engine,
-            &mut cmd_rx,
-            &gone,
-            &TokioClock,
-            Links { display, hid: Some(HidLink { hid: &mut hid, backend: &mut *backend }) },
-        )
-        .await
-    };
-    info!("done: {}", engine.summary());
-
-    sess.shutdown().await;
-    match exit {
-        Exit::Stopped(StopCause::Command) => {
-            queue.push_control(Frame::control(&Event::Stopped));
-            0
+        if had_outputs && outputs.is_empty() {
+            stream.hang_up();
+            return;
         }
-        // Nobody is reading: there is nobody to tell.
-        Exit::Stopped(StopCause::ConsumerGone) => 0,
-        Exit::Failed(message) => fail(&queue, EXIT_FAILED, message),
+    }
+    for o in &mut outputs {
+        if let Err(e) = o.sink.flush() {
+            warn!("flushing {} failed: {e}", o.name);
+        }
     }
 }
 
@@ -638,9 +537,164 @@ async fn stop_on_signals(tx: mpsc::Sender<Command>) {
     }
 }
 
+/// Feeds the stream's input from stdin (if `read_stdin`) and from the signals, on a thread of its own.
+fn spawn_input(input: Input, read_stdin: bool) {
+    let spawned = std::thread::Builder::new().name("scrios-input".into()).spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!("cannot read commands: {e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let tx = input.sender();
+            if read_stdin {
+                tokio::spawn(supervised(read_commands(tokio::io::stdin(), tx.clone()), tx.clone()));
+            }
+            stop_on_signals(tx).await;
+            // The thread (and its blocked read of stdin) ends with the process.
+            std::future::pending::<()>().await;
+        });
+    });
+    if let Err(e) = spawned {
+        warn!("cannot read commands: {e}");
+    }
+}
+
+/// Reports a failure to start: in the log and, if the primary output is a framed one, as its `error` event.
+fn refuse(primary: Option<&mut Output>, message: String) -> i32 {
+    error!("{message}");
+    if let Some(o) = primary {
+        let _ = o.sink.write_item(&Item::Event(Event::Error { message }));
+    }
+    EXIT_START_FAILED
+}
+
+fn run_stream(args: &StreamArgs) -> i32 {
+    let format = args.format();
+    let target = match args.target(std::io::stdout().is_terminal()) {
+        Ok(t) => t,
+        Err(why) => return refuse(None, why),
+    };
+    let primary = match &target {
+        Target::Nothing => None,
+        Target::Stdout => match take_stdout() {
+            Ok(f) => Some(Output::new("stdout".into(), format, f)),
+            Err(e) => return refuse(None, format!("cannot take over stdout: {e}")),
+        },
+        Target::File(path) => match File::create(path) {
+            Ok(f) => Some(Output::new(path.display().to_string(), format, f)),
+            Err(e) => return refuse(None, format!("cannot write --output {}: {e}", path.display())),
+        },
+    };
+    let mut outputs: Vec<Output> = primary.into_iter().collect();
+
+    if let Err(why) = args.check().and_then(|()| args.check_record()) {
+        return refuse(outputs.first_mut(), why);
+    }
+    // The recording is opened before anything is started: a path that cannot be written should not cost a run.
+    if let Some(path) = &args.record {
+        match File::create(path) {
+            Ok(f) => outputs.push(Output::new(path.display().to_string(), Format::Raw, f)),
+            Err(e) => return refuse(outputs.first_mut(), format!("cannot write --record {}: {e}", path.display())),
+        }
+    }
+
+    let stream = match Stream::start(args.stream_options()) {
+        Ok(s) => s,
+        Err(e) => return refuse(outputs.first_mut(), format!("cannot start the stream: {e}")),
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::Builder::new().name("scrios-writer".into()).spawn({
+        let stream = stream.clone();
+        move || {
+            consume(&stream, outputs);
+            let _ = done_tx.send(());
+        }
+    });
+    if let Err(e) = writer {
+        stream.hang_up();
+        error!("cannot start the writer thread: {e}");
+        return EXIT_START_FAILED;
+    }
+    spawn_input(stream.input(), !args.advanced.no_stdin);
+
+    let outcome = stream.wait();
+    // Let the writer finish what is queued (the access units are stale now: only events are kept), but never wait
+    // long for a reader that does not read.
+    let _ = done_rx.recv_timeout(WRITER_GRACE);
+    outcome.exit_code()
+}
+
+fn run_list(usbmuxd: Option<&str>) -> i32 {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("cannot build the async runtime: {e}");
+            return EXIT_START_FAILED;
+        }
+    };
+    match rt.block_on(list::list_devices(usbmuxd)) {
+        Ok(devices) if devices.is_empty() => {
+            eprintln!("no device is connected (usbmuxd lists none)");
+            0
+        }
+        Ok(devices) => {
+            // A closed pipe (`scrios list | head -1`) is not an error.
+            let _ = std::io::stdout().lock().write_all(list::format_table(&devices).as_bytes());
+            0
+        }
+        Err(why) => {
+            error!("{why}");
+            EXIT_START_FAILED
+        }
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    init_logging();
+    let code = match cli.action() {
+        Action::List { usbmuxd } => run_list(usbmuxd.as_deref()),
+        Action::Stream(args) => run_stream(&args),
+    };
+    std::process::exit(code);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrios::offer::{Codec, OfferFlags};
+
+    fn stream_args(args: &[&str]) -> StreamArgs {
+        let argv = std::iter::once("scrios").chain(args.iter().copied());
+        match Cli::parse_from(argv).action() {
+            Action::Stream(a) => *a,
+            other => panic!("not a stream: {other:?}"),
+        }
+    }
+
+    fn options(args: &[&str]) -> StreamOptions {
+        stream_args(args).stream_options()
+    }
+
+    fn offer(o: &StreamOptions) -> OfferFlags {
+        OfferFlags {
+            allow_rtcp_fb: o.allow_rtcp_fb,
+            ltr: o.ltr,
+            codec: match o.codec {
+                CodecKind::H264 => Codec::H264,
+                CodecKind::Hevc => Codec::Hevc,
+            },
+        }
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn sizes_parse() {
@@ -664,77 +718,138 @@ mod tests {
     }
 
     #[test]
+    fn no_subcommand_is_stream_and_the_subcommands_are_chosen() {
+        assert!(matches!(Cli::parse_from(["scrios"]).action(), Action::Stream(_)));
+        assert!(matches!(Cli::parse_from(["scrios", "stream"]).action(), Action::Stream(_)));
+        match Cli::parse_from(["scrios", "stream", "--udid", "U", "--format", "framed"]).action() {
+            Action::Stream(a) => {
+                assert_eq!(a.udid.as_deref(), Some("U"));
+                assert_eq!(a.format(), Format::Framed);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(Cli::parse_from(["scrios", "list"]).action(), Action::List { usbmuxd: None }));
+        match Cli::parse_from(["scrios", "list", "--usbmuxd", "127.0.0.1:27015"]).action() {
+            Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("127.0.0.1:27015")),
+            other => panic!("{other:?}"),
+        }
+        // --list-devices is `list` (and takes --usbmuxd).
+        assert!(matches!(Cli::parse_from(["scrios", "--list-devices"]).action(), Action::List { usbmuxd: None }));
+        match Cli::parse_from(["scrios", "--list-devices", "--usbmuxd", "/tmp/mux"]).action() {
+            Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("/tmp/mux")),
+            other => panic!("{other:?}"),
+        }
+        // The stream's options do not mix with a subcommand's position, and a stranger is refused.
+        assert!(Cli::try_parse_from(["scrios", "--udid", "U", "list"]).is_err());
+        assert!(Cli::try_parse_from(["scrios", "frobnicate"]).is_err());
+    }
+
+    #[test]
     fn the_cli_defaults_are_the_contracts() {
-        let a = Args::parse_from(["scrios"]);
+        let a = stream_args(&[]);
         assert_eq!(a.udid, None);
         assert_eq!(a.usbmuxd, None);
         assert_eq!(a.display_id, 1);
-        assert_eq!(a.rtcp_interval_ms, 5000);
-        assert_eq!(a.keyframe_min_interval_ms, 2000);
-        assert_eq!(a.stats_interval_ms, 5000);
-        assert_eq!(a.rtp_stall_keyframe_ms, 5000);
-        assert_eq!(a.rtp_stall_timeout_ms, 15000);
-        assert_eq!(a.visible_size, None);
-        assert_eq!(a.max_bitrate, None);
-        // The offer is the stock one, less the HEVC bank, unless asked otherwise.
-        assert_eq!(a.offer_flags(), OfferFlags { codec: Codec::H264, ..OfferFlags::default() });
-        // With --codec hevc it is the stock offer itself.
-        let hevc = Args::parse_from(["scrios", "--codec", "hevc"]);
-        assert_eq!(hevc.offer_flags(), OfferFlags::default());
-        assert!(!a.device_hub_feedback);
-        // HID is off, and its mapping is the automatic one.
-        assert!(!a.hid);
-        assert_eq!(a.hid_mapping(), HidMapping::default());
-        assert_eq!(a.hid_mapping().space, HidSpace::Auto);
-        // The codec is the default one (H.264: an offer without the HEVC bank) and no probe is asked for.
-        assert_eq!(a.codec, DEFAULT_CODEC);
+        assert_eq!(a.record, None);
+        assert_eq!(a.output, None);
+        assert_eq!(a.format(), Format::Raw, "raw is the default format");
+        // Control is on, and its mapping is the automatic one.
+        assert!(a.control());
+        assert_eq!(a.advanced.hid_mapping(), HidMapping::default());
+        assert_eq!(a.advanced.hid_mapping().space, HidSpace::Auto);
+        // The codec is H.264 (an offer without the HEVC bank) and no probe is asked for.
+        assert_eq!(a.video_codec, DEFAULT_CODEC);
         assert_eq!(DEFAULT_CODEC, CodecArg::H264, "the documented default");
-        assert_eq!(a.offer_flags().codec, Codec::H264);
         assert_eq!(a.probe_window(), None);
         assert_eq!(a.check(), Ok(()));
-        assert_eq!(a.display_poll_ms, 1000);
+        assert_eq!(a.check_record(), Ok(()));
+
+        let o = a.stream_options();
+        assert_eq!(o.udid, None);
+        assert_eq!(o.display_id, 1);
+        assert_eq!(o.visible_size, None);
+        assert_eq!(o.rtcp_interval, Some(Duration::from_millis(5000)));
+        assert_eq!(o.keyframe_min_interval, Duration::from_millis(2000));
+        assert_eq!(o.stats_interval, Some(Duration::from_millis(5000)));
+        assert_eq!(o.rtp_stall_keyframe, Some(Duration::from_millis(5000)));
+        assert_eq!(o.rtp_stall_timeout, Some(Duration::from_millis(15000)));
+        assert_eq!(o.display_poll, Some(Duration::from_millis(1000)));
+        assert!(!o.device_hub_feedback);
+        assert!(o.control);
+        assert!(o.probe.is_none());
+        // The offer is the stock one, less the HEVC bank, unless asked otherwise.
+        assert_eq!(offer(&o), OfferFlags { codec: Codec::H264, ..OfferFlags::default() });
+        // The library's defaults are the command line's.
+        let lib = StreamOptions::default();
+        assert_eq!(
+            (o.display_id, o.codec, o.control, o.rtcp_interval, o.keyframe_min_interval, o.stats_interval),
+            (lib.display_id, lib.codec, lib.control, lib.rtcp_interval, lib.keyframe_min_interval, lib.stats_interval)
+        );
+        assert_eq!(
+            (o.rtp_stall_keyframe, o.rtp_stall_timeout, o.display_poll, o.hid_mapping),
+            (lib.rtp_stall_keyframe, lib.rtp_stall_timeout, lib.display_poll, lib.hid_mapping)
+        );
+    }
+
+    #[test]
+    fn the_video_codec_has_its_scrcpy_name_and_the_old_ones() {
+        for (args, want) in [
+            (vec!["--video-codec", "h264"], CodecKind::H264),
+            (vec!["--video-codec", "h265"], CodecKind::Hevc),
+            (vec!["--video-codec", "hevc"], CodecKind::Hevc),
+            // The old flag still works.
+            (vec!["--codec", "h264"], CodecKind::H264),
+            (vec!["--codec", "hevc"], CodecKind::Hevc),
+            (vec!["--codec", "h265"], CodecKind::Hevc),
+        ] {
+            assert_eq!(options(&args).codec, want, "{args:?}");
+        }
+        assert_eq!(offer(&options(&["--codec", "hevc"])), OfferFlags::default(), "HEVC is the stock offer itself");
+        assert!(Cli::try_parse_from(["scrios", "--video-codec", "vp9"]).is_err());
+        assert!(Cli::try_parse_from(["scrios", "--codec", "vp9"]).is_err());
     }
 
     #[test]
     fn the_codec_options_go_together_or_not() {
         // H.264 is the default, with or without the flag, and without a probe it is the stream.
-        for args in [vec!["scrios"], vec!["scrios", "--codec", "h264"]] {
-            let a = Args::parse_from(args);
+        for args in [vec![], vec!["--video-codec", "h264"], vec!["--codec", "h264"]] {
+            let a = stream_args(&args);
             assert_eq!(a.check(), Ok(()));
-            assert_eq!(a.offer_flags().codec, Codec::H264);
+            assert_eq!(a.stream_options().codec, CodecKind::H264);
             assert_eq!(a.probe_window(), None);
         }
         // A probe needs no flag but the window: the default codec is H.264.
-        let a = Args::parse_from(["scrios", "--probe-secs", "5"]);
+        let a = stream_args(&["--probe-secs", "5"]);
         assert_eq!(a.check(), Ok(()));
         assert_eq!(a.probe_window(), Some(Duration::from_secs(5)));
-        let a = Args::parse_from(["scrios", "--codec", "h264", "--probe-secs", "8"]);
-        assert_eq!(a.offer_flags().codec, Codec::H264);
-        assert_eq!(a.probe_window(), Some(Duration::from_secs(8)));
-        assert_eq!(a.check(), Ok(()));
+        let probe = a.stream_options().probe.unwrap();
+        assert_eq!((probe.window, probe.raw_dump), (Duration::from_secs(5), None));
+        assert_eq!(a.stream_options().check(), Ok(()));
         // The window is capped.
-        let a = Args::parse_from(["scrios", "--codec", "h264", "--probe-secs", "999999"]);
+        let a = stream_args(&["--video-codec", "h264", "--probe-secs", "999999"]);
         assert_eq!(a.probe_window(), Some(Duration::from_secs(MAX_PROBE_SECS)));
         // A probe of HEVC is refused: the probe is for H.264.
-        let a = Args::parse_from(["scrios", "--codec", "hevc", "--probe-secs", "5"]);
-        assert!(a.check().unwrap_err().contains("--codec h264"));
+        for flag in ["--video-codec", "--codec"] {
+            let a = stream_args(&[flag, "hevc", "--probe-secs", "5"]);
+            assert!(a.check().unwrap_err().contains("--video-codec h264"));
+            assert!(a.stream_options().check().is_err(), "the library says so too");
+        }
         // HEVC is the opt-in: the stock offer.
-        let a = Args::parse_from(["scrios", "--codec", "hevc"]);
+        let a = stream_args(&["--video-codec", "h265"]);
         assert_eq!(a.check(), Ok(()));
-        assert_eq!(a.offer_flags().codec, Codec::Hevc);
-        assert!(Args::try_parse_from(["scrios", "--codec", "vp9"]).is_err());
+        assert_eq!(offer(&a.stream_options()).codec, Codec::Hevc);
         // The raw dump belongs to the probe.
-        let a = Args::parse_from(["scrios", "--codec", "h264", "--probe-secs", "8", "--probe-raw", "/tmp/x.raw"]);
+        let a = stream_args(&["--probe-secs", "8", "--probe-raw", "/tmp/x.raw"]);
         assert_eq!(a.check(), Ok(()));
-        assert_eq!(a.probe_raw.as_deref(), Some(std::path::Path::new("/tmp/x.raw")));
-        let a = Args::parse_from(["scrios", "--probe-raw", "/tmp/x.raw"]);
+        assert_eq!(a.probe.probe_raw.as_deref(), Some(Path::new("/tmp/x.raw")));
+        assert_eq!(a.stream_options().probe.unwrap().raw_dump.as_deref(), Some(Path::new("/tmp/x.raw")));
+        let a = stream_args(&["--probe-raw", "/tmp/x.raw"]);
         assert!(a.check().unwrap_err().contains("--probe-raw is for the probe"));
     }
 
     #[test]
-    fn the_cli_options_parse() {
-        let a = Args::parse_from([
-            "scrios",
+    fn the_old_options_still_parse() {
+        let a = stream_args(&[
             "--udid",
             "U",
             "--usbmuxd",
@@ -758,33 +873,104 @@ mod tests {
             "--rtcp-fb",
             "--no-ltr",
             "--device-hub-feedback",
+            "--log-answer",
+            "--codec",
+            "h264",
         ]);
         assert_eq!(a.udid.as_deref(), Some("U"));
-        assert_eq!(a.display_id, 2);
-        assert_eq!(a.visible_size, Some((1206, 2622)));
-        assert_eq!(interval("x", a.rtcp_interval_ms), None);
-        assert_eq!(interval("x", a.rtp_stall_keyframe_ms), None);
-        assert_eq!(interval("x", a.rtp_stall_timeout_ms), Some(Duration::from_secs(9)));
-        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, ltr: false, codec: Codec::H264 });
-        assert!(a.device_hub_feedback);
-        let a = Args::parse_from([
-            "scrios",
-            "--hid",
-            "--hid-space",
-            "ui",
-            "--hid-flip-x",
-            "--hid-swap-xy",
-            "--display-poll-ms",
-            "0",
-        ]);
-        assert!(a.hid);
-        assert_eq!(a.hid_mapping(), HidMapping { space: HidSpace::Ui, flip_x: true, flip_y: false, swap_xy: true });
-        assert_eq!(interval("x", a.display_poll_ms), None);
-        assert!(Args::try_parse_from(["scrios", "--hid-space", "sideways"]).is_err());
+        assert_eq!(a.max_bitrate, Some(4_000_000));
+        let o = a.stream_options();
+        assert_eq!(o.usbmuxd.as_deref(), Some("127.0.0.1:27015"));
+        assert_eq!(o.display_id, 2);
+        assert_eq!(o.visible_size, Some((1206, 2622)));
+        assert_eq!(o.rtcp_interval, None);
+        assert_eq!(o.keyframe_min_interval, Duration::from_secs(3));
+        assert_eq!(o.stats_interval, None);
+        assert_eq!(o.rtp_stall_keyframe, None);
+        assert_eq!(o.rtp_stall_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(offer(&o), OfferFlags { allow_rtcp_fb: true, ltr: false, codec: Codec::H264 });
+        assert!(o.device_hub_feedback);
+        assert!(o.log_answer);
+        let a = stream_args(&["--hid", "--hid-space", "ui", "--hid-flip-x", "--hid-swap-xy", "--display-poll-ms", "0"]);
+        // --hid is the default now: accepted, and nothing changes.
+        assert!(a.hid && a.control());
+        assert_eq!(
+            a.advanced.hid_mapping(),
+            HidMapping { space: HidSpace::Ui, flip_x: true, flip_y: false, swap_xy: true }
+        );
+        assert_eq!(a.stream_options().display_poll, None);
+        assert!(Cli::try_parse_from(["scrios", "--hid-space", "sideways"]).is_err());
         // Each offer flag on its own.
-        let a = Args::parse_from(["scrios", "--rtcp-fb"]);
-        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, codec: Codec::H264, ..OfferFlags::default() });
-        let a = Args::parse_from(["scrios", "--no-ltr"]);
-        assert_eq!(a.offer_flags(), OfferFlags { ltr: false, codec: Codec::H264, ..OfferFlags::default() });
+        assert_eq!(
+            offer(&options(&["--rtcp-fb"])),
+            OfferFlags { allow_rtcp_fb: true, codec: Codec::H264, ..OfferFlags::default() }
+        );
+        assert_eq!(
+            offer(&options(&["--no-ltr"])),
+            OfferFlags { ltr: false, codec: Codec::H264, ..OfferFlags::default() }
+        );
+    }
+
+    #[test]
+    fn control_is_on_unless_no_control() {
+        assert!(options(&[]).control);
+        assert!(options(&["--hid"]).control, "the old flag is a no-op");
+        assert!(!options(&["--no-control"]).control);
+        assert!(!options(&["-n"]).control);
+        assert!(!options(&["--hid", "--no-control"]).control, "--no-control wins");
+    }
+
+    #[test]
+    fn the_scrcpy_flags_parse() {
+        let a = stream_args(&["-s", "U", "-r", "out.h264", "-o", "-", "-n"]);
+        assert_eq!(a.udid.as_deref(), Some("U"));
+        assert_eq!(a.record.as_deref(), Some(Path::new("out.h264")));
+        assert_eq!(a.output.as_deref(), Some("-"));
+        assert!(a.no_control);
+        // Options scrcpy has and the display offer cannot honour are refused, not ignored.
+        assert!(Cli::try_parse_from(["scrios", "--max-fps", "30"]).is_err());
+        assert!(Cli::try_parse_from(["scrios", "--no-video"]).is_err());
+    }
+
+    #[test]
+    fn the_output_goes_where_it_was_asked_and_never_to_a_terminal_by_default() {
+        // No options: stdout, unless it is a terminal.
+        assert_eq!(stream_args(&[]).target(false), Ok(Target::Stdout));
+        assert!(stream_args(&[]).target(true).unwrap_err().contains("refusing to write the video to a terminal"));
+        assert!(stream_args(&["--format", "framed"]).target(true).is_err());
+        // --output is explicit: a terminal is allowed then.
+        assert_eq!(stream_args(&["--output", "-"]).target(true), Ok(Target::Stdout));
+        assert_eq!(stream_args(&["-o", "-"]).target(false), Ok(Target::Stdout));
+        assert_eq!(stream_args(&["--output", "out.h264"]).target(true), Ok(Target::File("out.h264".into())));
+        // --record alone records and writes the stream nowhere else; with --output or --format it is in addition.
+        assert_eq!(stream_args(&["--record", "r.h264"]).target(true), Ok(Target::Nothing));
+        assert_eq!(stream_args(&["--record", "r.h264"]).target(false), Ok(Target::Nothing));
+        assert_eq!(stream_args(&["--record", "r.h264", "--output", "-"]).target(false), Ok(Target::Stdout));
+        assert_eq!(stream_args(&["--record", "r.h264", "--format", "framed"]).target(false), Ok(Target::Stdout));
+        assert!(stream_args(&["--record", "r.h264", "--format", "framed"]).target(true).is_err());
+        // A probe writes no video: nothing to refuse in the raw format; its events are framed ones.
+        assert_eq!(stream_args(&["--probe-secs", "3"]).target(true), Ok(Target::Nothing));
+        assert_eq!(stream_args(&["--probe-secs", "3", "--format", "framed"]).target(false), Ok(Target::Stdout));
+        assert!(stream_args(&["--probe-secs", "3", "--format", "framed"]).target(true).is_err());
+    }
+
+    #[test]
+    fn the_formats_are_raw_by_default() {
+        assert_eq!(stream_args(&[]).format(), Format::Raw);
+        assert_eq!(stream_args(&["--format", "raw"]).format(), Format::Raw);
+        assert_eq!(stream_args(&["--format", "framed"]).format(), Format::Framed);
+        assert!(Cli::try_parse_from(["scrios", "--format", "mp4"]).is_err());
+    }
+
+    #[test]
+    fn a_recording_is_a_raw_stream_not_a_container() {
+        for ok in ["screen.h264", "screen.h265", "screen.264", "screen", "dir.mp4/screen.h264"] {
+            assert_eq!(stream_args(&["--record", ok]).check_record(), Ok(()), "{ok}");
+        }
+        for bad in ["screen.mp4", "screen.MKV", "x.mov", "x.webm"] {
+            let why = stream_args(&["--record", bad]).check_record().unwrap_err();
+            assert!(why.contains("raw Annex-B") && why.contains("ffmpeg"), "{why}");
+        }
+        assert!(stream_args(&["--record", "-"]).check_record().unwrap_err().contains("needs a file"));
     }
 }
