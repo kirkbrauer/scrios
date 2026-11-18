@@ -319,6 +319,32 @@ pub fn run_unmount_ddi(target: &TargetArgs) -> i32 {
 }
 
 /// `scrios doctor`: every check of the preflight, with its fix. Exit status 0 if all passed, 1 if one failed.
+/// The viewer's own check for `scrios doctor`: the decoder that the window would decode H.264 with.
+#[cfg(feature = "viewer")]
+fn viewer_decoder_check() -> doctor::Check {
+    use scrios::codec::CodecKind;
+    use scrios::viewer::DecoderChoice;
+    use scrios::viewer::decode;
+    let name = "h264 decoder";
+    match decode::create(DecoderChoice::Auto, CodecKind::H264) {
+        Ok(decoder) => {
+            let fallback = if decode::has_platform_decoder() { ", OpenH264 in software as the fallback" } else { "" };
+            doctor::Check {
+                name: name.into(),
+                status: doctor::Status::Ok,
+                detail: format!("{} decodes the picture of the window{fallback}", decoder.name()),
+                fix: None,
+            }
+        }
+        Err(why) => doctor::Check {
+            name: name.into(),
+            status: doctor::Status::Fail,
+            detail: why,
+            fix: Some("the window needs a decoder: `scrios stream` shows nothing and needs none".into()),
+        },
+    }
+}
+
 pub fn run_doctor(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
     let sources = match ddi.sources() {
         Ok(s) => s,
@@ -330,7 +356,13 @@ pub fn run_doctor(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
     run_async(async {
         let opts = DoctorOptions { target: target.target(), ddi: sources };
         let report = Box::pin(doctor::run(&opts)).await;
-        // TODO(viewer): the viewer adds its decoder check here with `report.push(..)` before it is printed.
+        // A build with the viewer also checks that it has an H.264 decoder to show the picture with.
+        #[cfg(feature = "viewer")]
+        let report = {
+            let mut report = report;
+            report.push(viewer_decoder_check());
+            report
+        };
         out(&report.render());
         if report.passed() { 0 } else { EXIT_MISSING }
     })

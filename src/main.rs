@@ -1,5 +1,7 @@
 //! `scrios`: mirrors an iOS device's screen as an H.264 or HEVC stream, with touch and keys.
-//! This is the command line over the library (`scrios::stream`); see `docs/cli.md` and `docs/protocol.md`.
+//! This is the command line over the library (`scrios::stream`); see `docs/cli.md` and `docs/protocol.md`. With the
+//! `viewer` feature (the default of desktop builds), `scrios` without a subcommand opens a window instead of writing
+//! the video (`scrios::viewer`).
 
 // A raw or framed stream may go to stdout: nothing else may be printed there while it does.
 #![deny(clippy::print_stdout)]
@@ -26,6 +28,8 @@ use scrios::list;
 use scrios::preflight::PreflightOptions;
 use scrios::sink::{Format, Sink};
 use scrios::stream::{EXIT_START_FAILED, Input, Item, Probe, Stream, StreamOptions};
+#[cfg(feature = "viewer")]
+use scrios::viewer::{DecoderChoice, Setup, ViewerOptions};
 
 /// The longest interval accepted for the millisecond options (a day); longer ones are clamped.
 const MAX_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -106,9 +110,36 @@ started (or the options do not go together), 101 after an internal error.
 
 Examples:
   scrios list
-  scrios | ffplay -f h264 -
-  scrios --udid 00008110-001234567890401E --record screen.h264
-  scrios --format framed --output - | my-program";
+  scrios stream | ffplay -f h264 -
+  scrios stream --udid 00008110-001234567890401E --record screen.h264
+  scrios stream --format framed --output - | my-program";
+
+/// What `scrios --help` says it is, with and without the viewer.
+const LONG_ABOUT: &str = if cfg!(feature = "viewer") {
+    "Mirror and control an iOS device's screen. Connects to the device through usbmuxd (with the pair record \
+usbmuxd already has), opens the CoreDevice tunnel and starts the display stream. Without a subcommand it opens a window \
+that shows the screen and sends the device your mouse and keyboard (a click is a touch; Cmd, or Alt elsewhere, with H, S \
+and the arrow keys are the Home button, the App Switcher and the volume); close the window to stop. `scrios stream` \
+writes the video instead, headless: by default a raw Annex-B H.264 stream on stdout, which a player reads directly \
+(`scrios stream | ffplay -f h264 -`). --record FILE records the video as well, in either mode; for `scrios stream`, \
+--output FILE writes it to a file instead of stdout, and --format framed is the length-framed machine protocol \
+(access units and JSON events) for programs. Touch and keys are sent to the device through the window, or through the \
+commands on stdin of `scrios stream` (see below), unless --no-control. Logs go to stderr.\n\n\
+`scrios list` (or --list-devices) lists the devices usbmuxd knows. `scrios ddi-status`, `scrios mount-ddi` and \
+`scrios unmount-ddi` manage the developer disk image that the display service needs, `scrios doctor` checks everything \
+the stream needs, and `scrios developer-mode` shows and reveals the Developer Mode switch."
+} else {
+    "Mirror and control an iOS device's screen. Connects to the device through usbmuxd (with the pair record \
+usbmuxd already has), opens the CoreDevice tunnel, starts the display stream and writes it as video: by default a raw \
+Annex-B H.264 stream on stdout, which a player reads directly (`scrios | ffplay -f h264 -`). --record FILE records it \
+as well, --output FILE writes it to a file instead of stdout, and --format framed is the length-framed machine protocol \
+(access units and JSON events) for programs. Touch and keys are sent to the device through the commands on stdin (see \
+below), unless --no-control. Logs go to stderr.\n\n\
+Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows. \
+`scrios ddi-status`, `scrios mount-ddi` and `scrios unmount-ddi` manage the developer disk image that the display \
+service needs, `scrios doctor` checks everything the stream needs, and `scrios developer-mode` shows and reveals the \
+Developer Mode switch."
+};
 
 /// The text after the options in `--help`: what also stops the stream is the host's own.
 fn after_help() -> String {
@@ -120,15 +151,7 @@ fn after_help() -> String {
     name = "scrios",
     version,
     about = "Mirror and control an iOS device's screen: H.264 or HEVC video, touch and keys, over CoreDevice",
-    long_about = "Mirror and control an iOS device's screen. Connects to the device through usbmuxd (with the pair \
-record usbmuxd already has), opens the CoreDevice tunnel, starts the display stream and writes it as video: by \
-default a raw Annex-B H.264 stream on stdout, which a player reads directly (`scrios | ffplay -f h264 -`). \
---record FILE records it as well, --output FILE writes it to a file instead of stdout, and --format framed is the \
-length-framed machine protocol (access units and JSON events) for programs. Touch and keys are sent to the \
-device through the commands on stdin (see below), unless --no-control. Logs go to stderr.\n\n\
-Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows. \
-`scrios ddi-status`, `scrios mount-ddi` and `scrios unmount-ddi` manage the developer disk image that the display \
-service needs.",
+    long_about = LONG_ABOUT,
     after_long_help = after_help(),
     args_conflicts_with_subcommands = true
 )]
@@ -142,11 +165,16 @@ struct Cli {
 
     #[command(flatten)]
     stream: StreamArgs,
+
+    #[cfg(feature = "viewer")]
+    #[command(flatten, next_help_heading = "Viewer (without a subcommand)")]
+    viewer: ViewerArgs,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Stream the device's screen (what `scrios` does without a subcommand)
+    /// Stream the device's screen to a pipe or a file, with no window (what `scrios` does without a subcommand in a
+    /// build without the viewer)
     #[command(after_long_help = after_help())]
     Stream(StreamArgs),
     /// List the devices usbmuxd knows: UDID and how each is connected
@@ -188,13 +216,18 @@ struct ListArgs {
 /// What the command line asks for.
 #[derive(Debug)]
 enum Action {
-    List { usbmuxd: Option<String> },
+    List {
+        usbmuxd: Option<String>,
+    },
     Stream(Box<StreamArgs>),
     DdiStatus(DdiCommandArgs),
     MountDdi(DdiCommandArgs),
     UnmountDdi(TargetArgs),
     Doctor(DdiCommandArgs),
     DeveloperMode(DeveloperModeArgs),
+    /// The window (`scrios` without a subcommand, in a build with the viewer).
+    #[cfg(feature = "viewer")]
+    View(Box<StreamArgs>, Box<ViewerArgs>),
 }
 
 impl Cli {
@@ -208,9 +241,67 @@ impl Cli {
             Some(Cmd::Doctor(a)) => Action::Doctor(a),
             Some(Cmd::DeveloperMode(a)) => Action::DeveloperMode(a),
             None if self.list_devices => Action::List { usbmuxd: self.stream.usbmuxd },
+            #[cfg(feature = "viewer")]
+            None => Action::View(Box::new(self.stream), Box::new(self.viewer)),
+            #[cfg(not(feature = "viewer"))]
             None => Action::Stream(Box::new(self.stream)),
         }
     }
+}
+
+/// Which decoder the viewer uses (see `--decoder`).
+#[cfg(feature = "viewer")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DecoderArg {
+    /// The platform's decoder if it has one (`VideoToolbox` on macOS), else `OpenH264`; `OpenH264` too if the platform's fails.
+    Auto,
+    /// The platform's decoder, and no other (an error where there is none: Linux, and Windows for now).
+    Platform,
+    /// `OpenH264`, in software.
+    Software,
+}
+
+#[cfg(feature = "viewer")]
+impl DecoderArg {
+    fn choice(self) -> DecoderChoice {
+        match self {
+            DecoderArg::Auto => DecoderChoice::Auto,
+            DecoderArg::Platform => DecoderChoice::Platform,
+            DecoderArg::Software => DecoderChoice::Software,
+        }
+    }
+}
+
+/// The options of the window (`scrios` without a subcommand). The stream's own options (`--udid`, `--record`,
+/// `--no-control`, ...) are the same as for `scrios stream`.
+#[cfg(feature = "viewer")]
+#[derive(Args, Debug)]
+struct ViewerArgs {
+    /// The H.264 decoder: auto (the platform's: `VideoToolbox` on macOS; `OpenH264` where there is none, or if the
+    /// platform's fails), platform (the platform's only), software (`OpenH264`)
+    #[arg(long, value_enum, value_name = "DECODER", default_value_t = DecoderArg::Auto)]
+    decoder: DecoderArg,
+
+    /// The title of the window
+    #[arg(long, value_name = "TITLE", default_value = "scrios")]
+    window_title: String,
+
+    /// The first window is at most this wide, in logical pixels (default: what the screen has room for)
+    #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u32).range(1..=16384))]
+    window_width: Option<u32>,
+
+    /// The first window is at most this high, in logical pixels (default: what the screen has room for)
+    #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u32).range(1..=16384))]
+    window_height: Option<u32>,
+
+    /// Show the frame rate and the viewer's delay (the access unit's arrival to the picture's display) in the title
+    #[arg(long)]
+    show_stats: bool,
+
+    /// Let Cmd+P (Alt+P elsewhere) lock the device. Off by default: with the screen as the only way in, a lock from the
+    /// keyboard is a way to lock oneself out
+    #[arg(long)]
+    lock_shortcut: bool,
 }
 
 #[derive(Args, Debug)]
@@ -236,7 +327,8 @@ struct StreamArgs {
     video_codec: CodecArg,
 
     /// Also record the video to FILE as a raw Annex-B stream (.h264, or .h265 for HEVC), flushed picture by picture.
-    /// Given alone, it is all that is written: add --output or --format to stream as well
+    /// With the window it records while the window is open. With `scrios stream`, given alone, it is all that is
+    /// written: add --output or --format to stream as well
     #[arg(short = 'r', long, value_name = "FILE")]
     record: Option<PathBuf>,
 
@@ -245,7 +337,7 @@ struct StreamArgs {
     #[arg(short = 'o', long, value_name = "-|FILE")]
     output: Option<String>,
 
-    /// What is written to the output: raw (a plain Annex-B stream: `scrios | ffplay -f h264 -`) or framed
+    /// What is written to the output: raw (a plain Annex-B stream: `scrios stream | ffplay -f h264 -`) or framed
     /// (the machine protocol of docs/protocol.md). Default: raw
     #[arg(long, value_enum, value_name = "FORMAT")]
     format: Option<FormatArg>,
@@ -483,8 +575,8 @@ impl StreamArgs {
             return Ok(Target::Nothing);
         }
         if stdout_is_terminal {
-            return Err("refusing to write the video to a terminal: pipe it (`scrios | ffplay -f h264 -`), or give \
-                        --output FILE or --record FILE (--output - writes to the terminal anyway)"
+            return Err("refusing to write the video to a terminal: pipe it (`scrios stream | ffplay -f h264 -`), or \
+                        give --output FILE or --record FILE (--output - writes to the terminal anyway)"
                 .into());
         }
         Ok(Target::Stdout)
@@ -503,6 +595,27 @@ impl StreamArgs {
                  e.g. `ffmpeg -i {0}.h264 -c copy {0}.{ext}`",
                 path.with_extension("").display()
             ));
+        }
+        Ok(())
+    }
+
+    /// What the window cannot do: options of `scrios stream` that the window has no meaning for.
+    #[cfg(feature = "viewer")]
+    fn check_viewer(&self) -> Result<(), String> {
+        if self.output.is_some() || self.format.is_some() {
+            return Err(
+                "--output and --format are for `scrios stream`: the window shows the video, it does not write \
+                        it (--record FILE records it as well); to write the video, run `scrios stream`"
+                    .into(),
+            );
+        }
+        if self.probe.probe_secs > 0 || self.probe.probe_raw.is_some() {
+            return Err("the probe is for `scrios stream`: run `scrios stream --probe-secs N`".into());
+        }
+        if self.video_codec != CodecArg::H264 {
+            return Err("the window decodes H.264 only for now: leave --video-codec out, or use `scrios stream` for \
+                        HEVC"
+                .into());
         }
         Ok(())
     }
@@ -774,6 +887,50 @@ fn run_stream(args: &StreamArgs) -> i32 {
     outcome.exit_code()
 }
 
+/// `scrios` without a subcommand: the window.
+#[cfg(feature = "viewer")]
+fn run_view(args: &StreamArgs, viewer: &ViewerArgs) -> i32 {
+    if let Err(why) = args.check_viewer().and_then(|()| args.check_record()).and_then(|()| args.check()) {
+        return refuse(None, why);
+    }
+    let options = ViewerOptions {
+        codec: args.video_codec.kind(),
+        decoder: viewer.decoder.choice(),
+        control: args.control(),
+        title: viewer.window_title.clone(),
+        window_width: viewer.window_width,
+        window_height: viewer.window_height,
+        show_stats: viewer.show_stats,
+        lock_shortcut: viewer.lock_shortcut,
+        record: args.record.clone(),
+    };
+    // The decoder and the recording come first: a failure there should not cost a run on the device.
+    let setup = match Setup::prepare(options) {
+        Ok(setup) => setup,
+        Err(why) => return refuse(None, why),
+    };
+    info!("decoder: {}", setup.decoder_name());
+    // The device is made ready before the window opens, as for `scrios stream`: waited for (the lines say what for, on
+    // the terminal), Developer Mode checked, the developer disk image mounted. Ctrl-C while it waits is a clean stop.
+    let mut stream_options = args.stream_options();
+    match args.preflight_options() {
+        Err(why) => return refuse(None, why),
+        Ok(None) => {}
+        Ok(Some(preflight)) => match device_cmds::run_preflight(&preflight) {
+            PreflightEnd::Ready(device) => stream_options = device.stream_options(stream_options),
+            PreflightEnd::Interrupted => return 0,
+            PreflightEnd::Failed(why) => return refuse(None, why),
+        },
+    }
+    let stream = match Stream::start(stream_options) {
+        Ok(stream) => stream,
+        Err(e) => return refuse(None, format!("cannot start the stream: {e}")),
+    };
+    // Only the signals: the window is the input, and standard input is not read.
+    spawn_input(stream.input(), false, AtEof::Ignore);
+    setup.run(std::sync::Arc::new(stream))
+}
+
 fn run_list(usbmuxd: Option<&str>) -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -810,6 +967,8 @@ fn main() {
         Action::UnmountDdi(target) => device_cmds::run_unmount_ddi(&target),
         Action::Doctor(a) => device_cmds::run_doctor(&a.target, &a.ddi),
         Action::DeveloperMode(a) => device_cmds::run_developer_mode(&a),
+        #[cfg(feature = "viewer")]
+        Action::View(args, viewer) => run_view(&args, &viewer),
     };
     std::process::exit(code);
 }
@@ -819,12 +978,12 @@ mod tests {
     use super::*;
     use scrios::offer::{Codec, OfferFlags};
 
+    /// The options of `scrios stream ARGS` (the same in a build with the viewer and without it).
     fn stream_args(args: &[&str]) -> StreamArgs {
-        let command_line = std::iter::once("scrios").chain(args.iter().copied());
-        match Cli::parse_from(command_line).action() {
-            Action::Stream(a) => *a,
-            other => panic!("not a stream: {other:?}"),
-        }
+        let command_line = ["scrios", "stream"].into_iter().chain(args.iter().copied());
+        let action = Cli::parse_from(command_line).action();
+        let Action::Stream(a) = action else { panic!("not a stream: {action:?}") };
+        *a
     }
 
     fn options(args: &[&str]) -> StreamOptions {
@@ -871,26 +1030,24 @@ mod tests {
 
     #[test]
     fn no_subcommand_is_stream_and_the_subcommands_are_chosen() {
+        // Without a subcommand: the window if there is one in this build, else the stream.
+        #[cfg(feature = "viewer")]
+        assert!(matches!(Cli::parse_from(["scrios"]).action(), Action::View(..)));
+        #[cfg(not(feature = "viewer"))]
         assert!(matches!(Cli::parse_from(["scrios"]).action(), Action::Stream(_)));
         assert!(matches!(Cli::parse_from(["scrios", "stream"]).action(), Action::Stream(_)));
-        match Cli::parse_from(["scrios", "stream", "--udid", "U", "--format", "framed"]).action() {
-            Action::Stream(a) => {
-                assert_eq!(a.udid.as_deref(), Some("U"));
-                assert_eq!(a.format(), Format::Framed);
-            }
-            other => panic!("{other:?}"),
-        }
+        let a = stream_args(&["--udid", "U", "--format", "framed"]);
+        assert_eq!(a.udid.as_deref(), Some("U"));
+        assert_eq!(a.format(), Format::Framed);
         assert!(matches!(Cli::parse_from(["scrios", "list"]).action(), Action::List { usbmuxd: None }));
-        match Cli::parse_from(["scrios", "list", "--usbmuxd", "127.0.0.1:27015"]).action() {
-            Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("127.0.0.1:27015")),
-            other => panic!("{other:?}"),
-        }
+        let action = Cli::parse_from(["scrios", "list", "--usbmuxd", "127.0.0.1:27015"]).action();
+        let Action::List { usbmuxd } = action else { panic!("not a list: {action:?}") };
+        assert_eq!(usbmuxd.as_deref(), Some("127.0.0.1:27015"));
         // --list-devices is `list` (and takes --usbmuxd).
         assert!(matches!(Cli::parse_from(["scrios", "--list-devices"]).action(), Action::List { usbmuxd: None }));
-        match Cli::parse_from(["scrios", "--list-devices", "--usbmuxd", "/tmp/mux"]).action() {
-            Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("/tmp/mux")),
-            other => panic!("{other:?}"),
-        }
+        let action = Cli::parse_from(["scrios", "--list-devices", "--usbmuxd", "/tmp/mux"]).action();
+        let Action::List { usbmuxd } = action else { panic!("not a list: {action:?}") };
+        assert_eq!(usbmuxd.as_deref(), Some("/tmp/mux"));
         // The stream's options do not mix with a subcommand's position, and a stranger is refused.
         assert!(Cli::try_parse_from(["scrios", "--udid", "U", "list"]).is_err());
         assert!(Cli::try_parse_from(["scrios", "frobnicate"]).is_err());
@@ -1212,5 +1369,104 @@ mod tests {
             assert!(why.contains("raw Annex-B") && why.contains("ffmpeg"), "{why}");
         }
         assert!(stream_args(&["--record", "-"]).check_record().unwrap_err().contains("needs a file"));
+    }
+
+    /// The window's options: the stream's, then the viewer's, as `scrios ARGS` parses them.
+    #[cfg(feature = "viewer")]
+    fn view_args(args: &[&str]) -> (StreamArgs, ViewerArgs) {
+        let command_line = std::iter::once("scrios").chain(args.iter().copied());
+        match Cli::parse_from(command_line).action() {
+            Action::View(stream, viewer) => (*stream, *viewer),
+            other => panic!("not the window: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "viewer")]
+    #[test]
+    fn the_window_is_what_scrios_does_without_a_subcommand() {
+        let (stream, viewer) = view_args(&[]);
+        assert_eq!(viewer.decoder, DecoderArg::Auto);
+        assert_eq!(viewer.window_title, "scrios");
+        assert_eq!((viewer.window_width, viewer.window_height), (None, None));
+        assert!(!viewer.show_stats && !viewer.lock_shortcut, "no lock shortcut, no overlay, unless asked for");
+        assert!(stream.control(), "touch and keys are on");
+        assert_eq!(stream.check_viewer(), Ok(()));
+        assert_eq!(stream.check(), Ok(()));
+        // `scrios stream` and `scrios list` are not the window, and --list-devices is still a list.
+        assert!(matches!(Cli::parse_from(["scrios", "stream"]).action(), Action::Stream(_)));
+        assert!(matches!(Cli::parse_from(["scrios", "list"]).action(), Action::List { .. }));
+        assert!(matches!(Cli::parse_from(["scrios", "--list-devices"]).action(), Action::List { .. }));
+    }
+
+    #[cfg(feature = "viewer")]
+    #[test]
+    fn the_viewer_flags_parse() {
+        let (stream, viewer) = view_args(&[
+            "--decoder",
+            "software",
+            "--window-title",
+            "My phone",
+            "--window-width",
+            "900",
+            "--window-height",
+            "700",
+            "--show-stats",
+            "--lock-shortcut",
+            "-n",
+            "--record",
+            "out.h264",
+            "-s",
+            "U",
+        ]);
+        assert_eq!(viewer.decoder, DecoderArg::Software);
+        assert_eq!(viewer.decoder.choice(), DecoderChoice::Software);
+        assert_eq!(viewer.window_title, "My phone");
+        assert_eq!((viewer.window_width, viewer.window_height), (Some(900), Some(700)));
+        assert!(viewer.show_stats && viewer.lock_shortcut);
+        assert!(!stream.control(), "--no-control is view only");
+        assert_eq!(stream.record.as_deref(), Some(Path::new("out.h264")), "--record works with the window");
+        assert_eq!(stream.udid.as_deref(), Some("U"));
+        for (name, want) in [
+            ("auto", DecoderChoice::Auto),
+            ("platform", DecoderChoice::Platform),
+            ("software", DecoderChoice::Software),
+        ] {
+            assert_eq!(view_args(&["--decoder", name]).1.decoder.choice(), want);
+        }
+        assert!(Cli::try_parse_from(["scrios", "--decoder", "gpu"]).is_err());
+        assert!(Cli::try_parse_from(["scrios", "--window-height", "0"]).is_err());
+        assert!(Cli::try_parse_from(["scrios", "--window-width", "wide"]).is_err());
+    }
+
+    #[cfg(feature = "viewer")]
+    #[test]
+    fn the_viewers_flags_are_not_the_streams() {
+        // They belong to the window: `scrios stream` does not take them.
+        for flag in [["--decoder", "software"], ["--window-title", "x"], ["--window-height", "9"]] {
+            assert!(Cli::try_parse_from(["scrios", "stream", flag[0], flag[1]]).is_err(), "{flag:?}");
+        }
+        for flag in ["--show-stats", "--lock-shortcut"] {
+            assert!(Cli::try_parse_from(["scrios", "stream", flag]).is_err(), "{flag}");
+        }
+    }
+
+    #[cfg(feature = "viewer")]
+    #[test]
+    fn the_window_refuses_what_only_a_written_stream_means() {
+        for args in [&["--output", "-"][..], &["--format", "framed"], &["-o", "x.h264"], &["--format", "raw"]] {
+            let why = view_args(args).0.check_viewer().unwrap_err();
+            assert!(why.contains("scrios stream"), "{args:?}: {why}");
+        }
+        let why = view_args(&["--probe-secs", "3"]).0.check_viewer().unwrap_err();
+        assert!(why.contains("probe"), "{why}");
+        let why = view_args(&["--video-codec", "h265"]).0.check_viewer().unwrap_err();
+        assert!(why.contains("H.264 only"), "{why}");
+        // The recording, the codec spelled out, and the control flags are fine.
+        assert_eq!(
+            view_args(&["--record", "r.h264", "--video-codec", "h264", "-n", "--no-ltr"]).0.check_viewer(),
+            Ok(())
+        );
+        // A recording that is not a raw stream is refused here as it is for `scrios stream`.
+        assert!(view_args(&["--record", "r.mp4"]).0.check_record().is_err());
     }
 }
