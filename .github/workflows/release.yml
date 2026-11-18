@@ -37,8 +37,10 @@ jobs:
             exit 1
           fi
           echo "releasing ${version}"
+      - name: idevice is pinned exactly
+        run: scripts/check-pins.sh
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --all-targets --locked
 
   build:
     name: build ${{ matrix.asset }}
@@ -61,6 +63,10 @@ jobs:
           targets: ${{ matrix.target }}
       # Static musl binaries are cross-built with zig as the C compiler and linker: aws-lc-sys (the TLS backend)
       # compiles its C sources with `cc` (no CMake, no bindgen for these targets).
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: matrix.zig
+        with:
+          version: 0.17.1
       - name: install cargo-zigbuild
         if: matrix.zig
         run: pipx install cargo-zigbuild

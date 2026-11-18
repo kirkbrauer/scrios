@@ -15,12 +15,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Any warning fails the build: rustc's, clippy's (the lints are in Cargo.toml's [lints]) and rustdoc's.
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
   # Pinned so that a new Rust (and its new lints) arrives as a change, not mid-review.
   RUST_TOOLCHAIN: 1.96.0
 
 jobs:
   check:
-    name: fmt, clippy, test (${{ matrix.os }})
+    name: fmt, clippy, test, doc (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -42,19 +45,47 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - name: idevice is pinned exactly
+        run: scripts/check-pins.sh
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: cargo test
-        run: cargo test --locked
+        run: |
+          cargo test --all-targets --all-features --locked
+          cargo test --doc --all-features --locked
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features --locked
       - name: smoke test (release build, no device)
         run: |
           cargo build --release --locked
           scripts/smoke.sh target/release/scrios
+      - name: fuzz harnesses build
+        working-directory: fuzz
+        run: cargo build --locked
+
+  msrv:
+    name: MSRV (rust-version from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: read rust-version
+        id: msrv
+        run: echo "version=$(sed -n -E 's/^rust-version = "([0-9.]+)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: cargo check with ${{ steps.msrv.outputs.version }}
+        # Lints newer than this toolchain are unknown to it: that alone is not a failure.
+        env:
+          RUSTFLAGS: -D warnings -A unknown-lints
+        run: cargo check --all-targets --all-features --locked
 
   deny:
-    name: cargo deny (licences, bans, sources, advisories)
+    name: cargo deny (advisories, licences, bans, sources)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -63,6 +94,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           command: check
+          arguments: --all-features --locked
 
   musl:
     name: static musl build (${{ matrix.target }})
@@ -79,6 +111,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
       - name: install cargo-zigbuild
         run: pipx install cargo-zigbuild
       - name: build
@@ -101,6 +136,5 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: cargo publish --dry-run
         run: |
+          cargo package --list --locked
           cargo publish --dry-run --locked
-          ls -l target/package/*.crate
-

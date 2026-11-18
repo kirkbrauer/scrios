@@ -11,8 +11,6 @@ it as scrcpy, but for iOS devices: a small command-line program, and a Rust libr
   keyboard keys and text, a keyframe request, and stop.
 - No viewer window yet: see the [roadmap](#roadmap).
 
-> scrios is not affiliated with, or endorsed by, Genymobile or the scrcpy project. The name only echoes the idea.
-
 ## How it works, and what the device needs
 
 scrios uses Apple's own developer services: the **CoreDevice display service and HID service** that Xcode uses,
