@@ -18,12 +18,15 @@ reached over the standard usbmuxd/RemoteXPC tunnel. These are official Apple dev
 publicly documented. **No jailbreak is needed**; the device only needs:
 
 - **Developer Mode** enabled (Settings > Privacy & Security > Developer Mode);
-- to be **paired/trusted** with the host (usbmuxd must already hold the pair record; scrios never pairs);
-- the **developer disk image** mounted. Xcode does that on a Mac; on Linux, a tool such as
-  [go-ios](https://github.com/danielpaulus/go-ios) or [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)
-  can mount the personalized DDI.
+- to be **paired/trusted** with the host (the pair record is in usbmuxd, which is the only place scrios reads it);
+- the **developer disk image** mounted, which scrios does itself from the `iOS_DDI` folder of Xcode (see
+  [Prerequisites](#prerequisites)); no other tool (go-ios, pymobiledevice3) is needed.
 
-scrios never changes a setting of the device, writes a pair record or mounts an image itself.
+scrios works like scrcpy, with no extra steps: `scrios` waits for the device ("Plug in and unlock your iPhone or iPad"),
+for Trust ("Unlock the device and tap Trust") and for Developer Mode (it reveals the switch and prints the steps), and
+mounts the developer disk image if it is missing. It never turns Developer Mode on by itself and never pairs: the device's
+owner does that on the device (`scrios developer-mode --enable --yes` turns Developer Mode on when you ask for it by name).
+`scrios doctor` checks everything and says how to fix what is missing.
 
 The CoreDevice, RemoteXPC, usbmuxd and lockdown protocols come from the [idevice](https://github.com/jkcoxson/idevice)
 crate by Jackson Coxson (MIT), pinned to one release. scrios adds the display stream on top: the offer, the RTP
@@ -48,8 +51,63 @@ The display stream and touch were tested, on an earlier build of scrios, with th
 - iPhone 16 Pro, iOS 27.2
 - iPad (iPad14,3), iOS 27.0.1
 
+The set-up described under [Prerequisites](#prerequisites) (waiting for the device, Trust and Developer Mode, mounting
+the developer disk image, `scrios doctor`) is tested against scripted fakes of usbmuxd and the device, not yet on a
+device.
+
 The display service needs iOS 17 or later (the CoreDevice tunnel); **iOS versions older than 27 are untested.**
 Host: Linux (x86_64, aarch64) and macOS (Apple silicon); Unix only.
+
+## Prerequisites
+
+usbmuxd is scrios's only way to a device, as adb is scrcpy's. What the host needs, by platform:
+
+| Host | usbmuxd | The developer disk image folder |
+| --- | --- | --- |
+| **macOS** | built in (`/var/run/usbmuxd`) | **Xcode**, or a copy of its `iOS_DDI` folder: scrios finds `/Library/Developer/DeveloperDiskImages/iOS_DDI` itself |
+| **Linux** | the `usbmuxd` daemon (a package of every distribution; it starts on its own when a device is plugged in, or `sudo systemctl start usbmuxd`) | a copy of `iOS_DDI` from a Mac with Xcode |
+| **Windows** (not supported yet) | the Apple Devices app or iTunes, whose Apple Mobile Device Service is usbmuxd on `127.0.0.1:27015` | a copy of `iOS_DDI` from a Mac with Xcode |
+
+On every host:
+
+- **Developer Mode** on the device (Settings > Privacy & Security > Developer Mode; scrios reveals the switch and says the
+  steps, then waits through the restart);
+- the device **paired and trusted** with the host (tap Trust on the device; scrios itself does not pair, so if the host
+  never asked, pair once with your system's tool: Finder on macOS, `idevicepair pair` from libimobiledevice on Linux);
+- **internet for the first mount after each restart of the device**: mounting the personalized image asks Apple's signing
+  server (`gs.apple.com`, plain HTTP, not through a proxy) for a ticket. Without internet scrios says so; once the image
+  is mounted nothing else is needed until the device restarts.
+
+**The developer disk image is Apple's, and scrios does not ship, host or download it by default.** scrios looks for the
+`iOS_DDI` folder (it holds `Restore/BuildManifest.plist`, an image and its trust cache) in `--ddi-dir`, `$SCRIOS_DDI_DIR`,
+Xcode's folders on macOS, and its cache folder (`~/Library/Caches/scrios/ddi` on macOS, `~/.cache/scrios/ddi` on Linux,
+`%LOCALAPPDATA%\scrios\ddi` on Windows). On Linux or Windows, copy the folder from a Mac with Xcode into the cache folder
+once:
+
+```
+mkdir -p ~/.cache/scrios && scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI ~/.cache/scrios/ddi
+```
+
+(The paths of Xcode's folders are from what Xcode is known to do; one was seen on a Mac with Xcode, the other was not.
+Details, the archive download for fleets, and the manifest layout: [docs/cli.md](docs/cli.md#the-developer-disk-image).)
+
+### A device on another machine
+
+Point `--usbmuxd` at the usbmuxd of the machine the device is plugged into, as scrcpy does with a remote adb:
+
+```
+# where scrios runs: forward a local port to the usbmuxd socket of the machine the device is plugged into
+ssh -N -L 27015:/var/run/usbmuxd you@that-machine &
+scrios --usbmuxd 127.0.0.1:27015
+
+# or, without ssh, on that machine: serve the socket on TCP, and give scrios its address
+socat TCP-LISTEN:27015,reuseaddr,fork UNIX-CONNECT:/var/run/usbmuxd
+scrios --usbmuxd that-machine:27015
+```
+
+**The socat port is unauthenticated** (anyone who reaches it can use every device and read its pair record): use it only
+over a link you trust, and prefer the ssh forward. The CoreDevice tunnel and the services all ride usbmuxd connections, so
+they should work remotely; that is reasoned, not tried on a device. See [docs/cli.md](docs/cli.md#a-remote-usbmuxd).
 
 ## Install
 
@@ -68,16 +126,20 @@ Cross-builds and static musl binaries: [BUILD.md](BUILD.md).
 
 ```
 scrios list                                          # the devices usbmuxd knows
+scrios doctor                                        # check everything, with the fix for what is missing
 scrios --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch it
 scrios --record screen.h264                          # record raw H.264
 scrios --format framed                               # the machine protocol, for programs
 ```
 
-Every option, with examples: [docs/cli.md](docs/cli.md). The framed output and the stdin control protocol are
+`scrios` waits for what is missing (`--no-wait` fails at once) and mounts the developer disk image if needed; `scrios
+mount-ddi`, `ddi-status`, `unmount-ddi` and `developer-mode` do those steps by hand. Every option, with examples:
+[docs/cli.md](docs/cli.md). The framed output and the stdin control protocol are
 specified, with their version, in [docs/protocol.md](docs/protocol.md).
 
 Logs go to standard error (`RUST_LOG` sets the level). Exit status: `0` after a clean stop, `2` if the stream could
-not be started, `1` if it failed while running, `101` after an internal error.
+not be started, `1` if it failed while running, `101` after an internal error. The end of standard input stops a stream
+only with `--format framed`; a recording started with standard input closed (nohup, a script) runs until SIGINT or SIGTERM.
 
 ## Library
 
@@ -87,7 +149,8 @@ programs can embed the stream; the API is not stable yet (0.x). See the crate do
 ## Users
 
 - [Jumpstarter](https://github.com/jumpstarter-dev/jumpstarter) runs `scrios --format framed` for the screen of the
-  iOS devices it leases out, with touch and keys.
+  iOS devices it leases out, with touch and keys. The framed format makes none of the checks above and never waits (a
+  program reads what is missing as an `error` event): run `scrios doctor` or `scrios mount-ddi` before.
 
 ## Roadmap
 

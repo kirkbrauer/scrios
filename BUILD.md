@@ -42,7 +42,10 @@ because its API changes between releases. A bump is deliberate: change it in `Ca
 "Compatibility" line, run the tests, and smoke-test against a real device. Only the features scrios uses are on:
 `ring` (rustls on ring: TLS for the lockdown session; idevice's default, aws-lc, needs CMake/NASM on Windows), `display_stream` (the display service client, offers, RTP/RTCP helpers),
 `core_device_proxy` and `tunnel_tcp_stack` (the CoreDevice tunnel with its userspace TCP/UDP stack), `usbmuxd`,
-`rsd` and `xpc`.
+`rsd` and `xpc`, and for the device set-up `mobile_image_mounter` (mounting the developer disk image), `tss` (the
+request to Apple's signing server that mounting makes; it brings idevice's small HTTP client, `webpki-roots` for https
+downloads of a DDI archive, and its CDLA-Permissive-2.0 licence, which `deny.toml` allows for that crate only) and
+`amfi` (revealing and, on request, turning on Developer Mode).
 
 ## Releases
 
