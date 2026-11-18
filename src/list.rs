@@ -51,6 +51,7 @@ pub async fn list_devices(usbmuxd: Option<&str>) -> Result<Vec<Listed>, String> 
 }
 
 /// The table `scrios list` prints: a header and a line per entry (nothing else for an empty list).
+#[must_use]
 pub fn format_table(devices: &[Listed]) -> String {
     let width = devices.iter().map(|d| d.udid.len()).max().unwrap_or(0).max("UDID".len());
     let mut out = format!("{:<width$}  CONNECTION\n", "UDID");

@@ -34,12 +34,14 @@ pub struct Frame {
 
 impl Frame {
     /// An access-unit frame.
+    #[must_use]
     pub fn unit(pts_us: u64, key: bool, params: bool, payload: Vec<u8>) -> Frame {
         Frame { pts_us, flags: unit_flags(key, params), payload }
     }
 
     /// A control frame carrying `event` as JSON (pts is 0). A `config` event carries the protocol version
     /// ([`PROTOCOL_VERSION`]) as its last field.
+    #[must_use]
     pub fn control(event: &Event) -> Frame {
         // Serializing these plain structs cannot fail; fall back to an error object anyway.
         let encoded = match event {
@@ -50,21 +52,25 @@ impl Frame {
         Frame { pts_us: 0, flags: FLAG_CONTROL, payload }
     }
 
+    #[must_use]
     pub fn is_control_frame(&self) -> bool {
         self.flags & FLAG_CONTROL != 0
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn is_control(&self) -> bool {
         self.is_control_frame()
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn is_key(&self) -> bool {
         self.flags & FLAG_KEY != 0
     }
 
     /// The 13 header bytes.
+    #[must_use]
     pub fn header(&self) -> [u8; HEADER_LEN] {
         header(self.payload.len(), self.pts_us, self.flags)
     }
@@ -85,6 +91,7 @@ impl Frame {
 }
 
 /// The flags of an access-unit frame.
+#[must_use]
 pub fn unit_flags(key: bool, params: bool) -> u8 {
     let mut flags = 0;
     if key {

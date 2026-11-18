@@ -99,6 +99,7 @@ impl Key {
     pub const NAMES: &'static str =
         "home, app-switcher (or switcher), lock, power, sleep, volume-up, volume-down, mute, siri";
 
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Key> {
         Some(match name {
             "home" => Key::Home,
@@ -116,6 +117,7 @@ impl Key {
 
     /// (HID usage page, usage code) of the button, from the reference tool's named buttons. Power,
     /// lock and sleep are the same button.
+    #[must_use]
     pub fn usage(self) -> (u64, u64) {
         match self {
             Key::Home | Key::AppSwitcher => (0x0C, 0x40),
@@ -130,6 +132,7 @@ impl Key {
     /// How long the button is held down in ms. The short hold is the reference tool's; a long
     /// press is held about twice as long or more (a held press, not a repeated one). The App
     /// Switcher is two short Home presses whatever `press` says.
+    #[must_use]
     pub fn hold_ms(self, press: Press) -> u64 {
         match (self, press) {
             (Key::AppSwitcher, _) => 80,
@@ -241,6 +244,7 @@ fn parse_kb(args: &[&str]) -> Result<Kb, String> {
     }
 }
 
+#[must_use]
 pub fn parse_line(line: &[u8]) -> Parsed {
     let text = String::from_utf8_lossy(line);
     let text = text.trim();

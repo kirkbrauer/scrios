@@ -82,6 +82,7 @@ pub struct StreamInfo {
 // ---- pure helpers -----------------------------------------------------------------------------
 
 /// The usbmuxd address to use when `--usbmuxd` is not given.
+#[must_use]
 pub fn default_usbmuxd_spec() -> String {
     match std::env::var("USBMUXD_SOCKET_ADDRESS") {
         Ok(v) if !v.trim().is_empty() => v,
@@ -210,6 +211,7 @@ fn negotiated_clock_hz(answer: &plist::Value) -> Option<u32> {
 
 /// Reads what the stream's parameters are out of the device's answer (or its server status, which
 /// carries the same stream config).
+#[must_use]
 pub fn answer_info(answer: &plist::Value) -> StreamInfo {
     StreamInfo {
         source_port: find_u32(answer, "SourcePort").and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0),
@@ -290,6 +292,7 @@ fn negotiation_lines(answer: &plist::Value) -> Vec<String> {
 /// The parts of the device's answer that say which codec and stream it chose: the scalar values whose
 /// key names a payload, codec, SSRC, port, frame rate, RTCP, bitrate, size, profile or level, and the
 /// negotiation blob's payloads and streams.
+#[must_use]
 pub fn answer_summary(answer: &plist::Value) -> Vec<String> {
     let mut out = Vec::new();
     collect_summary(answer, "", 0, &mut out);
@@ -729,6 +732,7 @@ fn fmt_hex(v: Option<u64>) -> String {
 /// What the listed HID surfaces say against what is assumed: touch reports go to the surface
 /// [`DIGITIZER_SURFACE_MAIN_TOUCHSCREEN`]. The listing has no orientation or size to check the
 /// mapping against (the crate reads only id, product and usage); a missing surface is worth a warning.
+#[must_use]
 pub fn surface_warnings(surfaces: &[HidSurface]) -> Vec<String> {
     let mut out = Vec::new();
     if surfaces.is_empty() {
@@ -748,11 +752,13 @@ pub fn surface_warnings(surfaces: &[HidSurface]) -> Vec<String> {
 
 impl DeviceHid {
     /// Touch works (the buttons may not).
+    #[must_use]
     pub fn ready(&self) -> bool {
         self.touch.is_some()
     }
 
     /// The keyboard was created and can be used.
+    #[must_use]
     pub fn keyboard_ready(&self) -> bool {
         self.keyboard.is_some()
     }

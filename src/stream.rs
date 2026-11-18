@@ -213,6 +213,7 @@ pub enum Outcome {
 
 impl Outcome {
     /// The exit status of the `scrios` binary: 0, [`EXIT_START_FAILED`], [`EXIT_FAILED`] or [`EXIT_INTERNAL`].
+    #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Outcome::Stopped => 0,
@@ -283,6 +284,7 @@ impl Stream {
 
     /// The next thing the stream produced; blocks until there is one. `None` once the stream is over (or hung up
     /// on) and everything it produced was read.
+    #[must_use]
     pub fn recv(&self) -> Option<Item> {
         loop {
             let frame = self.shared.queue.pop()?;
@@ -300,6 +302,7 @@ impl Stream {
     }
 
     /// A handle for touch, keys, text, keyframe requests and stop.
+    #[must_use]
     pub fn input(&self) -> Input {
         Input { tx: self.shared.input.clone() }
     }
@@ -334,6 +337,10 @@ pub struct Input {
     tx: mpsc::Sender<Command>,
 }
 
+#[expect(
+    clippy::must_use_candidate,
+    reason = "the bool says whether the command was queued (false: the stream is over); a caller that does not care may ignore it"
+)]
 impl Input {
     /// Sends any command.
     pub fn send(&self, command: Command) -> bool {
@@ -346,6 +353,7 @@ impl Input {
 
     /// The command channel itself, for async code that wants to `send(..).await` (the stdin reader of the binary
     /// does).
+    #[must_use]
     pub fn sender(&self) -> mpsc::Sender<Command> {
         self.tx.clone()
     }

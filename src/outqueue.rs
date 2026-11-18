@@ -86,10 +86,12 @@ impl Default for OutQueue {
 }
 
 impl OutQueue {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_limits(MAX_QUEUED_UNITS, MAX_QUEUED_BYTES)
     }
 
+    #[must_use]
     pub fn with_limits(max_units: usize, max_bytes: usize) -> Self {
         OutQueue {
             inner: Mutex::new(Inner::default()),

@@ -74,6 +74,7 @@ pub struct ProbeReport {
 }
 
 impl ProbeReport {
+    #[must_use]
     pub fn new(window: Duration) -> Self {
         ProbeReport { window, ..Default::default() }
     }
@@ -132,6 +133,7 @@ impl ProbeReport {
     }
 
     /// The report as log lines.
+    #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!(
             "{} RTP packets in {} s ({} RTCP, {} neither); by payload type: {}",

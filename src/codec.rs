@@ -25,6 +25,7 @@ pub struct SpsDescription {
 
 impl CodecKind {
     /// The RTP payload type the stock offer gives the codec.
+    #[must_use]
     pub fn payload_type(self) -> u8 {
         match self {
             CodecKind::Hevc => 100,
@@ -32,6 +33,7 @@ impl CodecKind {
         }
     }
 
+    #[must_use]
     pub fn depacketizer(self) -> Box<dyn Depacketizer> {
         match self {
             CodecKind::Hevc => Box::new(Assembler::new()),

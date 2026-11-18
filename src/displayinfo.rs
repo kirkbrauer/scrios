@@ -35,12 +35,14 @@ impl DisplayInfo {
     /// How far the framebuffer must be turned clockwise to be upright: the degrees of the current
     /// orientation (`rot90` means 90). Checked on an iPad by the integrator; the native orientation
     /// is not part of it (it is reported as it is).
+    #[must_use]
     pub fn rotation(&self) -> Option<u16> {
         orientation_degrees(self.current_orientation.as_deref()?)
     }
 }
 
 /// `rot0`, `rot90`, `rot180`, `rot270` (or just the number) as degrees.
+#[must_use]
 pub fn orientation_degrees(s: &str) -> Option<u16> {
     let n: u16 = s.trim().strip_prefix("rot").unwrap_or(s.trim()).parse().ok()?;
     (n.is_multiple_of(90) && n < 360).then_some(n)
@@ -48,6 +50,7 @@ pub fn orientation_degrees(s: &str) -> Option<u16> {
 
 /// The display the screen is on: the primary one that is not external, else any primary one,
 /// else the first.
+#[must_use]
 pub fn primary(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
     displays
         .iter()

@@ -73,6 +73,7 @@ pub struct Axes {
 }
 
 impl Axes {
+    #[must_use]
     pub fn apply(self, (a, b): (f64, f64)) -> (f64, f64) {
         let (mut x, mut y) = if self.swap_xy { (b, a) } else { (a, b) };
         if self.flip_x {
@@ -91,6 +92,7 @@ impl Axes {
     }
 
     /// `self` first, then `other`, as one transform in the same form.
+    #[must_use]
     pub fn then(self, other: Axes) -> Axes {
         let first = self.terms();
         let second = other.terms();
@@ -110,6 +112,7 @@ impl Axes {
 /// The automatic mapping: the framebuffer point turned clockwise by `(360 - native) % 360` to the
 /// digitizer's point, as swaps and flips. `None` if the native orientation is unknown or not a right
 /// angle.
+#[must_use]
 pub fn auto_axes(native_degrees: Option<u16>) -> Option<Axes> {
     Some(match native_degrees? {
         0 => Axes::default(),
@@ -170,6 +173,7 @@ fn axis_fraction(p: f64, size: u32) -> f64 {
 /// turned to be upright; `upright_w` x `upright_h` is the upright picture. The first pixel of an
 /// axis is 0.0 and the last (size - 1) is 1.0; positions outside the picture are clamped to its edge;
 /// a rotation that is not a right angle counts as 0.
+#[must_use]
 pub fn panel_position(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) -> (f64, f64) {
     let (ux, uy) = (axis_fraction(x, upright_w), axis_fraction(y, upright_h));
     // Turning the framebuffer clockwise by r gives the upright picture; this is the inverse.
@@ -210,6 +214,7 @@ fn picture_edges(px: f64, py: f64, upright_w: u32, upright_h: u32) -> Option<Str
 /// The log line for a touch `down` that lands on the very edge of the digitizer (its mapped x or y
 /// is 0 or 65535), or `None` for a touch that does not. `px` and `py` are the upright picture
 /// position as it came; the edge named is the picture's own (a corner names both sides).
+#[must_use]
 pub fn edge_down_message(x: u16, y: u16, px: f64, py: f64, upright_w: u32, upright_h: u32) -> Option<String> {
     let at_limit = |v: u16| v == 0 || f64::from(v) == AXIS_MAX;
     if !at_limit(x) && !at_limit(y) {
@@ -221,6 +226,7 @@ pub fn edge_down_message(x: u16, y: u16, px: f64, py: f64, upright_w: u32, uprig
 
 /// Maps an upright picture position (pixels) to the digitizer's normalized 0..=65535 space, in the
 /// framebuffer's own axes: the inverse of turning the framebuffer clockwise by `rotation`.
+#[must_use]
 pub fn map_touch(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) -> (u16, u16) {
     let (fx, fy) = panel_position(x, y, upright_w, upright_h, rotation);
     (to_axis(fx), to_axis(fy))
@@ -228,6 +234,7 @@ pub fn map_touch(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) 
 
 impl HidMapping {
     /// The mapping in effect, given the display's native orientation in degrees (if known).
+    #[must_use]
     pub fn effective(&self, native_degrees: Option<u16>) -> Effective {
         let user = Axes { swap_xy: self.swap_xy, flip_x: self.flip_x, flip_y: self.flip_y };
         match self.space {
@@ -242,6 +249,7 @@ impl HidMapping {
 
     /// An upright picture position (pixels) to the digitizer's 0..=65535 axes.
     /// `native_degrees` is the primary display's native orientation, if the device said.
+    #[must_use]
     pub fn map(
         &self,
         x: f64,
@@ -274,6 +282,7 @@ pub struct View {
 
 impl View {
     /// The size of the upright picture: the framebuffer's, with the sides swapped for 90 and 270.
+    #[must_use]
     pub fn upright_size(&self) -> (u32, u32) {
         match self.rotation % 360 {
             90 | 270 => (self.height, self.width),
@@ -283,6 +292,7 @@ impl View {
 }
 
 /// A `hid` event that carries the mapping in effect (and, for `ready`, the state of the service).
+#[must_use]
 pub fn mapping_event(ready: Option<bool>, message: Option<String>, effective: &Effective) -> Event {
     Event::Hid(HidEvent {
         ready,
@@ -314,6 +324,7 @@ pub enum Action {
 
 impl Action {
     /// How long the backend may take to perform it.
+    #[must_use]
     pub fn timeout(self) -> Duration {
         match self {
             // Taking the keyboard down asks the device to list its surfaces to confirm it is gone.
@@ -324,6 +335,7 @@ impl Action {
 
     /// Whether it lets go of something (a lift, a button or key up, the keyboard released or removed). These
     /// are never refused by a full [`ActionQueue`]: what is held down must come up.
+    #[must_use]
     pub fn is_release(self) -> bool {
         match self {
             Action::Touch { down, .. } | Action::Button { down, .. } | Action::Key { down, .. } => !down,
@@ -396,10 +408,12 @@ impl ActionQueue {
         before - self.items.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -407,6 +421,7 @@ impl ActionQueue {
 
 /// The US keyboard layout: the usage of the key that types `c`, and whether Shift is needed. Letters,
 /// digits, the printable ASCII punctuation, space, newline (Return) and tab; nothing else.
+#[must_use]
 pub fn us_layout(c: char) -> Option<(u8, bool)> {
     // Only ASCII has a usage (the arms below), so a character that is not a byte has none.
     let n = u8::try_from(c).ok()?;
@@ -581,6 +596,7 @@ impl Hid {
     }
 
     /// The mapping this controller uses for a display with the given native orientation.
+    #[must_use]
     pub fn effective(&self, native_degrees: Option<u16>) -> Effective {
         self.mapping.effective(native_degrees)
     }
@@ -590,6 +606,7 @@ impl Hid {
     }
 
     /// When a held move or a key release is due.
+    #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         let move_due = self.pending_move.and(self.last_touch_sent).map(|t| t + MOVE_INTERVAL);
         let key_due = self.keys_down.iter().map(|k| k.at).chain(self.button_steps.front().map(|s| s.at)).min();
@@ -599,6 +616,7 @@ impl Hid {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn finger_down(&self) -> bool {
         self.finger.is_some()
     }

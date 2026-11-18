@@ -50,11 +50,13 @@ const NEAR_LATE: u16 = 256;
 pub const MAX_UNIT_BYTES: usize = crate::frame::MAX_PAYLOAD - 4096;
 
 /// The NAL unit type of an HEVC NAL unit header's first byte.
+#[must_use]
 pub fn nal_type(byte0: u8) -> u8 {
     (byte0 >> 1) & 0x3f
 }
 
 /// HEVC IRAP pictures: BLA, IDR and CRA (types 16..=21).
+#[must_use]
 pub fn is_irap(nal_type: u8) -> bool {
     (16..=21).contains(&nal_type)
 }
@@ -151,10 +153,12 @@ pub trait NalFormat: std::fmt::Debug {
     fn parse<'a>(payload: &'a [u8], out: &mut Vec<Item<'a>>);
     /// A replacement for a whole NAL unit of type `typ` that goes into the stream instead of it
     /// (`None`: as it is). H.264 uses this to give its SPS a VUI bitstream restriction.
+    #[must_use]
     fn transform_nal(_typ: u8, _nal: &[u8]) -> Option<Vec<u8>> {
         None
     }
     /// Whether a whole NAL unit is a B slice.
+    #[must_use]
     fn is_b_slice(_typ: u8, _nal: &[u8]) -> bool {
         false
     }
@@ -568,10 +572,12 @@ impl<F: NalFormat> Default for UnitAssembler<F> {
 }
 
 impl<F: NalFormat> UnitAssembler<F> {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_max_unit_bytes(MAX_UNIT_BYTES)
     }
 
+    #[must_use]
     pub fn with_max_unit_bytes(max_unit_bytes: usize) -> Self {
         UnitAssembler {
             expected: None,
@@ -925,22 +931,26 @@ pub mod testutil {
     pub const VPS: [u8; 6] = [0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
     pub const PPS: [u8; 5] = [0x44, 0x01, 0xC1, 0x72, 0xB4];
     /// An IDR_W_RADL slice (type 19), TID 0.
+    #[must_use]
     pub fn idr(body: &[u8]) -> Vec<u8> {
         let mut v = vec![19 << 1, 0x01];
         v.extend_from_slice(body);
         v
     }
     /// A TRAIL_R slice (type 1).
+    #[must_use]
     pub fn trail(body: &[u8]) -> Vec<u8> {
         let mut v = vec![1 << 1, 0x01];
         v.extend_from_slice(body);
         v
     }
     /// An SPS-typed NAL unit with an opaque body (use `sps::testutil` for a parseable one).
+    #[must_use]
     pub fn fake_sps() -> Vec<u8> {
         vec![0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90]
     }
 
+    #[must_use]
     pub fn ap(nals: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![NAL_AP << 1, 0x01];
         for n in nals {
@@ -951,6 +961,7 @@ pub mod testutil {
     }
 
     /// Splits `nal` (with its 2-byte header) into FU packets of at most `chunk` fragment bytes.
+    #[must_use]
     pub fn fu(nal: &[u8], chunk: usize) -> Vec<Vec<u8>> {
         let t = nal_type(nal[0]);
         let body = &nal[2..];
@@ -975,6 +986,7 @@ pub mod testutil {
             .collect()
     }
 
+    #[must_use]
     pub fn annexb(nals: &[&[u8]]) -> Vec<u8> {
         let mut v = Vec::new();
         for n in nals {
@@ -985,6 +997,7 @@ pub mod testutil {
     }
 
     /// A tiny RTP packet writer for the tests that go through the byte parser.
+    #[must_use]
     pub fn rtp_bytes(seq: u16, ts: u32, marker: bool, ssrc: u32, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![0x80, 100 | if marker { 0x80 } else { 0 }];
         v.extend_from_slice(&seq.to_be_bytes());

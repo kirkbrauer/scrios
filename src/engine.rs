@@ -53,6 +53,7 @@ pub enum ClockSource {
 }
 
 impl ClockSource {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ClockSource::Default => "default",
@@ -98,12 +99,14 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// For another codec: its depacketizer, its SPS and its RTP payload type.
+    #[must_use]
     pub fn for_codec(mut self, codec: CodecKind) -> Self {
         self.codec = codec;
         self.payload_type = codec.payload_type();
         self
     }
 
+    #[must_use]
     pub fn new(our_ssrc: u32) -> Self {
         EngineConfig {
             our_ssrc,
@@ -478,6 +481,7 @@ impl Engine {
 
     /// The earliest time something needs doing (an RTCP report, a held keyframe request, stats,
     /// the silence checks, the feedback timer).
+    #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         [
             self.limiter.deadline(),
@@ -499,6 +503,7 @@ impl Engine {
     }
 
     /// The port the device listens on for RTCP, once known.
+    #[must_use]
     pub fn rtcp_port(&self) -> Option<u16> {
         self.rtcp_port
     }
@@ -509,6 +514,7 @@ impl Engine {
     }
 
     /// The counters. Access units, bytes and keyframes are what the writer has written.
+    #[must_use]
     pub fn stats(&self) -> Stats {
         let w = self.queue.written();
         Stats {
@@ -524,12 +530,14 @@ impl Engine {
 
     /// The device's SSRC, once known.
     #[cfg(test)]
+    #[must_use]
     pub fn device_ssrc(&self) -> Option<u32> {
         self.device_ssrc
     }
 
     /// The RTP clock rate in use and where it comes from.
     #[cfg(test)]
+    #[must_use]
     pub fn clock(&self) -> (u32, ClockSource) {
         (self.clock_hz, self.clock_source)
     }
@@ -548,6 +556,7 @@ impl Engine {
     }
 
     /// One line for the log: the counters and what the depacketizer saw besides.
+    #[must_use]
     pub fn summary(&self) -> String {
         format!(
             "{:?}; late/duplicate packets {}, units ended without a marker bit {}, parameter sets seen: {}",

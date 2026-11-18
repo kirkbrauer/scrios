@@ -19,6 +19,7 @@ pub const NAL_STAP_A: u8 = 24;
 pub const NAL_FU_A: u8 = 28;
 
 /// The type of an H.264 NAL unit (or of an RTP payload's first byte): the low 5 bits.
+#[must_use]
 pub fn nal_type(byte0: u8) -> u8 {
     byte0 & 0x1f
 }
@@ -36,6 +37,7 @@ pub struct PayloadScan {
 }
 
 /// Reads one RTP payload as H.264. Never panics on short or odd input.
+#[must_use]
 pub fn scan_payload(payload: &[u8]) -> PayloadScan {
     let mut scan = PayloadScan::default();
     let Some(&b0) = payload.first() else {
@@ -100,11 +102,13 @@ pub struct AvcSps {
 
 impl AvcSps {
     /// The RFC 6381 codec string: `avc1.` and profile_idc, the constraint byte and level_idc in hex.
+    #[must_use]
     pub fn codec_string(&self) -> String {
         format!("avc1.{:02X}{:02X}{:02X}", self.profile_idc, self.constraint_flags, self.level_idc)
     }
 
     /// The constraint flags that are set, by name (`set0`..`set5`).
+    #[must_use]
     pub fn constraint_names(&self) -> String {
         // Flag `i` is bit `7 - i`: rotated left by `i` it is the top bit.
         let names: Vec<String> = (0..6u32)
@@ -521,6 +525,7 @@ pub fn add_bitstream_restriction(nal: &[u8]) -> Result<SpsRewrite, SpsError> {
 }
 
 /// The slice type of a slice NAL unit (types 1 and 5): the second `ue(v)` of its header, 0 to 9.
+#[must_use]
 pub fn slice_type(nal: &[u8]) -> Option<u32> {
     if !matches!(nal_type(*nal.first()?), 1 | 5) {
         return None;
@@ -534,6 +539,7 @@ pub fn slice_type(nal: &[u8]) -> Option<u32> {
 
 /// A B slice (slice_type 1 or 6) of a non-IDR picture: an IDR picture has only I slices (H.264 7.4.3),
 /// so a slice of NAL type 5 is never counted, whatever its header says.
+#[must_use]
 pub fn is_b_slice(nal: &[u8]) -> bool {
     nal.first().is_some_and(|&b| nal_type(b) == 1) && matches!(slice_type(nal), Some(1 | 6))
 }
@@ -610,6 +616,7 @@ pub struct BoxRef<'a> {
 
 /// The boxes of a sequence of boxes, up to the first one that is cut short or malformed. A size of 1
 /// means a 64-bit size follows, a size of 0 means the box runs to the end.
+#[must_use]
 pub fn boxes(mut buf: &[u8]) -> Vec<BoxRef<'_>> {
     let mut out = Vec::new();
     while let Some((&[s0, s1, s2, s3, k0, k1, k2, k3], after_header)) = buf.split_first_chunk::<8>() {
@@ -693,6 +700,7 @@ fn annexb_config(payload: &[u8]) -> Option<AvcConfig> {
 /// 4. SPS and PPS NAL units in Annex-B form.
 ///
 /// Returns `None` if none of them parses; the caller then takes the sets from the stream's own NAL units.
+#[must_use]
 pub fn find_avc_config(payload: &[u8]) -> Option<AvcConfig> {
     find_avc_boxes(payload)
         .or_else(|| {
@@ -737,6 +745,7 @@ pub mod testutil {
     pub const PPS: [u8; 4] = [0x68, 0xEE, 0x3C, 0x80];
 
     /// An IDR slice NAL unit (type 5).
+    #[must_use]
     pub fn idr(body: &[u8]) -> Vec<u8> {
         let mut v = vec![0x65];
         v.extend_from_slice(body);
@@ -744,6 +753,7 @@ pub mod testutil {
     }
 
     /// A non-IDR slice NAL unit (type 1).
+    #[must_use]
     pub fn slice(body: &[u8]) -> Vec<u8> {
         let mut v = vec![0x41];
         v.extend_from_slice(body);
@@ -751,6 +761,7 @@ pub mod testutil {
     }
 
     /// A STAP-A packet payload.
+    #[must_use]
     pub fn stap_a(nals: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![0x18];
         for n in nals {
@@ -761,6 +772,7 @@ pub mod testutil {
     }
 
     /// FU-A payloads of at most `chunk` fragment bytes for `nal` (header byte included).
+    #[must_use]
     pub fn fu_a(nal: &[u8], chunk: usize) -> Vec<Vec<u8>> {
         let (indicator, typ) = ((nal[0] & 0xE0) | 28, nal[0] & 0x1f);
         let parts: Vec<&[u8]> = nal[1..].chunks(chunk).collect();
@@ -784,6 +796,7 @@ pub mod testutil {
     }
 
     /// An `AVCDecoderConfigurationRecord`.
+    #[must_use]
     pub fn avcc_record(profile: u8, compat: u8, level: u8, sps: &[&[u8]], pps: &[&[u8]]) -> Vec<u8> {
         let mut r = vec![1, profile, compat, level, 0xFF, 0xE0 | u8::try_from(sps.len()).unwrap()];
         for s in sps {
@@ -799,6 +812,7 @@ pub mod testutil {
     }
 
     /// An ISO box: size, type, content.
+    #[must_use]
     pub fn make_box(kind: &[u8; 4], content: &[u8]) -> Vec<u8> {
         let mut b = u32::try_from(content.len() + 8).unwrap().to_be_bytes().to_vec();
         b.extend_from_slice(kind);
@@ -807,6 +821,7 @@ pub mod testutil {
     }
 
     /// An `avc1` box: the visual sample entry fields for a `width` x `height` picture, then the child boxes.
+    #[must_use]
     pub fn avc1_box(width: u16, height: u16, children: &[Vec<u8>]) -> Vec<u8> {
         let mut c = vec![0u8; 6]; // reserved
         c.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
@@ -860,11 +875,13 @@ pub mod testutil {
 
     impl VuiSpec {
         /// What the iPad's SPS has: the video signal type with full range and no colour description.
+        #[must_use]
         pub fn ipad() -> Self {
             VuiSpec { video_signal: Some((5, true, None)), ..VuiSpec::default() }
         }
 
         /// Everything there is, with an HRD of two CPBs for both kinds.
+        #[must_use]
         pub fn everything() -> Self {
             let hrd = HrdSpec {
                 cpb_cnt_minus1: 1,
@@ -982,6 +999,7 @@ pub mod testutil {
     }
 
     /// The restriction the rewrite adds, for a stream with `refs` reference frames.
+    #[must_use]
     pub fn added_restriction(refs: u32) -> Restriction {
         Restriction {
             motion_vectors_over_pic_boundaries: true,
@@ -1016,6 +1034,7 @@ pub mod testutil {
 
     impl AvcSpsSpec {
         /// Baseline, level 3.0, 640x480.
+        #[must_use]
         pub fn baseline_vga() -> Self {
             AvcSpsSpec {
                 sps_id: 0,
@@ -1036,6 +1055,7 @@ pub mod testutil {
         }
 
         /// High, level 4.0, 1920x1088 coded and cropped to 1080.
+        #[must_use]
         pub fn high_1080p() -> Self {
             AvcSpsSpec {
                 sps_id: 0,
@@ -1055,6 +1075,7 @@ pub mod testutil {
             }
         }
 
+        #[must_use]
         pub fn nal(&self) -> Vec<u8> {
             let mut w = BitWriter::default();
             w.ue(self.sps_id); // seq_parameter_set_id

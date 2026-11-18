@@ -23,6 +23,7 @@ pub struct KeyframeLimiter {
 }
 
 impl KeyframeLimiter {
+    #[must_use]
     pub fn new(min_interval: Duration) -> Self {
         KeyframeLimiter { min_interval, last_sent: None, pending: false }
     }
@@ -59,6 +60,7 @@ impl KeyframeLimiter {
     }
 
     /// When a coalesced request becomes due (None if nothing is waiting).
+    #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
         if !self.pending {
             return None;
@@ -72,6 +74,7 @@ impl KeyframeLimiter {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         self.pending
     }

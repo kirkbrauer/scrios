@@ -134,6 +134,7 @@ pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
     Ok(fields)
 }
 
+#[must_use]
 pub fn encode(fields: &[Field]) -> Vec<u8> {
     let mut out = Vec::new();
     for f in fields {

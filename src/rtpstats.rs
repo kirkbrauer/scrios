@@ -22,6 +22,7 @@ pub struct SenderReportInfo {
 }
 
 /// The first sender report in a (compound) RTCP datagram.
+#[must_use]
 pub fn parse_sender_report(buf: &[u8]) -> Option<SenderReportInfo> {
     let mut off = 0;
     while off + 4 <= buf.len() {
@@ -70,6 +71,7 @@ pub struct RtpStats {
 }
 
 impl RtpStats {
+    #[must_use]
     pub fn new(clock_hz: u32) -> Self {
         RtpStats {
             clock_hz: clock_hz.max(1),
@@ -147,15 +149,18 @@ impl RtpStats {
 
     /// The highest sequence number received, counted from the first one (low 16 bits).
     #[expect(clippy::cast_possible_truncation, reason = "the low 16 bits are what is asked for")]
+    #[must_use]
     pub fn highest_since_base(&self) -> u16 {
         self.extended_highest().wrapping_sub(self.base_seq) as u16
     }
 
+    #[must_use]
     pub fn received(&self) -> u32 {
         self.received
     }
 
     /// Extended highest sequence number received (cycles in the high 16 bits).
+    #[must_use]
     pub fn extended_highest(&self) -> u32 {
         self.cycles.wrapping_add(u32::from(self.max_seq))
     }
@@ -165,6 +170,7 @@ impl RtpStats {
     }
 
     /// Cumulative packets lost, clamped to the report's 24 bits (a negative count, from duplicates, is 0).
+    #[must_use]
     pub fn cumulative_lost(&self) -> u32 {
         let lost = i64::from(self.expected()) - i64::from(self.received);
         u32::try_from(lost.clamp(0, 0x00FF_FFFF)).unwrap_or(0) // in range: clamped
@@ -175,6 +181,7 @@ impl RtpStats {
         clippy::cast_sign_loss,
         reason = "the jitter is not negative, and a float-to-int `as` saturates"
     )]
+    #[must_use]
     pub fn jitter(&self) -> u32 {
         self.jitter as u32
     }

@@ -67,6 +67,7 @@ impl SpsInfo {
     /// The WebCodecs / RFC 6381 codec string (ISO/IEC 14496-15 annex E):
     /// `<prefix>.<space><profile_idc>.<compat flags, bit order reversed, hex>.<L|H><level_idc>.<constraint bytes, hex>`
     /// with the trailing zero constraint bytes left out (the first is always written).
+    #[must_use]
     pub fn codec_string(&self, prefix: &str) -> String {
         let space = match self.profile_space {
             1 => "A",
@@ -181,6 +182,7 @@ fn bit_mask(pos: usize) -> u8 {
 }
 
 /// Removes the emulation prevention bytes (`00 00 03` becomes `00 00`) from a NAL unit's payload.
+#[must_use]
 pub fn unescape_rbsp(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut zeros = 0u32;
@@ -246,6 +248,7 @@ impl BitWriter {
 }
 
 /// Inserts emulation prevention bytes: a `03` after any `00 00` followed by a byte <= 3.
+#[must_use]
 pub fn escape_rbsp(rbsp: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rbsp.len().saturating_add(8));
     let mut zeros = 0u32;
@@ -377,6 +380,7 @@ pub mod testutil {
 
     impl SpsSpec {
         /// Main profile, level 5.0, 4:2:0, the shape of the display stream's SPS.
+        #[must_use]
         pub fn main_l150(width: u32, height: u32) -> SpsSpec {
             SpsSpec {
                 profile_idc: 1,
@@ -395,6 +399,7 @@ pub mod testutil {
         }
 
         /// The NAL unit: header `42 01`, the escaped RBSP.
+        #[must_use]
         pub fn nal(&self) -> Vec<u8> {
             let mut w = BitWriter::default();
             w.u(4, 0); // sps_video_parameter_set_id
