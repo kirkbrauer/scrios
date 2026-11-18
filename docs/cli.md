@@ -243,8 +243,8 @@ has the overview; the details:
 * **Mouse** = finger 0, in pixels of the upright picture (the same `touch down|move|up` as the stdin commands). A press in
   the bars is ignored; a drag that leaves the picture sticks to its edge; losing the focus or a turn of the device lifts
   the finger.
-* **Edge margin** (`--edge-margin PIXELS`, default 24 logical pixels, 0 = none). The picture is inset from the window by a
-  band a little lighter than the bars. A press that starts in the band is **on the device's edge**: in the bottom band it
+* **Edge margin** (`--edge-margin PIXELS`, default 0 = none, so the window is the picture; 24 is a good band). The picture
+  is inset from the window by a band of that many logical pixels, a little lighter than the bars. A press that starts in the band is **on the device's edge**: in the bottom band it
   is the last row of the upright picture (the digitizer's own edge, 65535), in the top band row 0, in the side bands
   column 0 or the last column, with the other coordinate as aimed (a corner is the device's corner). The moves after the
   press map as usual and stay on the picture. So a drag from the top band is a top-edge swipe, and the window's own resize
@@ -252,8 +252,8 @@ has the overview; the details:
   short bar is drawn in it. The first window is the picture's size plus the band, and `--window-width`/`--window-height`
   are for the whole window. The band is never more than a sixth of the window's shorter side.
 * **The bottom swipe** (`--bottom-swipe keys|touch`, default `keys`). iOS ignores the swipe up from the home indicator as
-  injected touch, even at the exact edge, so with `keys` a press that starts in the bottom band or in the picture's lowest 3%
-  is **held back**: nothing is sent for it until it is decided.
+  injected touch, even at the exact edge, so with `keys` a press that starts in the picture's lowest 3% (at least 12 pixels
+  high; or in the bottom band, if there is a margin) is **held back**: nothing is sent for it until it is decided.
   * It rose by more than 8% of the upright height and went no further sideways than up, and the pointer then stopped for
     300 ms at some point before the button was released: **App Switcher** (`key app-switcher`); without that pause:
     **Home** (`key home`). No touch is ever sent for it. The title says "Home" or "App Switcher" for a moment.
@@ -261,7 +261,10 @@ has the overview; the details:
     (`touch down` at the edge, then `move`), followed live, up on release.
   * It ended without being either (a tap, a short drag): it is played as the touch it was, `touch down` at its start (the
     edge, for a press in the band) and `up` at its end after as long as the press lasted (at least 60 ms, at most 400).
-  Presses elsewhere are touch at once. `touch` sends the bottom drag as touch like any other.
+  Presses elsewhere are touch at once, which is what the App Switcher needs: a drag between its cards, a tap on a card, a
+  flick up on a card to close the app all start above the strip and are sent as they happen. A quick sideways drag along
+  the bottom edge (iOS's "previous app" gesture) is a sideways drag: touch, not the App Switcher. `touch` sends the bottom
+  drag as touch like any other.
 * **Keyboard.** A key goes down and up on the device (`kb down|up`, HID usage by the key's position) as it does on the
   host. Auto-repeat of the host is not forwarded. Losing the focus lifts every key.
 * **Shortcuts** with `MOD` = **Cmd** on macOS, **Alt** elsewhere; not sent to the device, and neither is the modifier or a

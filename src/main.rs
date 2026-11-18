@@ -318,7 +318,8 @@ struct ViewerArgs {
     #[arg(long)]
     show_stats: bool,
 
-    /// The margin round the picture, in logical pixels (0: none): a lighter band in which a press is on the device's edge,
+    /// The margin round the picture, in logical pixels (default 0: none; 24 is a good band): a lighter band in which a press
+    /// is on the device's edge,
     /// so that an edge swipe (the top one, say) can start there, away from the window's resize border. Cmd+G (Alt+G
     /// elsewhere) makes the bottom swipe
     #[arg(
@@ -1428,7 +1429,7 @@ mod tests {
         assert_eq!(viewer.window_title, "scrios");
         assert_eq!((viewer.window_width, viewer.window_height), (None, None));
         assert!(!viewer.show_stats && !viewer.lock_shortcut, "no lock shortcut, no overlay, unless asked for");
-        assert_eq!(viewer.edge_margin, 24, "an edge margin of 24 logical pixels");
+        assert_eq!(viewer.edge_margin, 0, "no edge margin unless asked for: the window is the picture");
         assert_eq!(viewer.bottom_swipe, BottomSwipeArg::Keys, "the bottom swipe is the Home button by default");
         assert_eq!(viewer.bottom_swipe.mode(), BottomSwipe::Keys);
         assert!(stream.control(), "touch and keys are on");

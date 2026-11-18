@@ -210,19 +210,26 @@ drawn; it does not include the device's encoder or the USB link).
 and `up` at the matching point of the device's screen. A drag that leaves the picture stays on its edge. One finger only
 (there is no multi-touch yet).
 
-**The edge margin.** The picture is inset from the window's edges by a band, 24 logical pixels wide, a little lighter than
-the black bars (`--edge-margin PIXELS`; 0 turns it off). A press that starts **in the band is on the device's edge**: in the
-top band it is the very top row of the screen, at the sides the very first or last column, with the position along the edge
-as you aimed (the Control Center swipe from the top right corner, for one). The window's own resize border, which is at the
-window's edge, is outside the band, so a drag from the picture's edge no longer resizes the window. The band does not cost
-the picture any size: the first window is as large as before, plus the band.
+**The edge margin** (off by default: the window is the picture). With `--edge-margin 24` the picture is inset from the
+window's edges by a band of that many logical pixels, a little lighter than the black bars. A press that starts **in the
+band is on the device's edge**: in the top band it is the very top row of the screen, at the sides the very first or last
+column, with the position along the edge as you aimed (the Control Center swipe from the top right corner, for one). The
+window's own resize border, which is at the window's edge, is outside the band, so a drag from the picture's edge does not
+resize the window. The first window is the picture's size plus the band. A short bar like iOS's home indicator shows in the
+bottom band while the pointer is in it.
 
 **The bottom swipe is the Home button.** iOS ignores the swipe up from the home indicator when it is injected as touch,
-even at the exact edge. So a drag that starts in the bottom band (or the lowest 3% of the picture) and goes up by more than
-8% of the screen's height is not sent as touch: when you let go, the device gets the **Home** button, or the **App Switcher**
-if you paused (about 300 ms) before letting go, as a swipe up and hold does on the phone. The window says which in its title
-("Home", "App Switcher") for a moment. A drag that is not that swipe (a tap near the bottom, a short or sideways drag) is sent
-as the touch it was. A short bar like iOS's home indicator shows in the bottom band while the pointer is in it.
+even at the exact edge. So a drag that starts in the lowest 3% of the picture (at least 12 pixels; or in the bottom band,
+if there is one) and goes up by more than 8% of the screen's height is not sent as touch:
+- when you let go the device gets the **Home** button;
+- if you stopped for about 300 ms before letting go (swipe up and **hold**) it gets the **App Switcher** instead, the
+  double Home press that `MOD+S` makes too. The window says which in its title ("Home", "App Switcher") for a moment.
+
+Everything else is touch, as it was, so the App Switcher itself works with the mouse: a drag between the cards, a tap on a
+card to open it, and a flick up on a card to close the app all start above the lowest strip and go through as they happen.
+Only a press in the strip is held back until it is decided; a tap there, a short drag and a sideways drag are sent as the
+touch they were. A quick sideways drag along the bottom edge (iOS's "previous app" gesture) is such a drag: it is not turned
+into the App Switcher, since a drag that is an app's own would be taken from it; use the hold or `MOD+S`.
 `--bottom-swipe touch` sends the bottom drag as touch like any other, for an iOS that accepts it.
 
 **Keyboard.** Keys are sent to the device as a hardware keyboard by their position (letters, digits, arrows, function
@@ -263,7 +270,7 @@ NV12 planes.
 | --- | --- |
 | `--window-title TITLE` | the window's title (default `scrios`) |
 | `--window-width PIXELS`, `--window-height PIXELS` | the first window is at most this wide / high (logical pixels) |
-| `--edge-margin PIXELS` | the margin round the picture, in which a press is on the device's edge (default 24; 0: none) |
+| `--edge-margin PIXELS` | a margin round the picture, in which a press is on the device's edge (default 0: none; 24 is a good band) |
 | `--bottom-swipe keys\|touch` | a drag up from the bottom edge is the Home button / App Switcher (`keys`, the default) or touch |
 | `--show-stats` | frame rate and delay in the title |
 | `--lock-shortcut` | `MOD+P` locks the device |

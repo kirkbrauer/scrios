@@ -142,6 +142,9 @@ pub fn letterbox(window: (u32, u32), upright: (u32, u32)) -> Option<Rect> {
     Some(Rect { x: ((ww - w) / 2.0).floor(), y: ((wh - h) / 2.0).floor(), w, h })
 }
 
+/// The least height, in physical pixels, of the picture's lowest strip where a swipe from the bottom edge may start.
+pub const MIN_BOTTOM_STRIP: f64 = 12.0;
+
 /// How the window is laid out: the picture letterboxed inside the window less a margin, and the margin around it.
 ///
 /// The **margin** is a band `margin` pixels wide on every side of the picture (drawn a little lighter than the bars).
@@ -227,11 +230,13 @@ impl Layout {
     }
 
     /// Whether a press at `at` is where a swipe up from the bottom edge starts: in the margin below the picture, or in the
-    /// picture's lowest `fraction` (the home indicator's own strip).
+    /// picture's lowest `fraction` (the home indicator's own strip), which is at least [`MIN_BOTTOM_STRIP`] pixels high
+    /// so that a small window has one.
     #[must_use]
     pub fn starts_bottom_swipe(&self, at: (f64, f64), fraction: f64) -> bool {
         let Some(p) = self.picture() else { return false };
-        self.in_bottom_margin(at) || (p.contains(at.0, at.1) && at.1 >= p.y + p.h * (1.0 - fraction))
+        let strip = (p.h * fraction).max(MIN_BOTTOM_STRIP);
+        self.in_bottom_margin(at) || (p.contains(at.0, at.1) && at.1 >= p.y + p.h - strip)
     }
 
     /// The hint that shows while the pointer is in the bottom margin: a short bar, like iOS's home indicator, in the
@@ -758,6 +763,12 @@ mod tests {
         assert!(!none.starts_bottom_swipe((250.0, 500.0), 0.03));
         assert!(none.starts_bottom_swipe((250.0, 995.0), 0.03));
         assert!(!Layout { window: (0, 0), ..l }.starts_bottom_swipe((1.0, 1.0), 0.03));
+        // A small window still has a strip of 12 pixels, though 3% of 300 is 9.
+        let small = Layout { window: (150, 300), upright: (1206, 2622), margin: 0 };
+        let p = small.picture().expect("a picture");
+        assert_eq!((p.y, p.h), (0.0, 300.0));
+        assert!(small.starts_bottom_swipe((75.0, 289.0), 0.03));
+        assert!(!small.starts_bottom_swipe((75.0, 287.0), 0.03));
     }
 
     #[test]

@@ -1287,4 +1287,145 @@ mod tests {
         m.pressed(margined(), (250.0, 500.0), ms(0));
         assert!(matches!(commands(&m.cancel()).as_slice(), [Command::Touch(Touch { phase: TouchPhase::Up, .. })]));
     }
+
+    // ---- the App Switcher, with no margin (the default: the window is the picture) ----------------------------------
+
+    /// A window that is just the picture: 438x952 for the 1206x2622 picture, with no margin. Its lowest 3% starts at y 923.4.
+    fn plain() -> Layout {
+        Layout { window: (438, 952), upright: (1206, 2622), margin: 0 }
+    }
+
+    /// Feeds a drag through a mouse: the press, the moves (time in ms, position), the release; everything it sent, in order.
+    fn drag(
+        m: &mut Mouse,
+        layout: Layout,
+        press: (u64, (f64, f64)),
+        moves: &[(u64, (f64, f64))],
+        release: (u64, (f64, f64)),
+    ) -> Vec<Action> {
+        let mut all = m.pressed(layout, press.1, ms(press.0));
+        for (t, at) in moves {
+            all.extend(m.moved(layout, *at, ms(*t)));
+        }
+        all.extend(m.released(layout, release.1, ms(release.0)));
+        all
+    }
+
+    #[test]
+    fn swipe_up_from_the_bottom_and_hold_opens_the_app_switcher_with_no_margin() {
+        let mut m = keys();
+        // Pressed on the picture's lowest strip (the home indicator's), up by 40% of the height over 200 ms, still for
+        // 500 ms, released.
+        let all = drag(
+            &mut m,
+            plain(),
+            (0, (219.0, 945.0)),
+            &[(50, (219.0, 800.0)), (100, (219.0, 650.0)), (150, (219.0, 570.0)), (200, (219.0, 560.0))],
+            (700, (219.0, 560.0)),
+        );
+        assert_eq!(commands(&all), vec![Command::Key(HwKey::AppSwitcher, Press::Short)]);
+        assert_eq!(notes(&all), vec!["App Switcher"]);
+        // The same quickly, no hold: Home.
+        let mut m = keys();
+        let all = drag(
+            &mut m,
+            plain(),
+            (0, (219.0, 945.0)),
+            &[(50, (219.0, 800.0)), (100, (219.0, 650.0))],
+            (110, (219.0, 650.0)),
+        );
+        assert_eq!(commands(&all), vec![Command::Key(HwKey::Home, Press::Short)]);
+        assert_eq!(notes(&all), vec!["Home"]);
+    }
+
+    #[test]
+    fn inside_the_app_switcher_a_flick_up_on_a_card_is_touch_all_the_way() {
+        // The cards are mid-screen: a flick up on one (to close the app) starts there, far above the lowest strip.
+        let mut m = keys();
+        let all = drag(
+            &mut m,
+            plain(),
+            (0, (219.0, 600.0)),
+            &[(8, (219.0, 560.0)), (16, (219.0, 500.0)), (24, (219.0, 420.0)), (32, (219.0, 300.0))],
+            (40, (219.0, 250.0)),
+        );
+        let cmds = commands(&all);
+        assert!(notes(&all).is_empty(), "no button was pressed");
+        assert!(cmds.iter().all(|c| matches!(c, Command::Touch(_))), "{cmds:?}");
+        let phases: Vec<TouchPhase> = cmds
+            .iter()
+            .map(|c| match c {
+                Command::Touch(t) => t.phase,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                TouchPhase::Down,
+                TouchPhase::Move,
+                TouchPhase::Move,
+                TouchPhase::Move,
+                TouchPhase::Move,
+                TouchPhase::Up
+            ]
+        );
+        // And it was sent as it happened: the down is the answer to the press itself, not held back.
+        let mut m = keys();
+        assert!(matches!(
+            commands(&m.pressed(plain(), (219.0, 600.0), ms(0))).as_slice(),
+            [Command::Touch(Touch { phase: TouchPhase::Down, .. })]
+        ));
+    }
+
+    #[test]
+    fn inside_the_app_switcher_sideways_swipes_and_taps_on_cards_are_touch() {
+        // Between cards: a drag across the middle of the screen.
+        let mut m = keys();
+        let all = drag(
+            &mut m,
+            plain(),
+            (0, (380.0, 480.0)),
+            &[(10, (300.0, 480.0)), (20, (150.0, 482.0))],
+            (30, (60.0, 482.0)),
+        );
+        assert!(commands(&all).iter().all(|c| matches!(c, Command::Touch(_))));
+        assert!(notes(&all).is_empty());
+        // A tap on a card (to open the app): a touch down and up at once.
+        let mut m = keys();
+        let all = drag(&mut m, plain(), (0, (219.0, 480.0)), &[], (70, (219.0, 480.0)));
+        let phases: Vec<TouchPhase> = commands(&all)
+            .iter()
+            .filter_map(|c| match c {
+                Command::Touch(t) => Some(t.phase),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(phases, vec![TouchPhase::Down, TouchPhase::Up]);
+    }
+
+    #[test]
+    fn a_tap_on_the_lowest_strip_and_a_sideways_drag_along_it_are_touch_and_the_switcher_is_not_opened() {
+        // A quick sideways drag along the bottom (iOS's switch-to-previous-app gesture) is a touch like any sideways drag:
+        // it is not turned into a button, so that a drag that is the app's own is not taken away.
+        let mut m = keys();
+        let all = drag(
+            &mut m,
+            plain(),
+            (0, (60.0, 945.0)),
+            &[(15, (200.0, 944.0)), (30, (380.0, 944.0))],
+            (40, (380.0, 944.0)),
+        );
+        let cmds = commands(&all);
+        assert!(notes(&all).is_empty());
+        assert!(matches!(cmds.first(), Some(Command::Touch(Touch { phase: TouchPhase::Down, .. }))), "{cmds:?}");
+        assert!(matches!(cmds.last(), Some(Command::Touch(Touch { phase: TouchPhase::Up, .. }))), "{cmds:?}");
+        assert!(!cmds.iter().any(|c| matches!(c, Command::Key(..))));
+        // Just above the strip (923.4) the press is touch at once, and a swipe up from there is a drag, not Home.
+        let mut m = keys();
+        assert!(!commands(&m.pressed(plain(), (219.0, 920.0), ms(0))).is_empty());
+        // Just inside the strip it is held back.
+        let mut m = keys();
+        assert!(m.pressed(plain(), (219.0, 925.0), ms(0)).is_empty());
+    }
 }

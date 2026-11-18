@@ -38,8 +38,9 @@ pub use pipeline::{Feed, Recorder};
 
 use pipeline::{Control, FrameSlot, Wake, decode_loop};
 
-/// The margin round the picture unless asked otherwise: wide enough to aim at with a mouse, narrow enough to be no loss.
-pub const DEFAULT_EDGE_MARGIN: u32 = 24;
+/// The margin round the picture unless asked otherwise: none (the window is the picture). `--edge-margin 24` is a band
+/// wide enough to aim at with a mouse, to start an edge swipe in.
+pub const DEFAULT_EDGE_MARGIN: u32 = 0;
 
 /// What the viewer is asked for.
 #[derive(Debug, Clone)]
