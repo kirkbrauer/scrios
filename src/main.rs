@@ -466,10 +466,13 @@ fn init_logging() {
 /// Takes stdout for the stream: the descriptor is duplicated and fd 1 is pointed at stderr,
 /// so a stray print anywhere in the process cannot corrupt the stream.
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "dup, dup2 and a File from the descriptor dup returned: no safe API does this")]
 fn take_stdout() -> std::io::Result<File> {
     use std::os::fd::FromRawFd;
-    // SAFETY: dup and dup2 on this process's own standard descriptors; the new descriptor is
-    // handed to exactly one File.
+    // SAFETY: `dup(1)` returns a new descriptor that nothing else owns, or -1, which is checked before it is used.
+    // `dup2(2, 1)` only points descriptor 1, which the process owns, at descriptor 2. `close` is called on the new
+    // descriptor once, on the path where it is not given to a `File`. `File::from_raw_fd` takes that open descriptor
+    // over exactly once, so it is closed exactly once (when the `File` is dropped).
     unsafe {
         let fd = libc::dup(1);
         if fd < 0 {
