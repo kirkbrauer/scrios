@@ -5,6 +5,8 @@
 #     (`host:port` or `TCP:host:port`), and --usbmuxd wins over $USBMUXD_SOCKET_ADDRESS;
 #   * a start-up failure (no usbmuxd at the given path, or no such UDID) in the framed format writes exactly one
 #     `error` control frame to stdout, logs to stderr, and exits 2; in the raw format stdout stays empty;
+#   * the device commands (`ddi-status`, `mount-ddi`, `unmount-ddi`) say what is missing (a device with no pair
+#     record in usbmuxd is "not trusted"), and a DDI download without its SHA-256 is refused;
 #   * options that do not go together are refused, with an `error` event in the framed format;
 #   * the video is never written to a terminal.
 # Runs the binary on this host, so give it one built for this host:
@@ -179,4 +181,20 @@ code=$?
 set -e
 [ "$code" -eq 2 ] || { echo "expected exit 2, got $code"; cat "$err"; exit 1; }
 one_error_frame "no device with UDID NOSUCHDEVICE (usbmuxd lists: 00008110-001234567890401E" > /dev/null
+
+# The device commands: the fake usbmuxd lists a device but holds no pair record for it, so it does not trust us.
+for cmd in ddi-status mount-ddi unmount-ddi; do
+  set +e
+  run $BIN $cmd --usbmuxd "$sock" 2> "$err"
+  code=$?
+  set -e
+  [ "$code" -eq 2 ] && grep -q "tap Trust" "$err" || { echo "scrios $cmd: expected exit 2 and the Trust hint, got $code"; cat "$err"; exit 1; }
+done
+echo "ok: the device commands say that the device does not trust this computer"
+set +e
+run $BIN mount-ddi --usbmuxd "$sock" --ddi-download-url https://example.com/ddi.tar.gz 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] && grep -q "SHA-256" "$err" || { echo "a download without a hash was not refused"; cat "$err"; exit 1; }
+echo "ok: a DDI download without its SHA-256 is refused"
 echo "smoke test passed"

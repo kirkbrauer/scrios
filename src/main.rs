@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod device_cmds;
+
+use device_cmds::{DdiArgs, TargetArgs};
 use scrios::codec::CodecKind;
 use scrios::commands::{Command, read_commands, supervised};
 use scrios::frame::Event;
@@ -111,7 +114,9 @@ default a raw Annex-B H.264 stream on stdout, which a player reads directly (`sc
 --record FILE records it as well, --output FILE writes it to a file instead of stdout, and --format framed is the \
 length-framed machine protocol (access units and JSON events) for programs. Touch and keys are sent to the \
 device through the commands on stdin (see below), unless --no-control. Logs go to stderr.\n\n\
-Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows.",
+Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows. \
+`scrios ddi-status`, `scrios mount-ddi` and `scrios unmount-ddi` manage the developer disk image that the display \
+service needs.",
     after_long_help = AFTER_HELP,
     args_conflicts_with_subcommands = true
 )]
@@ -134,6 +139,23 @@ enum Cmd {
     Stream(StreamArgs),
     /// List the devices usbmuxd knows: UDID and how each is connected
     List(ListArgs),
+    /// Show Developer Mode, the mounted developer disk image, and the image scrios would mount
+    DdiStatus(DdiCommandArgs),
+    /// Mount the developer disk image the display service needs (iOS 17 and later; needs internet for Apple's
+    /// signing server the first time after each restart of the device)
+    MountDdi(DdiCommandArgs),
+    /// Unmount the developer disk image
+    UnmountDdi(TargetArgs),
+}
+
+/// A device and the image folder for the commands that mount or look at the developer disk image.
+#[derive(Args, Debug)]
+struct DdiCommandArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+
+    #[command(flatten, next_help_heading = "Developer disk image")]
+    ddi: DdiArgs,
 }
 
 #[derive(Args, Debug)]
@@ -151,6 +173,9 @@ struct ListArgs {
 enum Action {
     List { usbmuxd: Option<String> },
     Stream(Box<StreamArgs>),
+    DdiStatus(DdiCommandArgs),
+    MountDdi(DdiCommandArgs),
+    UnmountDdi(TargetArgs),
 }
 
 impl Cli {
@@ -158,6 +183,9 @@ impl Cli {
         match self.command {
             Some(Cmd::List(l)) => Action::List { usbmuxd: l.usbmuxd },
             Some(Cmd::Stream(s)) => Action::Stream(Box::new(s)),
+            Some(Cmd::DdiStatus(a)) => Action::DdiStatus(a),
+            Some(Cmd::MountDdi(a)) => Action::MountDdi(a),
+            Some(Cmd::UnmountDdi(a)) => Action::UnmountDdi(a),
             None if self.list_devices => Action::List { usbmuxd: self.stream.usbmuxd },
             None => Action::Stream(Box::new(self.stream)),
         }
@@ -668,6 +696,9 @@ fn main() {
     let code = match cli.action() {
         Action::List { usbmuxd } => run_list(usbmuxd.as_deref()),
         Action::Stream(args) => run_stream(&args),
+        Action::DdiStatus(a) => device_cmds::run_ddi_status(&a.target, &a.ddi),
+        Action::MountDdi(a) => device_cmds::run_mount_ddi(&a.target, &a.ddi),
+        Action::UnmountDdi(target) => device_cmds::run_unmount_ddi(&target),
     };
     std::process::exit(code);
 }
@@ -681,7 +712,7 @@ mod tests {
         let command_line = std::iter::once("scrios").chain(args.iter().copied());
         match Cli::parse_from(command_line).action() {
             Action::Stream(a) => *a,
-            other @ Action::List { .. } => panic!("not a stream: {other:?}"),
+            other => panic!("not a stream: {other:?}"),
         }
     }
 
@@ -736,18 +767,18 @@ mod tests {
                 assert_eq!(a.udid.as_deref(), Some("U"));
                 assert_eq!(a.format(), Format::Framed);
             }
-            other @ Action::List { .. } => panic!("{other:?}"),
+            other => panic!("{other:?}"),
         }
         assert!(matches!(Cli::parse_from(["scrios", "list"]).action(), Action::List { usbmuxd: None }));
         match Cli::parse_from(["scrios", "list", "--usbmuxd", "127.0.0.1:27015"]).action() {
             Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("127.0.0.1:27015")),
-            other @ Action::Stream(_) => panic!("{other:?}"),
+            other => panic!("{other:?}"),
         }
         // --list-devices is `list` (and takes --usbmuxd).
         assert!(matches!(Cli::parse_from(["scrios", "--list-devices"]).action(), Action::List { usbmuxd: None }));
         match Cli::parse_from(["scrios", "--list-devices", "--usbmuxd", "/tmp/mux"]).action() {
             Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("/tmp/mux")),
-            other @ Action::Stream(_) => panic!("{other:?}"),
+            other => panic!("{other:?}"),
         }
         // The stream's options do not mix with a subcommand's position, and a stranger is refused.
         assert!(Cli::try_parse_from(["scrios", "--udid", "U", "list"]).is_err());

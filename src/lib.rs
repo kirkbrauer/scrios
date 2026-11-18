@@ -9,6 +9,8 @@
 //!   (`docs/protocol.md`), which is what the `scrios` binary does.
 //! * [`list`] lists the devices usbmuxd knows; [`mux`] is the address of the usbmuxd to ask (usbmuxd is the only way
 //!   scrios reaches a device).
+//! * [`preflight`], [`ddi`] and [`ops`] check what a device needs for the display service (it trusts this host,
+//!   the developer disk image is mounted) and mount the image.
 //!
 //! The `scrios` binary is a thin command line over these. The other modules are public too, so that other programs
 //! can use the pieces (depacketizers, SPS parsers, the HID controller, ...); their API is not stable yet (0.x).
@@ -16,6 +18,7 @@
 pub mod avc;
 pub mod codec;
 pub mod commands;
+pub mod ddi;
 pub mod depack;
 pub mod device;
 pub mod displayinfo;
@@ -26,7 +29,9 @@ pub mod keyframe;
 pub mod list;
 pub mod mux;
 pub mod offer;
+pub mod ops;
 pub mod outqueue;
+pub mod preflight;
 pub mod probe;
 pub mod rtpstats;
 pub mod session;
@@ -34,5 +39,7 @@ pub mod sink;
 pub mod sps;
 pub mod stream;
 
+#[cfg(test)]
+mod testdir;
 #[cfg(test)]
 mod testmux;

@@ -29,6 +29,10 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# One crate under a licence that is not in the list above: the Mozilla CA bundle that idevice's `tss` feature (the
+# Apple signing server request that mounting the developer disk image makes) uses for https. CDLA-Permissive-2.0 is
+# a permissive licence for data (attribution, no copyleft). It is allowed for this crate only.
+exceptions = [{ allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" }]
 
 [bans]
 multiple-versions = "allow"
