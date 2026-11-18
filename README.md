@@ -4,7 +4,7 @@
 the screen as **H.264** (or HEVC) and sends **touch, hardware keys and keyboard text** back to the device. Think of
 it as scrcpy, but for iOS devices: a small command-line program, and a Rust library to embed.
 
-- The video is plain Annex-B H.264/HEVC: write it to a file or pipe it into `ffplay`/`mpv`, or use the documented
+- The video is plain Annex-B H.264/HEVC: write it to a file or pipe it into `ffplay` (see [docs/cli.md](docs/cli.md) for the flags that keep it live), or use the documented
   framed mode (`--format framed`), with timestamps, key-unit markers and control events, for programs that consume
   it.
 - Control is a line protocol on standard input: touch down/move/up, keys (home, app switcher, lock, volume, …),
@@ -42,7 +42,8 @@ Built against **idevice 0.1.68** (pinned exactly; see [BUILD.md](BUILD.md#idevic
 
 ### Tested on
 
-The display stream and touch were tested, on an earlier build of scrios, with:
+The display stream and touch were tested, on an earlier build of scrios, with the devices below. This build (idevice
+0.1.68) has streamed and recorded an iPhone's screen on macOS; touch on it is not yet checked.
 
 - iPhone 16 Pro, iOS 27.2
 - iPad (iPad14,3), iOS 27.0.1
@@ -67,7 +68,7 @@ Cross-builds and static musl binaries: [BUILD.md](BUILD.md).
 
 ```
 scrios list                                          # the devices usbmuxd knows
-scrios --udid <UDID> --output - | ffplay -f h264 -   # watch it
+scrios --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch it
 scrios --record screen.h264                          # record raw H.264
 scrios --format framed                               # the machine protocol, for programs
 ```

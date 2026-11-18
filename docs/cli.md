@@ -23,15 +23,27 @@ UDID                       CONNECTION
 00008110-001234567890401E  usb
 ```
 
-Watch the screen. The default output is a raw Annex-B stream on standard output, which players read as it is:
+Watch the screen. The default output is a raw Annex-B stream on standard output. For live viewing with low latency,
+this `ffplay` command line is the one checked on a real iPhone (macOS, ffmpeg 9):
 
 ```
-scrios --udid 00008110-001234567890401E --output - | ffplay -f h264 -
-scrios | mpv --demuxer-lavf-format=h264 -
-scrios --video-codec h265 | ffplay -f hevc -
+scrios --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -window_title scrios -
 ```
 
-(`--udid` is not needed when exactly one device is connected, `--output -` is the default when standard output is a pipe or a file.)
+What each flag is for, because raw Annex-B has no timestamps and no container:
+
+| Flag | Why |
+| --- | --- |
+| `-framerate 60` | Without it ffplay paces the stream at the demuxer's 25 fps default and builds a backlog of seconds. Use the device's rate (60 for current iPhones and iPads). |
+| `-probesize 32` | Without it ffplay reads about 5 MB before it shows anything: seconds on a still screen. |
+| `-flags low_delay`, `-framedrop` | Show each picture as soon as it is decoded; drop late ones rather than fall behind. |
+| `-y 1000` | The window's height; a phone's screen is about 2,600 pixels tall. |
+
+**Do not add `-fflags nobuffer`**: with a raw H.264 pipe it makes ffplay decode nothing (ffmpeg 9.0.2: 0 frames, no
+window). The same applies to HEVC with `--video-codec h265` and `-f hevc`.
+
+(`--udid` is not needed when exactly one device is connected; `--output -` is the default when standard output is a pipe
+or a file.)
 
 Record to a file. A recording is a raw Annex-B stream, flushed picture by picture, so a recording that was cut short is
 playable up to the cut; `ffmpeg` wraps it in a container:
@@ -40,7 +52,7 @@ playable up to the cut; `ffmpeg` wraps it in a container:
 scrios --record screen.h264                          # Ctrl-C stops it
 ffplay -f h264 screen.h264
 ffmpeg -f h264 -i screen.h264 -c copy screen.mp4
-scrios --record screen.h264 --output - | ffplay -f h264 -     # watch and record
+scrios --record screen.h264 --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch and record
 ```
 
 For a program: the framed format, which also carries the events (the picture's size and orientation, statistics, what
