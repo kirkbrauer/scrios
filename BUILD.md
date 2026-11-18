@@ -5,7 +5,7 @@ is an **aarch64 Linux** ELF (it runs on a Raspberry Pi 5 with Debian bookworm; a
 Apple-silicon Mac builds it natively).
 
 ```
-./build.sh          # -> target/release/jumpstarter-ios-display
+./build.sh          # -> target/release/scrios
 ./test.sh           # cargo test, in the same container
 ./scripts/smoke.sh  # runs the built binary without a phone: --help, and a start-up failure
 ```
@@ -97,7 +97,7 @@ backend of the lockdown session with the phone; the `idevice-tools` build used t
 ## Output
 
 ```
-$ file target/release/jumpstarter-ios-display
+$ file target/release/scrios
 ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, ... for GNU/Linux 3.7.0, stripped
 ```
 
