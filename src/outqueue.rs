@@ -51,7 +51,9 @@ pub enum Pushed {
     Queued,
     /// The queue was full (or the unit too large): this many units were dropped, the offered one
     /// included. Everything queued before it is gone, so the stream needs a keyframe.
-    Overflow { dropped: usize },
+    Overflow {
+        dropped: usize,
+    },
     /// The queue is closed.
     Closed,
 }
@@ -107,8 +109,7 @@ impl OutQueue {
             return;
         }
         self.written_units.fetch_add(1, Ordering::Relaxed);
-        self.written_bytes
-            .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+        self.written_bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
         if frame.flags & crate::frame::FLAG_KEY != 0 {
             self.written_keyframes.fetch_add(1, Ordering::Relaxed);
         }
@@ -153,15 +154,11 @@ impl OutQueue {
         if q.closed {
             return false;
         }
-        if q.controls >= MAX_QUEUED_CONTROLS {
-            if let Some(i) = q
-                .items
-                .iter()
-                .position(|i| matches!(i, Item::Control { droppable: true, .. }))
-            {
-                q.items.remove(i);
-                q.controls -= 1;
-            }
+        if q.controls >= MAX_QUEUED_CONTROLS
+            && let Some(i) = q.items.iter().position(|i| matches!(i, Item::Control { droppable: true, .. }))
+        {
+            q.items.remove(i);
+            q.controls -= 1;
         }
         q.items.push_back(Item::Control { frame, droppable });
         q.controls += 1;
@@ -179,15 +176,11 @@ impl OutQueue {
         let len = frame.payload.len();
         if len > MAX_PAYLOAD {
             let dropped = q.drop_units();
-            return Pushed::Overflow {
-                dropped: dropped + 1,
-            };
+            return Pushed::Overflow { dropped: dropped + 1 };
         }
         if q.units >= self.max_units || q.unit_bytes + len > self.max_bytes {
             let dropped = q.drop_units();
-            return Pushed::Overflow {
-                dropped: dropped + 1,
-            };
+            return Pushed::Overflow { dropped: dropped + 1 };
         }
         q.units += 1;
         q.unit_bytes += len;
@@ -426,9 +419,7 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..200u32 {
                         if i % 7 == 0 {
-                            q.push_control(Frame::control(&Event::Error {
-                                message: format!("p{p} #{i}"),
-                            }));
+                            q.push_control(Frame::control(&Event::Error { message: format!("p{p} #{i}") }));
                         } else {
                             q.push_unit(Frame::unit(u64::from(i), false, false, vec![p; 1 + (i as usize % 90) * 100]));
                         }
@@ -456,11 +447,8 @@ mod tests {
         }
         // Within one producer, frames keep their order.
         for p in 0..4u8 {
-            let pts: Vec<u64> = frames
-                .iter()
-                .filter(|f| !f.is_control() && f.payload[0] == p)
-                .map(|f| f.pts_us)
-                .collect();
+            let pts: Vec<u64> =
+                frames.iter().filter(|f| !f.is_control() && f.payload[0] == p).map(|f| f.pts_us).collect();
             assert!(pts.windows(2).all(|w| w[0] < w[1]));
         }
     }

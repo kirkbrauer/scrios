@@ -1,13 +1,26 @@
 [package]
-name = "jumpstarter-ios-display"
+name = "scrios"
 version = "0.1.0"
 edition = "2024"
-description = "Streams an iPhone's screen (HEVC over RTP, CoreDevice displayservice) to stdout as length-framed Annex-B access units."
+rust-version = "1.87"
+description = "The screen of an iOS device as an H.264 or HEVC stream, with touch and keys, over Apple's CoreDevice display and HID services"
 license = "Apache-2.0"
+repository = "https://github.com/kirkbrauer/scrios"
+readme = "README.md"
+keywords = ["ios", "screen", "h264", "hevc", "coredevice"]
+categories = ["multimedia::video", "command-line-utilities"]
 publish = false
 
+[lib]
+name = "scrios"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scrios"
+path = "src/main.rs"
+
 [dependencies]
-# The CoreDevice display service, tunnel and usbmuxd client. Pinned by commit; see BUILD.md for
+# The CoreDevice display service, tunnel and usbmuxd client (MIT). Pinned by commit; see BUILD.md for
 # building against a local checkout when GitHub is not reachable.
 idevice = { git = "https://github.com/jkcoxson/idevice", rev = "2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132", default-features = false, features = [
   "aws-lc",

@@ -65,7 +65,7 @@ pub struct RtpStats {
     /// Interarrival jitter in RTP timestamp units.
     jitter: f64,
     epoch: Option<Instant>,
-    prev: Option<(f64, u32)>, // (arrival in timestamp units, RTP timestamp)
+    prev: Option<(f64, u32)>,        // (arrival in timestamp units, RTP timestamp)
     last_sr: Option<(u32, Instant)>, // (middle 32 bits of the NTP time, arrival)
 }
 
@@ -160,9 +160,7 @@ impl RtpStats {
     }
 
     fn expected(&self) -> u32 {
-        self.extended_highest()
-            .wrapping_sub(self.base_seq)
-            .wrapping_add(1)
+        self.extended_highest().wrapping_sub(self.base_seq).wrapping_add(1)
     }
 
     /// Cumulative packets lost, clamped to the report's 24 bits (a negative count, from duplicates, is 0).
@@ -324,11 +322,7 @@ mod tests {
         for i in 0..200u64 {
             let ts = (i * 500) as u32;
             let late = if i % 2 == 0 { 0 } else { 10_000 };
-            s.on_packet(
-                t0 + Duration::from_micros(i * 500 * 1_000_000 / 24_000 + late),
-                i as u16,
-                ts,
-            );
+            s.on_packet(t0 + Duration::from_micros(i * 500 * 1_000_000 / 24_000 + late), i as u16, ts);
         }
         // |D| alternates around 240 ticks; the filtered value converges near 240.
         assert!((200..=250).contains(&s.jitter()), "jitter {}", s.jitter());

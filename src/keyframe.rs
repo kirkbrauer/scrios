@@ -24,11 +24,7 @@ pub struct KeyframeLimiter {
 
 impl KeyframeLimiter {
     pub fn new(min_interval: Duration) -> Self {
-        KeyframeLimiter {
-            min_interval,
-            last_sent: None,
-            pending: false,
-        }
+        KeyframeLimiter { min_interval, last_sent: None, pending: false }
     }
 
     fn window_open(&self, now: Instant) -> bool {

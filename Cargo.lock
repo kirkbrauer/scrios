@@ -559,24 +559,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jumpstarter-ios-display"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "flate2",
- "idevice",
- "libc",
- "plist",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -939,6 +921,24 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scrios"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "flate2",
+ "idevice",
+ "libc",
+ "plist",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "serde"

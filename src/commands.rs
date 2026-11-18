@@ -86,7 +86,8 @@ pub enum Press {
 }
 
 impl Key {
-    pub const NAMES: &'static str = "home, app-switcher (or switcher), lock, power, sleep, volume-up, volume-down, mute, siri";
+    pub const NAMES: &'static str =
+        "home, app-switcher (or switcher), lock, power, sleep, volume-up, volume-down, mute, siri";
 
     pub fn from_name(name: &str) -> Option<Key> {
         Some(match name {
@@ -146,9 +147,7 @@ pub enum Parsed {
 const MAX_COORDINATE: f64 = 1_000_000.0;
 
 fn parse_coordinate(what: &str, s: &str) -> Result<f64, String> {
-    let v: f64 = s
-        .parse()
-        .map_err(|_| format!("{what} {s:?} is not a number"))?;
+    let v: f64 = s.parse().map_err(|_| format!("{what} {s:?} is not a number"))?;
     if !v.is_finite() || v.abs() > MAX_COORDINATE {
         return Err(format!("{what} {s:?} is out of range"));
     }
@@ -165,15 +164,8 @@ fn parse_touch(args: &[&str]) -> Result<Touch, String> {
         "up" => TouchPhase::Up,
         other => return Err(format!("touch phase {other:?} is not down, move or up")),
     };
-    let id: u32 = id
-        .parse()
-        .map_err(|_| format!("finger id {id:?} is not a number"))?;
-    Ok(Touch {
-        phase,
-        x: parse_coordinate("x", x)?,
-        y: parse_coordinate("y", y)?,
-        id,
-    })
+    let id: u32 = id.parse().map_err(|_| format!("finger id {id:?} is not a number"))?;
+    Ok(Touch { phase, x: parse_coordinate("x", x)?, y: parse_coordinate("y", y)?, id })
 }
 
 fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
@@ -183,14 +175,10 @@ fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
         [name, "long"] => (name, Press::Long),
         [_, other] => return Err(format!("key press {other:?} is not short or long")),
         _ => {
-            return Err(format!(
-                "usage: key <name> [short|long] (name is one of {})",
-                Key::NAMES
-            ));
+            return Err(format!("usage: key <name> [short|long] (name is one of {})", Key::NAMES));
         }
     };
-    let key = Key::from_name(name)
-        .ok_or_else(|| format!("unknown key {name:?} (one of {})", Key::NAMES))?;
+    let key = Key::from_name(name).ok_or_else(|| format!("unknown key {name:?} (one of {})", Key::NAMES))?;
     Ok((key, press))
 }
 
@@ -453,7 +441,9 @@ mod tests {
             assert!(matches!(touch(bad), Parsed::Bad(_)), "{bad}");
         }
         assert!(matches!(touch("key home forever"), Parsed::Bad(m) if m.contains("short or long")));
-        assert!(matches!(touch("key what"), Parsed::Bad(m) if m.contains("home") && m.contains("siri") && m.contains("app-switcher")));
+        assert!(
+            matches!(touch("key what"), Parsed::Bad(m) if m.contains("home") && m.contains("siri") && m.contains("app-switcher"))
+        );
     }
 
     #[test]
@@ -600,10 +590,7 @@ mod tests {
     #[tokio::test]
     async fn an_explicit_stop_then_more_input_still_ends_with_stop() {
         let v = run(b"keyframe\nstop\nkeyframe\n").await;
-        assert_eq!(
-            v,
-            vec![Command::Keyframe, Command::Stop, Command::Keyframe, Command::Stop]
-        );
+        assert_eq!(v, vec![Command::Keyframe, Command::Stop, Command::Keyframe, Command::Stop]);
     }
 
     #[tokio::test]
@@ -635,7 +622,7 @@ mod tests {
         assert_eq!(run(&input).await, vec![Command::Keyframe, Command::Stop]);
         // An overlong line that happens to start with a command word is still no command.
         let mut input = b"keyframe".to_vec();
-        input.extend(std::iter::repeat(b' ').take(70_000));
+        input.extend(std::iter::repeat_n(b' ', 70_000));
         input.extend_from_slice(b"\nstop\n");
         assert_eq!(run(&input).await, vec![Command::Stop, Command::Stop]);
     }

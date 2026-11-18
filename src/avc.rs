@@ -59,10 +59,10 @@ pub fn scan_payload(payload: &[u8]) -> PayloadScan {
         }
         NAL_FU_A => {
             // [FU indicator][FU header: S|E|R|type(5)][fragment]
-            if let Some(&fu) = payload.get(1) {
-                if fu & 0x80 != 0 {
-                    scan.nal_types.push(fu & 0x1f);
-                }
+            if let Some(&fu) = payload.get(1)
+                && fu & 0x80 != 0
+            {
+                scan.nal_types.push(fu & 0x1f);
             }
         }
         _ => {}
@@ -90,32 +90,20 @@ pub struct AvcSps {
 impl AvcSps {
     /// The RFC 6381 codec string: `avc1.` and profile_idc, the constraint byte and level_idc in hex.
     pub fn codec_string(&self) -> String {
-        format!(
-            "avc1.{:02X}{:02X}{:02X}",
-            self.profile_idc, self.constraint_flags, self.level_idc
-        )
+        format!("avc1.{:02X}{:02X}{:02X}", self.profile_idc, self.constraint_flags, self.level_idc)
     }
 
     /// The constraint flags that are set, by name (`set0`..`set5`).
     pub fn constraint_names(&self) -> String {
-        let names: Vec<String> = (0..6)
-            .filter(|i| self.constraint_flags & (0x80 >> i) != 0)
-            .map(|i| format!("set{i}"))
-            .collect();
-        if names.is_empty() {
-            "none".to_string()
-        } else {
-            names.join(" ")
-        }
+        let names: Vec<String> =
+            (0..6).filter(|i| self.constraint_flags & (0x80 >> i) != 0).map(|i| format!("set{i}")).collect();
+        if names.is_empty() { "none".to_string() } else { names.join(" ") }
     }
 }
 
 /// Profiles whose SPS carries the chroma format, bit depths and scaling matrices.
 fn has_chroma_info(profile_idc: u8) -> bool {
-    matches!(
-        profile_idc,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    )
+    matches!(profile_idc, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135)
 }
 
 fn skip_scaling_list(b: &mut Bits<'_>, size: usize) -> Result<(), SpsError> {
@@ -326,10 +314,7 @@ fn walk_sps(nal: &[u8], write: bool) -> Result<(u32, Option<Restriction>, Option
         return Err(SpsError::NotSps);
     }
     let rbsp = unescape_rbsp(&nal[1..]);
-    let mut c = Copier {
-        r: Bits::new(&rbsp),
-        w: write.then(BitWriter::default),
-    };
+    let mut c = Copier { r: Bits::new(&rbsp), w: write.then(BitWriter::default) };
     let profile_idc = c.u(8)?;
     c.u(8)?; // constraint flags
     c.u(8)?; // level_idc
@@ -595,10 +580,7 @@ pub fn boxes(mut buf: &[u8]) -> Vec<BoxRef<'_>> {
         if total < header as u64 || total > buf.len() as u64 {
             break;
         }
-        out.push(BoxRef {
-            kind,
-            content: &buf[header..total as usize],
-        });
+        out.push(BoxRef { kind, content: &buf[header..total as usize] });
         buf = &buf[total as usize..];
     }
     out
@@ -612,13 +594,8 @@ const VISUAL_SAMPLE_ENTRY_FIELDS: usize = 78;
 /// Reads an `avc1` box (as the content of its header: the visual sample entry fields, then child boxes)
 /// and returns the `avcC` record it holds.
 pub fn parse_avc1_content(content: &[u8]) -> Result<AvcConfig, String> {
-    let children = content
-        .get(VISUAL_SAMPLE_ENTRY_FIELDS..)
-        .ok_or("avc1 box is shorter than a visual sample entry")?;
-    let avcc = boxes(children)
-        .into_iter()
-        .find(|b| &b.kind == b"avcC")
-        .ok_or("avc1 box has no avcC child")?;
+    let children = content.get(VISUAL_SAMPLE_ENTRY_FIELDS..).ok_or("avc1 box is shorter than a visual sample entry")?;
+    let avcc = boxes(children).into_iter().find(|b| &b.kind == b"avcC").ok_or("avc1 box has no avcC child")?;
     parse_avcc(avcc.content)
 }
 
@@ -669,33 +646,24 @@ fn annexb_config(payload: &[u8]) -> Option<AvcConfig> {
 /// Returns `None` if none of them parses; the caller then takes the sets from the stream's own NAL units.
 pub fn find_avc_config(payload: &[u8]) -> Option<AvcConfig> {
     find_avc_boxes(payload)
-        .or_else(|| {
-            (0..=8usize.min(payload.len().saturating_sub(1)))
-                .find_map(|off| parse_avcc(&payload[off..]).ok())
-        })
+        .or_else(|| (0..=8usize.min(payload.len().saturating_sub(1))).find_map(|off| parse_avcc(&payload[off..]).ok()))
         .or_else(|| annexb_config(payload))
 }
 
 fn find_avc_boxes(payload: &[u8]) -> Option<AvcConfig> {
-    let find = |kind: &[u8; 4]| {
-        (4..payload.len().saturating_sub(3)).find_map(|i| (&payload[i..i + 4] == kind).then_some(i))
-    };
-    let box_at = |type_at: usize| -> Option<BoxRef<'_>> {
-        boxes(payload.get(type_at - 4..)?).into_iter().next()
-    };
-    if let Some(i) = find(b"avc1") {
-        if let Some(b) = box_at(i) {
-            if let Ok(cfg) = parse_avc1_content(b.content) {
-                return Some(cfg);
-            }
-        }
+    let find = |kind: &[u8; 4]| (4..payload.len().saturating_sub(3)).find(|&i| &payload[i..i + 4] == kind);
+    let box_at = |type_at: usize| -> Option<BoxRef<'_>> { boxes(payload.get(type_at - 4..)?).into_iter().next() };
+    if let Some(i) = find(b"avc1")
+        && let Some(b) = box_at(i)
+        && let Ok(cfg) = parse_avc1_content(b.content)
+    {
+        return Some(cfg);
     }
-    if let Some(i) = find(b"avcC") {
-        if let Some(b) = box_at(i) {
-            if let Ok(cfg) = parse_avcc(b.content) {
-                return Some(cfg);
-            }
-        }
+    if let Some(i) = find(b"avcC")
+        && let Some(b) = box_at(i)
+        && let Ok(cfg) = parse_avcc(b.content)
+    {
+        return Some(cfg);
     }
     None
 }
@@ -811,6 +779,7 @@ pub mod testutil {
     }
 
     /// The VUI of an SPS, field by field.
+    #[allow(clippy::type_complexity)]
     #[derive(Clone, Default)]
     pub struct VuiSpec {
         /// aspect_ratio_idc, and the SAR for 255.
@@ -831,10 +800,7 @@ pub mod testutil {
     impl VuiSpec {
         /// What the iPad's SPS has: the video signal type with full range and no colour description.
         pub fn ipad() -> Self {
-            VuiSpec {
-                video_signal: Some((5, true, None)),
-                ..VuiSpec::default()
-            }
+            VuiSpec { video_signal: Some((5, true, None)), ..VuiSpec::default() }
         }
 
         /// Everything there is, with an HRD of two CPBs for both kinds.
@@ -1195,7 +1161,7 @@ mod tests {
         assert!(parse_avc_sps(&nal[..6]).is_err());
         for fill in 0..=255u8 {
             let mut v = vec![0x67, 100, 0, 40];
-            v.extend(std::iter::repeat(fill).take(24));
+            v.extend(std::iter::repeat_n(fill, 24));
             let _ = parse_avc_sps(&v);
         }
     }
@@ -1431,7 +1397,7 @@ mod tests {
         assert!(add_bitstream_restriction(&bad).is_err());
         for fill in 0..=255u8 {
             let mut v = vec![0x67, 100, 0, 40];
-            v.extend(std::iter::repeat(fill).take(30));
+            v.extend(std::iter::repeat_n(fill, 30));
             let _ = add_bitstream_restriction(&v);
         }
     }
@@ -1448,7 +1414,18 @@ mod tests {
             n.extend_from_slice(&crate::sps::testutil::escape_rbsp(&w.finish()));
             n
         };
-        for (t, b) in [(0, false), (1, true), (2, false), (3, false), (4, false), (5, false), (6, true), (7, false), (8, false), (9, false)] {
+        for (t, b) in [
+            (0, false),
+            (1, true),
+            (2, false),
+            (3, false),
+            (4, false),
+            (5, false),
+            (6, true),
+            (7, false),
+            (8, false),
+            (9, false),
+        ] {
             assert_eq!(slice_type(&slice_nal(0x41, t)), Some(t));
             assert_eq!(is_b_slice(&slice_nal(0x41, t)), b, "slice_type {t} in a non-IDR slice");
             assert!(!is_b_slice(&slice_nal(0x65, t)), "an IDR slice is never a B slice (slice_type {t})");
@@ -1545,7 +1522,7 @@ mod tests {
         let avcc = make_box(b"avcC", &avcc_record(66, 0xC0, 30, &[&sps], &[&PPS]));
         // The packet seen on an iPad: 92 e6 c0 a3, then an `avc1` box.
         let mut packet = vec![0x92, 0xE6, 0xC0, 0xA3];
-        packet.extend_from_slice(&avc1_box(640, 480, &[avcc.clone()]));
+        packet.extend_from_slice(&avc1_box(640, 480, std::slice::from_ref(&avcc)));
         let cfg = find_avc_config(&packet).unwrap();
         assert_eq!(cfg.sps, vec![sps.clone()]);
         assert_eq!(cfg.pps, vec![PPS.to_vec()]);

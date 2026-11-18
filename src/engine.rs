@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use idevice::core_device::{
-    ReportBlock, RtpPacket, build_frame_ack, build_keyframe_request, build_liveness, build_rctl,
-    is_rtcp,
+    ReportBlock, RtpPacket, build_frame_ack, build_keyframe_request, build_liveness, build_rctl, is_rtcp,
 };
 use tracing::{debug, info, warn};
 
@@ -104,7 +103,7 @@ impl EngineConfig {
     pub fn new(our_ssrc: u32) -> Self {
         EngineConfig {
             our_ssrc,
-            cname: format!("{our_ssrc:08x}@jumpstarter-ios-display"),
+            cname: format!("{our_ssrc:08x}@scrios"),
             codec: CodecKind::Hevc,
             payload_type: PAYLOAD_TYPE,
             clock_hz: DEFAULT_CLOCK_HZ,
@@ -164,14 +163,7 @@ struct PtsClock {
 
 impl PtsClock {
     fn new(hz: u32) -> Self {
-        PtsClock {
-            hz: u64::from(hz.max(1)),
-            anchor_us: 0,
-            ticks: 0,
-            last: 0,
-            started: false,
-            last_pts: 0,
-        }
+        PtsClock { hz: u64::from(hz.max(1)), anchor_us: 0, ticks: 0, last: 0, started: false, last_pts: 0 }
     }
 
     fn pts_us(&mut self, timestamp: u32) -> u64 {
@@ -214,11 +206,7 @@ struct Throttle {
 
 impl Throttle {
     fn new(every: Duration) -> Self {
-        Throttle {
-            every,
-            last: None,
-            held: 0,
-        }
+        Throttle { every, last: None, held: 0 }
     }
 
     /// `Some(n)`: log now (n earlier occurrences were suppressed); `None`: stay quiet.
@@ -249,10 +237,8 @@ fn clock_correction(current: u32, measured: f64) -> Option<u32> {
     let nearest = CLOCK_CANDIDATES
         .into_iter()
         .min_by(|a, b| {
-            let (da, db) = (
-                (measured - f64::from(*a)).abs() / f64::from(*a),
-                (measured - f64::from(*b)).abs() / f64::from(*b),
-            );
+            let (da, db) =
+                ((measured - f64::from(*a)).abs() / f64::from(*a), (measured - f64::from(*b)).abs() / f64::from(*b));
             da.total_cmp(&db)
         })
         .expect("two candidates");
@@ -378,11 +364,7 @@ impl Engine {
 
         let mut out = Vec::new();
         self.asm.push(
-            PacketMeta {
-                seq: pkt.sequence_number,
-                timestamp: pkt.timestamp,
-                marker: pkt.marker,
-            },
+            PacketMeta { seq: pkt.sequence_number, timestamp: pkt.timestamp, marker: pkt.marker },
             pkt.payload,
             &mut out,
         );
@@ -410,14 +392,13 @@ impl Engine {
             self.next_rctl = Some(now + RCTL_INTERVAL);
             self.send_rctl(now);
         }
-        if let Some(interval) = self.cfg.stats_interval {
-            if self.next_stats.is_some_and(|t| now >= t) {
-                self.next_stats = Some(now + interval);
-                let s = self.stats();
-                debug!("stats: {}", self.summary());
-                self.queue
-                    .push_droppable_control(Frame::control(&Event::Stats(s)));
-            }
+        if let Some(interval) = self.cfg.stats_interval
+            && self.next_stats.is_some_and(|t| now >= t)
+        {
+            self.next_stats = Some(now + interval);
+            let s = self.stats();
+            debug!("stats: {}", self.summary());
+            self.queue.push_droppable_control(Frame::control(&Event::Stats(s)));
         }
 
         // RTP has stopped (sender reports may still come): ask for a keyframe, then give up.
@@ -431,10 +412,7 @@ impl Engine {
             let rtp_silent = now.saturating_duration_since(self.last_rtp);
             let silent = now.saturating_duration_since(self.last_rx);
             if self.cfg.rtp_stall_timeout.is_some_and(|d| rtp_silent >= d) {
-                self.fatal = Some(format!(
-                    "no RTP media from the device for {} s",
-                    rtp_silent.as_secs()
-                ));
+                self.fatal = Some(format!("no RTP media from the device for {} s", rtp_silent.as_secs()));
             } else if silent >= self.cfg.no_data_timeout {
                 self.fatal = Some(format!("no data from the device for {} s", silent.as_secs()));
             }
@@ -444,9 +422,7 @@ impl Engine {
     // ---- outputs ------------------------------------------------------------------------------
 
     fn stall_keyframe_at(&self) -> Option<Instant> {
-        self.cfg
-            .rtp_stall_keyframe
-            .map(|d| (self.last_rtp + d).max(self.stall_kf_rearm))
+        self.cfg.rtp_stall_keyframe.map(|d| (self.last_rtp + d).max(self.stall_kf_rearm))
     }
 
     /// The earliest time something needs doing (an RTCP report, a held keyframe request, stats,
@@ -510,13 +486,7 @@ impl Engine {
     /// The picture as the last `config` event described it (for mapping touches).
     pub fn view(&self) -> Option<crate::hid::View> {
         match &self.last_config {
-            Some(Event::Config {
-                width,
-                height,
-                rotation,
-                native_orientation,
-                ..
-            }) => Some(crate::hid::View {
+            Some(Event::Config { width, height, rotation, native_orientation, .. }) => Some(crate::hid::View {
                 width: *width,
                 height: *height,
                 rotation: rotation.unwrap_or(0),
@@ -564,7 +534,7 @@ impl Engine {
         };
         let elapsed = sr.ntp_secs - ntp0;
         if !(1.0..=120.0).contains(&elapsed) {
-            if elapsed > 120.0 || elapsed < 0.0 {
+            if !(0.0..=120.0).contains(&elapsed) {
                 self.first_sr = Some((sr.ntp_secs, sr.rtp_timestamp));
             }
             return; // too close together to measure, or too far apart to trust
@@ -660,8 +630,7 @@ impl Engine {
                 if self.cfg.device_hub_feedback {
                     // A frame arrived whole: acknowledge it, as Device Hub does.
                     self.frames_received = self.frames_received.wrapping_add(1);
-                    self.outbox
-                        .push(build_frame_ack(self.cfg.our_ssrc, au.timestamp));
+                    self.outbox.push(build_frame_ack(self.cfg.our_ssrc, au.timestamp));
                     self.counters.rtcp += 1;
                 }
                 self.handle_unit(now, au);
@@ -679,14 +648,12 @@ impl Engine {
 
         if let Some(sps) = &au.sps {
             let known = self.announced.as_ref().is_some_and(|(s, _)| s == sps);
-            if !known {
-                if let Err(e) = self.announce(sps) {
-                    warn!("dropping a keyframe: {e}");
-                    self.counters.dropped_units += 1;
-                    self.need_key = true;
-                    self.request_keyframe(now);
-                    return;
-                }
+            if !known && let Err(e) = self.announce(sps) {
+                warn!("dropping a keyframe: {e}");
+                self.counters.dropped_units += 1;
+                self.need_key = true;
+                self.request_keyframe(now);
+                return;
             }
         }
         if self.announced.is_none() {
@@ -699,10 +666,7 @@ impl Engine {
 
         let key = au.key;
         let pts = self.pts.pts_us(au.timestamp);
-        match self
-            .queue
-            .push_unit(Frame::unit(pts, key, au.params, au.payload))
-        {
+        match self.queue.push_unit(Frame::unit(pts, key, au.params, au.payload)) {
             Pushed::Queued => {
                 if key {
                     self.need_key = false;
@@ -722,11 +686,7 @@ impl Engine {
 
     /// Parses the SPS and sends the `config` control frame.
     fn announce(&mut self, sps_nal: &[u8]) -> Result<(), String> {
-        let sps = self
-            .cfg
-            .codec
-            .describe_sps(sps_nal)
-            .map_err(|e| format!("{e} (SPS bytes: {})", hex(sps_nal)))?;
+        let sps = self.cfg.codec.describe_sps(sps_nal).map_err(|e| format!("{e} (SPS bytes: {})", hex(sps_nal)))?;
         let changed = self.announced.is_some();
         self.announced = Some((sps_nal.to_vec(), sps));
         // The SPS changed: the display probably turned. Ask again (the first query was made at start).
@@ -768,11 +728,7 @@ impl Engine {
             Err(e) => {
                 warn!(
                     "display info unavailable ({e}); the picture size is {}",
-                    if self.cfg.visible_size.is_some() {
-                        "--visible-size"
-                    } else {
-                        "the SPS size"
-                    }
+                    if self.cfg.visible_size.is_some() { "--visible-size" } else { "the SPS size" }
                 );
                 return;
             }
@@ -788,16 +744,9 @@ impl Engine {
         };
         let codec = sps.codec.clone();
         // `--visible-size`, else the display's own size, else the SPS (its cropping).
-        let (width, height) = self
-            .cfg
-            .visible_size
-            .or(self.display.as_ref().map(|d| d.size))
-            .unwrap_or(sps.visible);
+        let (width, height) = self.cfg.visible_size.or(self.display.as_ref().map(|d| d.size)).unwrap_or(sps.visible);
         if width > sps.coded.0 || height > sps.coded.1 {
-            warn!(
-                "the visible size {width}x{height} is larger than the coded size {}x{}",
-                sps.coded.0, sps.coded.1
-            );
+            warn!("the visible size {width}x{height} is larger than the coded size {}x{}", sps.coded.0, sps.coded.1);
         }
         info!(
             "stream config: {codec}, coded {}x{}, visible {width}x{height}, {} fps, clock {} Hz ({})",
@@ -820,14 +769,8 @@ impl Engine {
             device_ssrc: self.device_ssrc.unwrap_or(0),
             rotation: self.display.as_ref().and_then(|d| d.rotation),
             point_scale: self.display.as_ref().and_then(|d| d.point_scale),
-            current_orientation: self
-                .display
-                .as_ref()
-                .and_then(|d| d.current_orientation.clone()),
-            native_orientation: self
-                .display
-                .as_ref()
-                .and_then(|d| d.native_orientation.clone()),
+            current_orientation: self.display.as_ref().and_then(|d| d.current_orientation.clone()),
+            native_orientation: self.display.as_ref().and_then(|d| d.native_orientation.clone()),
         };
         if !force && self.last_config.as_ref() == Some(&event) {
             return;
@@ -857,13 +800,7 @@ impl Engine {
             return;
         };
         let blocks = self.report_blocks(now);
-        let pkt = build_keyframe_request(
-            self.cfg.our_ssrc,
-            &self.cfg.cname,
-            media_ssrc,
-            &blocks,
-            self.fir_seq,
-        );
+        let pkt = build_keyframe_request(self.cfg.our_ssrc, &self.cfg.cname, media_ssrc, &blocks, self.fir_seq);
         self.fir_seq = self.fir_seq.wrapping_add(1);
         self.outbox.push(pkt);
         self.counters.plis += 1;
@@ -880,8 +817,7 @@ impl Engine {
             return;
         }
         let blocks = self.report_blocks(now);
-        self.outbox
-            .push(build_liveness(self.cfg.our_ssrc, &self.cfg.cname, &blocks));
+        self.outbox.push(build_liveness(self.cfg.our_ssrc, &self.cfg.cname, &blocks));
         self.counters.rtcp += 1;
     }
 
@@ -891,12 +827,7 @@ impl Engine {
             return;
         }
         let clock_ms = now.saturating_duration_since(self.started_at).as_millis() as u16;
-        self.outbox.push(build_rctl(
-            self.cfg.our_ssrc,
-            clock_ms,
-            self.frames_received,
-            self.rtp.highest_since_base(),
-        ));
+        self.outbox.push(build_rctl(self.cfg.our_ssrc, clock_ms, self.frames_received, self.rtp.highest_since_base()));
         self.counters.rtcp += 1;
     }
 
@@ -978,13 +909,7 @@ mod tests {
             let mut cfg = EngineConfig::new(OUR);
             f(&mut cfg);
             let t0 = Instant::now();
-            Rig {
-                eng: Engine::new(cfg, q.clone(), t0),
-                q,
-                t0,
-                seq: 100,
-                ts: 90_000,
-            }
+            Rig { eng: Engine::new(cfg, q.clone(), t0), q, t0, seq: 100, ts: 90_000 }
         }
 
         fn at(&self, ms: u64) -> Instant {
@@ -1334,7 +1259,7 @@ mod tests {
         assert_eq!(&sdes[4..8], &OUR.to_be_bytes());
         assert_eq!(sdes[8], 1, "CNAME item");
         let n = usize::from(sdes[9]);
-        assert_eq!(&sdes[10..10 + n], format!("{OUR:08x}@jumpstarter-ios-display").as_bytes());
+        assert_eq!(&sdes[10..10 + n], format!("{OUR:08x}@scrios").as_bytes());
         assert_eq!(sdes[10 + n], 0, "end of items");
 
         // And again an interval later, not before.
@@ -1814,7 +1739,9 @@ mod tests {
 
     mod h264 {
         use super::*;
-        use crate::avc::testutil::{AvcSpsSpec, PPS as PPS264, avc1_box, avcc_record, fu_a, idr as idr264, make_box, slice, stap_a};
+        use crate::avc::testutil::{
+            AvcSpsSpec, PPS as PPS264, avc1_box, avcc_record, fu_a, idr as idr264, make_box, slice, stap_a,
+        };
 
         const PT: u8 = 123;
 

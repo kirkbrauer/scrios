@@ -99,11 +99,7 @@ pub enum Item<'a> {
     Nal(&'a [u8]),
     /// A fragment of a NAL unit. `start` is set on the first one (it carries the rebuilt NAL header
     /// and the type); `end` on the last.
-    Fragment {
-        start: Option<FragmentStart>,
-        fragment: &'a [u8],
-        end: bool,
-    },
+    Fragment { start: Option<FragmentStart>, fragment: &'a [u8], end: bool },
     /// Parameter sets from a configuration packet, as (index in the format's parameter-set list, NAL unit).
     Config(Vec<(usize, Vec<u8>)>),
     /// The payload cannot be parsed: the unit is dropped.
@@ -404,7 +400,7 @@ impl NalFormat for H264 {
                 });
             }
             25..=27 | 29 => out.push(Item::Malformed), // interleaved packetization: not supported
-            _ => out.push(Item::Ignore),                // reserved
+            _ => out.push(Item::Ignore),               // reserved
         }
     }
 }
@@ -631,10 +627,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             Item::Config(sets) => {
                 if let Some(cur) = self.cur.as_mut() {
                     for (i, nal) in sets {
-                        let nal = F::PARAM_TYPES
-                            .get(i)
-                            .and_then(|t| F::transform_nal(*t, &nal))
-                            .unwrap_or(nal);
+                        let nal = F::PARAM_TYPES.get(i).and_then(|t| F::transform_nal(*t, &nal)).unwrap_or(nal);
                         if let Some(slot) = cur.params.get_mut(i) {
                             *slot = Some(nal);
                         }
@@ -672,11 +665,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             let at = cur.buf.len();
             cur.buf.extend_from_slice(&s.header[..s.header_len]);
             cur.buf.extend_from_slice(fragment);
-            cur.nals.push(NalRef {
-                start: at,
-                end: 0,
-                typ: s.typ,
-            });
+            cur.nals.push(NalRef { start: at, end: 0, typ: s.typ });
             cur.fu_open = true;
         } else if cur.fu_open {
             cur.buf.extend_from_slice(fragment);
@@ -733,11 +722,7 @@ impl<F: NalFormat> UnitAssembler<F> {
         cur.buf.extend_from_slice(&START_CODE);
         let start = cur.buf.len();
         cur.buf.extend_from_slice(nal);
-        cur.nals.push(NalRef {
-            start,
-            end: cur.buf.len(),
-            typ,
-        });
+        cur.nals.push(NalRef { start, end: cur.buf.len(), typ });
         if let Some(i) = F::PARAM_TYPES.iter().position(|p| *p == typ) {
             cur.params[i] = Some(nal.to_vec());
         }
@@ -750,10 +735,7 @@ impl<F: NalFormat> UnitAssembler<F> {
             b.mark(DropReason::Malformed); // ended in the middle of a fragmented NAL unit
         }
         if let Some(reason) = b.broken {
-            out.push(Output::Dropped {
-                timestamp: b.ts,
-                reason,
-            });
+            out.push(Output::Dropped { timestamp: b.ts, reason });
             return;
         }
         // The unit is whole: what parameter sets it carried are good.
@@ -777,17 +759,9 @@ impl<F: NalFormat> UnitAssembler<F> {
     fn build_unit(&self, b: Building) -> Result<AccessUnit, (u32, DropReason)> {
         let is_param = |t: u8| F::PARAM_TYPES.contains(&t);
         let key = b.nals.iter().any(|n| F::is_key(n.typ));
-        let carries_all = F::PARAM_TYPES
-            .iter()
-            .all(|t| b.nals.iter().any(|n| n.typ == *t));
+        let carries_all = F::PARAM_TYPES.iter().all(|t| b.nals.iter().any(|n| n.typ == *t));
 
-        let plain = |b: Building| AccessUnit {
-            timestamp: b.ts,
-            key: false,
-            params: false,
-            payload: b.buf,
-            sps: None,
-        };
+        let plain = |b: Building| AccessUnit { timestamp: b.ts, key: false, params: false, payload: b.buf, sps: None };
         if !key && !carries_all {
             return Ok(plain(b));
         }
@@ -804,22 +778,14 @@ impl<F: NalFormat> UnitAssembler<F> {
         let aud = usize::from(b.nals.first().is_some_and(|n| n.typ == F::AUD));
         let n_params = F::PARAM_TYPES.len();
         let already_first = b.nals.len() >= aud + n_params
-            && F::PARAM_TYPES
-                .iter()
-                .enumerate()
-                .all(|(i, t)| b.nals[aud + i].typ == *t)
+            && F::PARAM_TYPES.iter().enumerate().all(|(i, t)| b.nals[aud + i].typ == *t)
             && !b.nals[aud + n_params..].iter().any(|n| is_param(n.typ));
         let payload = if already_first {
             b.buf
         } else {
             let rest = |i: &usize, n: &&NalRef| *i >= aud && !is_param(n.typ);
-            let rest_len: usize = b
-                .nals
-                .iter()
-                .enumerate()
-                .filter(|(i, n)| rest(i, n))
-                .map(|(_, n)| 4 + n.end - n.start)
-                .sum();
+            let rest_len: usize =
+                b.nals.iter().enumerate().filter(|(i, n)| rest(i, n)).map(|(_, n)| 4 + n.end - n.start).sum();
             let aud_len = if aud == 1 { 4 + b.nals[0].end - b.nals[0].start } else { 0 };
             let sets_len: usize = sets.iter().map(|s| 4 + s.len()).sum();
             let mut p = Vec::with_capacity(sets_len + rest_len + aud_len);
@@ -840,13 +806,7 @@ impl<F: NalFormat> UnitAssembler<F> {
         if payload.len() > crate::frame::MAX_PAYLOAD {
             return Err((b.ts, DropReason::TooLarge));
         }
-        Ok(AccessUnit {
-            timestamp: b.ts,
-            key,
-            params: true,
-            payload,
-            sps: Some(sets[F::SPS_INDEX].clone()),
-        })
+        Ok(AccessUnit { timestamp: b.ts, key, params: true, payload, sps: Some(sets[F::SPS_INDEX].clone()) })
     }
 }
 
@@ -958,11 +918,7 @@ mod tests {
     use super::*;
 
     fn meta(seq: u16, ts: u32, marker: bool) -> PacketMeta {
-        PacketMeta {
-            seq,
-            timestamp: ts,
-            marker,
-        }
+        PacketMeta { seq, timestamp: ts, marker }
     }
 
     fn feed(a: &mut Assembler, seq: u16, ts: u32, marker: bool, p: &[u8]) -> Vec<Output> {
@@ -1089,13 +1045,7 @@ mod tests {
     fn a_key_unit_before_any_parameter_set_is_dropped() {
         let mut a = Assembler::new();
         let out = feed(&mut a, 1, 50, true, &idr(&[1; 4]));
-        assert_eq!(
-            out,
-            vec![Output::Dropped {
-                timestamp: 50,
-                reason: DropReason::MissingParams
-            }]
-        );
+        assert_eq!(out, vec![Output::Dropped { timestamp: 50, reason: DropReason::MissingParams }]);
     }
 
     #[test]
@@ -1108,13 +1058,7 @@ mod tests {
         assert_eq!(frags.len(), 3);
         let mut out = feed(&mut a, 104, 2000, false, &frags[0]);
         out.extend(feed(&mut a, 106, 2000, true, &frags[2]));
-        assert_eq!(
-            out,
-            vec![Output::Dropped {
-                timestamp: 2000,
-                reason: DropReason::Loss
-            }]
-        );
+        assert_eq!(out, vec![Output::Dropped { timestamp: 2000, reason: DropReason::Loss }]);
         assert_eq!(a.lost(), 1);
         // Unit C is complete and arrives without a gap: produced.
         let c = trail(&[5; 4]);
@@ -1137,14 +1081,8 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                Output::Dropped {
-                    timestamp: 2000,
-                    reason: DropReason::Loss
-                },
-                Output::Dropped {
-                    timestamp: 3000,
-                    reason: DropReason::Loss
-                }
+                Output::Dropped { timestamp: 2000, reason: DropReason::Loss },
+                Output::Dropped { timestamp: 3000, reason: DropReason::Loss }
             ]
         );
         // From here on, units flow again.
@@ -1160,13 +1098,7 @@ mod tests {
         // Packets 104..=106 (a whole unit) are lost; 107 starts a unit.
         let c = trail(&[2; 4]);
         let out = feed(&mut a, 107, 4000, true, &c);
-        assert_eq!(
-            out,
-            vec![Output::Dropped {
-                timestamp: 4000,
-                reason: DropReason::Loss
-            }]
-        );
+        assert_eq!(out, vec![Output::Dropped { timestamp: 4000, reason: DropReason::Loss }]);
         assert_eq!(a.lost(), 3);
     }
 
@@ -1214,59 +1146,31 @@ mod tests {
         for bad in [vec![], vec![0x02], vec![0x82, 0x01, 0x00]] {
             let mut a = Assembler::new();
             let out = feed(&mut a, 1, 100, true, &bad);
-            assert_eq!(
-                out,
-                vec![Output::Dropped {
-                    timestamp: 100,
-                    reason: DropReason::Malformed
-                }],
-                "payload {bad:?}"
-            );
+            assert_eq!(out, vec![Output::Dropped { timestamp: 100, reason: DropReason::Malformed }], "payload {bad:?}");
             // And the stream goes on.
             assert_eq!(feed(&mut a, 2, 200, true, &n).len(), 1);
         }
         // A truncated aggregation packet: the size says 9, three bytes follow.
         let mut a = Assembler::new();
         let ap = vec![NAL_AP << 1, 0x01, 0x00, 0x09, 0x02, 0x01, 0x00];
-        assert!(matches!(
-            feed(&mut a, 1, 100, true, &ap)[0],
-            Output::Dropped {
-                reason: DropReason::Malformed,
-                ..
-            }
-        ));
+        assert!(matches!(feed(&mut a, 1, 100, true, &ap)[0], Output::Dropped { reason: DropReason::Malformed, .. }));
         // A middle fragment with no start.
         let mut a = Assembler::new();
         let frags = fu(&trail(&[4; 30]), 10);
         assert!(matches!(
             feed(&mut a, 1, 100, true, &frags[1])[0],
-            Output::Dropped {
-                reason: DropReason::Malformed,
-                ..
-            }
+            Output::Dropped { reason: DropReason::Malformed, .. }
         ));
         // A unit that ends in the middle of a fragmented NAL unit.
         let mut a = Assembler::new();
         let frags = fu(&trail(&[4; 30]), 10);
         let out = feed(&mut a, 1, 100, true, &frags[0]);
-        assert!(matches!(
-            out[0],
-            Output::Dropped {
-                reason: DropReason::Malformed,
-                ..
-            }
-        ));
+        assert!(matches!(out[0], Output::Dropped { reason: DropReason::Malformed, .. }));
         // A single NAL unit while a fragment is open: the fragment's end was lost.
         let mut a = Assembler::new();
         feed(&mut a, 1, 100, false, &frags[0]);
         let out = feed(&mut a, 2, 100, true, &trail(&[1; 2]));
-        assert!(matches!(
-            out[0],
-            Output::Dropped {
-                reason: DropReason::Malformed,
-                ..
-            }
-        ));
+        assert!(matches!(out[0], Output::Dropped { reason: DropReason::Malformed, .. }));
         // temporal id plus 1 of zero.
         let mut a = Assembler::new();
         let out = feed(&mut a, 1, 100, true, &[0x02, 0x00, 0xAA]);
@@ -1277,7 +1181,7 @@ mod tests {
     fn enhancement_layers_and_reserved_types_are_skipped() {
         let mut a = Assembler::new();
         let base = trail(&[1; 4]);
-        let enh = vec![(1 << 1) | 0, (1 << 3) | 1, 0xEE]; // layer id 1
+        let enh = vec![(1 << 1), (1 << 3) | 1, 0xEE]; // layer id 1
         let reserved = vec![45 << 1, 0x01, 0xEE];
         let mut out = feed(&mut a, 1, 100, false, &enh);
         out.extend(feed(&mut a, 2, 100, false, &reserved));
@@ -1294,13 +1198,7 @@ mod tests {
         for (i, f) in frags.iter().enumerate() {
             a.push(meta(i as u16, 7, i == frags.len() - 1), f, &mut out);
         }
-        assert_eq!(
-            out,
-            vec![Output::Dropped {
-                timestamp: 7,
-                reason: DropReason::TooLarge
-            }]
-        );
+        assert_eq!(out, vec![Output::Dropped { timestamp: 7, reason: DropReason::TooLarge }]);
         // And one that fits goes through.
         let ok = trail(&[1; 200]);
         let out = feed(&mut a, frags.len() as u16, 8, true, &ok);
@@ -1328,10 +1226,7 @@ mod tests {
         let slice = idr(&[9; 6]);
         let mut out = feed(&mut a, 5, 200, false, &aud);
         out.extend(feed(&mut a, 6, 200, true, &slice));
-        assert_eq!(
-            unit(&out[0]).payload,
-            annexb(&[&aud, &VPS, &fake_sps(), &PPS, &slice])
-        );
+        assert_eq!(unit(&out[0]).payload, annexb(&[&aud, &VPS, &fake_sps(), &PPS, &slice]));
         // With the sets already behind it, nothing moves.
         let sps = fake_sps();
         let mut out = feed(&mut a, 7, 300, false, &ap(&[&aud, &VPS, &sps, &PPS]));
@@ -1350,13 +1245,7 @@ mod tests {
         assert!(feed(&mut a, 40001, 3000, true, &n).is_empty());
         // ... the third resyncs. Its unit may be missing its head: dropped, a keyframe is wanted.
         let out = feed(&mut a, 40002, 4000, true, &n);
-        assert_eq!(
-            out,
-            vec![Output::Dropped {
-                timestamp: 4000,
-                reason: DropReason::Loss
-            }]
-        );
+        assert_eq!(out, vec![Output::Dropped { timestamp: 4000, reason: DropReason::Loss }]);
         assert_eq!(a.lost(), 1);
         // The stream goes on from the new position.
         assert_eq!(feed(&mut a, 40003, 5000, true, &n).len(), 1);
@@ -1402,10 +1291,7 @@ mod tests {
         assert!(matches!(out[0], Output::Dropped { reason: DropReason::Loss, .. }));
         // The next keyframe, with no sets of its own, gets the old, good ones.
         let out = feed(&mut a, 8, 300, true, &idr(&[2; 4]));
-        assert_eq!(
-            unit(&out[0]).payload,
-            annexb(&[&VPS, &fake_sps(), &PPS, &idr(&[2; 4])])
-        );
+        assert_eq!(unit(&out[0]).payload, annexb(&[&VPS, &fake_sps(), &PPS, &idr(&[2; 4])]));
     }
 
     #[test]
@@ -1415,13 +1301,7 @@ mod tests {
         feed(&mut a, 1, 100, false, &frags[0]);
         // The middle fragment is lost; the end arrives.
         let out = feed(&mut a, 3, 100, true, &frags[2]);
-        assert_eq!(
-            out,
-            vec![Output::Dropped {
-                timestamp: 100,
-                reason: DropReason::Loss
-            }]
-        );
+        assert_eq!(out, vec![Output::Dropped { timestamp: 100, reason: DropReason::Loss }]);
     }
 
     #[test]
@@ -1457,8 +1337,8 @@ mod tests {
 #[cfg(test)]
 mod h264_tests {
     use super::*;
-    use crate::avc::testutil::*;
     use crate::avc::NAL_FU_A;
+    use crate::avc::testutil::*;
 
     fn meta(seq: u16, ts: u32, marker: bool) -> PacketMeta {
         PacketMeta { seq, timestamp: ts, marker }
@@ -1833,7 +1713,9 @@ mod h264_tests {
         annexb_config.extend_from_slice(&raw_sps());
         annexb_config.extend_from_slice(&[0, 0, 0, 1]);
         annexb_config.extend_from_slice(&PPS);
-        for (name, packet) in [("a bare record", [vec![0x92, 0xE6, 0xC0, 0xA3], record].concat()), ("Annex-B", annexb_config)] {
+        for (name, packet) in
+            [("a bare record", [vec![0x92, 0xE6, 0xC0, 0xA3], record].concat()), ("Annex-B", annexb_config)]
+        {
             let mut a = H264Assembler::new();
             assert!(feed(&mut a, 1, 100, true, &packet).is_empty(), "{name}");
             assert!(a.has_parameter_sets(), "{name}");

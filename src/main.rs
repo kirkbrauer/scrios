@@ -1,25 +1,8 @@
-//! `jumpstarter-ios-display`: streams an iPhone's screen to stdout as length-framed Annex-B HEVC
+//! `scrios`: streams an iPhone's screen to stdout as length-framed Annex-B HEVC
 //! access units. See README.md for the protocol.
 
 // stdout is the frame channel: nothing else may be printed there.
 #![deny(clippy::print_stdout)]
-
-mod commands;
-mod avc;
-mod codec;
-mod depack;
-mod device;
-mod displayinfo;
-mod engine;
-mod frame;
-mod hid;
-mod keyframe;
-mod offer;
-mod outqueue;
-mod probe;
-mod rtpstats;
-mod session;
-mod sps;
 
 use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -31,16 +14,17 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::codec::CodecKind;
-use crate::commands::{Command, read_commands, supervised};
-use crate::device::{DeviceOptions, Session};
-use crate::engine::{ClockSource, Engine, EngineConfig};
-use crate::frame::{Event, Frame};
-use crate::frame::HidEvent;
-use crate::hid::{Hid, HidBackend, HidMapping, HidSpace, NoHid, mapping_event};
-use crate::offer::{Codec, OfferFlags};
-use crate::outqueue::{OutQueue, run_writer};
-use crate::session::{Clock, DisplayLink, Exit, HidLink, Links, StopCause, TokioClock, run_session};
+use scrios::codec::CodecKind;
+use scrios::commands::{Command, read_commands, supervised};
+use scrios::device::{DeviceOptions, Session};
+use scrios::engine::{ClockSource, Engine, EngineConfig};
+use scrios::frame::HidEvent;
+use scrios::frame::{Event, Frame};
+use scrios::hid::{Hid, HidBackend, HidMapping, HidSpace, NoHid, mapping_event};
+use scrios::offer::{Codec, OfferFlags};
+use scrios::outqueue::{OutQueue, run_writer};
+use scrios::session::{Clock, DisplayLink, Exit, HidLink, Links, StopCause, TokioClock, run_session};
+use scrios::{displayinfo, engine, probe};
 
 /// Exit status: the stream could not be started.
 const EXIT_START_FAILED: i32 = 2;
@@ -83,7 +67,7 @@ enum SpaceArg {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "jumpstarter-ios-display",
+    name = "scrios",
     version,
     about = "Streams an iPhone's screen (HEVC over RTP, CoreDevice displayservice) to stdout as length-framed Annex-B access units",
     long_about = "Connects to the phone through usbmuxd (using the pair record usbmuxd already has), opens the \
@@ -198,9 +182,7 @@ struct Args {
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
-    let (w, h) = s
-        .split_once(['x', 'X'])
-        .ok_or_else(|| format!("expected WxH, got {s:?}"))?;
+    let (w, h) = s.split_once(['x', 'X']).ok_or_else(|| format!("expected WxH, got {s:?}"))?;
     let w: u32 = w.trim().parse().map_err(|_| format!("bad width in {s:?}"))?;
     let h: u32 = h.trim().parse().map_err(|_| format!("bad height in {s:?}"))?;
     if !(1..=32768).contains(&w) || !(1..=32768).contains(&h) {
@@ -260,8 +242,7 @@ impl Args {
 }
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("jumpstarter_ios_display=info,idevice=warn,warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("scrios=info,idevice=warn,warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -336,17 +317,16 @@ fn main() {
 
     // The session lives out here, so that a panic inside `run` cannot take with it the means to
     // stop the stream on the device.
+    // Shared only between this thread and the runtime's tasks it blocks on, never sent to another thread.
+    #[allow(clippy::arc_with_non_send_sync)]
     let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        rt.block_on(run(args, queue.clone(), gone.clone(), session.clone()))
-    }));
+    let result =
+        catch_unwind(AssertUnwindSafe(|| rt.block_on(run(args, queue.clone(), gone.clone(), session.clone()))));
     let code = match result {
         Ok(code) => code,
         Err(_) => {
             error!("internal error (a panic); stopping the stream");
-            queue.push_control(Frame::control(&Event::Error {
-                message: "internal error".into(),
-            }));
+            queue.push_control(Frame::control(&Event::Error { message: "internal error".into() }));
             let cleanup = catch_unwind(AssertUnwindSafe(|| {
                 rt.block_on(async {
                     let _ = tokio::time::timeout(PANIC_CLEANUP, async {
@@ -435,17 +415,9 @@ async fn wait_for_stop(commands: &mut mpsc::Receiver<Command>) {
     }
 }
 
-async fn run(
-    args: Args,
-    queue: Arc<OutQueue>,
-    gone: Arc<Notify>,
-    session: Arc<tokio::sync::Mutex<Session>>,
-) -> i32 {
+async fn run(args: Args, queue: Arc<OutQueue>, gone: Arc<Notify>, session: Arc<tokio::sync::Mutex<Session>>) -> i32 {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);
-    tokio::spawn(supervised(
-        read_commands(tokio::io::stdin(), cmd_tx.clone()),
-        cmd_tx.clone(),
-    ));
+    tokio::spawn(supervised(read_commands(tokio::io::stdin(), cmd_tx.clone()), cmd_tx.clone()));
     tokio::spawn(stop_on_signals(cmd_tx));
 
     if let Some(bps) = args.max_bitrate {
@@ -541,15 +513,12 @@ async fn run(
             queue.push_control(Frame::control(&Event::Stopped));
             return 0;
         };
-        let message = [
-            device_hid.touch_error.clone(),
-            device_hid.buttons_error.clone(),
-            device_hid.keyboard_error.clone(),
-        ]
-        .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("; ");
+        let message =
+            [device_hid.touch_error.clone(), device_hid.buttons_error.clone(), device_hid.keyboard_error.clone()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
         let ready = device_hid.ready();
         if ready {
             info!("HID ready{}", if message.is_empty() { String::new() } else { format!(" ({message})") });
@@ -592,8 +561,8 @@ async fn run(
         CodecArg::H264 => CodecKind::H264,
     });
     cfg.rtcp_interval = rtcp_interval;
-    cfg.keyframe_min_interval = interval("--keyframe-min-interval-ms", args.keyframe_min_interval_ms)
-        .unwrap_or(Duration::ZERO);
+    cfg.keyframe_min_interval =
+        interval("--keyframe-min-interval-ms", args.keyframe_min_interval_ms).unwrap_or(Duration::ZERO);
     cfg.stats_interval = interval("--stats-interval-ms", args.stats_interval_ms);
     cfg.rtp_stall_keyframe = interval("--rtp-stall-keyframe-ms", args.rtp_stall_keyframe_ms);
     cfg.rtp_stall_timeout = interval("--rtp-stall-timeout-ms", args.rtp_stall_timeout_ms);
@@ -629,13 +598,7 @@ async fn run(
             &mut cmd_rx,
             &gone,
             &TokioClock,
-            Links {
-                display,
-                hid: Some(HidLink {
-                    hid: &mut hid,
-                    backend: &mut *backend,
-                }),
-            },
+            Links { display, hid: Some(HidLink { hid: &mut hid, backend: &mut *backend }) },
         )
         .await
     };
@@ -702,7 +665,7 @@ mod tests {
 
     #[test]
     fn the_cli_defaults_are_the_contracts() {
-        let a = Args::parse_from(["jumpstarter-ios-display"]);
+        let a = Args::parse_from(["scrios"]);
         assert_eq!(a.udid, None);
         assert_eq!(a.usbmuxd, None);
         assert_eq!(a.display_id, 1);
@@ -716,7 +679,7 @@ mod tests {
         // The offer is the stock one, less the HEVC bank, unless asked otherwise.
         assert_eq!(a.offer_flags(), OfferFlags { codec: Codec::H264, ..OfferFlags::default() });
         // With --codec hevc it is the stock offer itself.
-        let hevc = Args::parse_from(["jumpstarter-ios-display", "--codec", "hevc"]);
+        let hevc = Args::parse_from(["scrios", "--codec", "hevc"]);
         assert_eq!(hevc.offer_flags(), OfferFlags::default());
         assert!(!a.device_hub_feedback);
         // HID is off, and its mapping is the automatic one.
@@ -735,43 +698,43 @@ mod tests {
     #[test]
     fn the_codec_options_go_together_or_not() {
         // H.264 is the default, with or without the flag, and without a probe it is the stream.
-        for args in [vec!["jumpstarter-ios-display"], vec!["jumpstarter-ios-display", "--codec", "h264"]] {
+        for args in [vec!["scrios"], vec!["scrios", "--codec", "h264"]] {
             let a = Args::parse_from(args);
             assert_eq!(a.check(), Ok(()));
             assert_eq!(a.offer_flags().codec, Codec::H264);
             assert_eq!(a.probe_window(), None);
         }
         // A probe needs no flag but the window: the default codec is H.264.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--probe-secs", "5"]);
+        let a = Args::parse_from(["scrios", "--probe-secs", "5"]);
         assert_eq!(a.check(), Ok(()));
         assert_eq!(a.probe_window(), Some(Duration::from_secs(5)));
-        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "8"]);
+        let a = Args::parse_from(["scrios", "--codec", "h264", "--probe-secs", "8"]);
         assert_eq!(a.offer_flags().codec, Codec::H264);
         assert_eq!(a.probe_window(), Some(Duration::from_secs(8)));
         assert_eq!(a.check(), Ok(()));
         // The window is capped.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "999999"]);
+        let a = Args::parse_from(["scrios", "--codec", "h264", "--probe-secs", "999999"]);
         assert_eq!(a.probe_window(), Some(Duration::from_secs(MAX_PROBE_SECS)));
         // A probe of HEVC is refused: the probe is for H.264.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "hevc", "--probe-secs", "5"]);
+        let a = Args::parse_from(["scrios", "--codec", "hevc", "--probe-secs", "5"]);
         assert!(a.check().unwrap_err().contains("--codec h264"));
         // HEVC is the opt-in: the stock offer.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "hevc"]);
+        let a = Args::parse_from(["scrios", "--codec", "hevc"]);
         assert_eq!(a.check(), Ok(()));
         assert_eq!(a.offer_flags().codec, Codec::Hevc);
-        assert!(Args::try_parse_from(["jumpstarter-ios-display", "--codec", "vp9"]).is_err());
+        assert!(Args::try_parse_from(["scrios", "--codec", "vp9"]).is_err());
         // The raw dump belongs to the probe.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "8", "--probe-raw", "/tmp/x.raw"]);
+        let a = Args::parse_from(["scrios", "--codec", "h264", "--probe-secs", "8", "--probe-raw", "/tmp/x.raw"]);
         assert_eq!(a.check(), Ok(()));
         assert_eq!(a.probe_raw.as_deref(), Some(std::path::Path::new("/tmp/x.raw")));
-        let a = Args::parse_from(["jumpstarter-ios-display", "--probe-raw", "/tmp/x.raw"]);
+        let a = Args::parse_from(["scrios", "--probe-raw", "/tmp/x.raw"]);
         assert!(a.check().unwrap_err().contains("--probe-raw is for the probe"));
     }
 
     #[test]
     fn the_cli_options_parse() {
         let a = Args::parse_from([
-            "jumpstarter-ios-display",
+            "scrios",
             "--udid",
             "U",
             "--usbmuxd",
@@ -802,17 +765,10 @@ mod tests {
         assert_eq!(interval("x", a.rtcp_interval_ms), None);
         assert_eq!(interval("x", a.rtp_stall_keyframe_ms), None);
         assert_eq!(interval("x", a.rtp_stall_timeout_ms), Some(Duration::from_secs(9)));
-        assert_eq!(
-            a.offer_flags(),
-            OfferFlags {
-                allow_rtcp_fb: true,
-                ltr: false,
-                codec: Codec::H264,
-            }
-        );
+        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, ltr: false, codec: Codec::H264 });
         assert!(a.device_hub_feedback);
         let a = Args::parse_from([
-            "jumpstarter-ios-display",
+            "scrios",
             "--hid",
             "--hid-space",
             "ui",
@@ -822,16 +778,13 @@ mod tests {
             "0",
         ]);
         assert!(a.hid);
-        assert_eq!(
-            a.hid_mapping(),
-            HidMapping { space: HidSpace::Ui, flip_x: true, flip_y: false, swap_xy: true }
-        );
+        assert_eq!(a.hid_mapping(), HidMapping { space: HidSpace::Ui, flip_x: true, flip_y: false, swap_xy: true });
         assert_eq!(interval("x", a.display_poll_ms), None);
-        assert!(Args::try_parse_from(["jumpstarter-ios-display", "--hid-space", "sideways"]).is_err());
+        assert!(Args::try_parse_from(["scrios", "--hid-space", "sideways"]).is_err());
         // Each offer flag on its own.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--rtcp-fb"]);
+        let a = Args::parse_from(["scrios", "--rtcp-fb"]);
         assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, codec: Codec::H264, ..OfferFlags::default() });
-        let a = Args::parse_from(["jumpstarter-ios-display", "--no-ltr"]);
+        let a = Args::parse_from(["scrios", "--no-ltr"]);
         assert_eq!(a.offer_flags(), OfferFlags { ltr: false, codec: Codec::H264, ..OfferFlags::default() });
     }
 }

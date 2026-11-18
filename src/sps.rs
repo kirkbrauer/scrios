@@ -66,20 +66,9 @@ impl SpsInfo {
         };
         let compat = self.compat_flags.reverse_bits();
         let tier = if self.tier_high { 'H' } else { 'L' };
-        let used = self
-            .constraint
-            .iter()
-            .rposition(|b| *b != 0)
-            .map_or(1, |i| i + 1);
-        let constraints = self.constraint[..used]
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(".");
-        format!(
-            "{prefix}.{space}{}.{compat:X}.{tier}{}.{constraints}",
-            self.profile_idc, self.level_idc
-        )
+        let used = self.constraint.iter().rposition(|b| *b != 0).map_or(1, |i| i + 1);
+        let constraints = self.constraint[..used].iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(".");
+        format!("{prefix}.{space}{}.{compat:X}.{tier}{}.{constraints}", self.profile_idc, self.level_idc)
     }
 
     /// The picture size after the conformance window is applied (what a decoder outputs).
@@ -90,12 +79,8 @@ impl SpsInfo {
             _ => (1, 1), // monochrome and 4:4:4
         };
         let [left, right, top, bottom] = self.conf_window;
-        let w = self
-            .width
-            .saturating_sub(sub_w * left.saturating_add(right));
-        let h = self
-            .height
-            .saturating_sub(sub_h * top.saturating_add(bottom));
+        let w = self.width.saturating_sub(sub_w * left.saturating_add(right));
+        let h = self.height.saturating_sub(sub_h * top.saturating_add(bottom));
         (w, h)
     }
 }
@@ -182,7 +167,7 @@ pub(crate) struct BitWriter {
 
 impl BitWriter {
     pub fn bit(&mut self, v: u32) {
-        if self.nbits % 8 == 0 {
+        if self.nbits.is_multiple_of(8) {
             self.bytes.push(0);
         }
         if v & 1 == 1 {
@@ -212,7 +197,7 @@ impl BitWriter {
     /// rbsp_trailing_bits: a one, then zeros to the byte boundary.
     pub fn finish(mut self) -> Vec<u8> {
         self.bit(1);
-        while self.nbits % 8 != 0 {
+        while !self.nbits.is_multiple_of(8) {
             self.bit(0);
         }
         self.bytes
@@ -463,8 +448,7 @@ mod tests {
         //   96               level_idc 150
         let nal = SpsSpec::main_l150(1216, 2656).nal();
         let golden = [
-            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xB0, 0x00, 0x00, 0x03, 0x00,
-            0x00, 0x03, 0x00, 0x96,
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xB0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x96,
         ];
         assert_eq!(&nal[..golden.len()], &golden);
     }
@@ -567,14 +551,11 @@ mod tests {
         junk.extend_from_slice(&[0u8; 40]);
         assert!(parse_sps(&junk).is_err());
         // A zero picture size.
-        assert_eq!(
-            parse_sps(&SpsSpec::main_l150(0, 100).nal()),
-            Err(SpsError::Invalid("picture size"))
-        );
+        assert_eq!(parse_sps(&SpsSpec::main_l150(0, 100).nal()), Err(SpsError::Invalid("picture size")));
         // Every single byte pattern in the dimension area: never a panic.
         for fill in 0..=255u8 {
             let mut v = vec![0x42, 0x01];
-            v.extend(std::iter::repeat(fill).take(32));
+            v.extend(std::iter::repeat_n(fill, 32));
             let _ = parse_sps(&v);
         }
     }

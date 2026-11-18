@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Smoke test of the release binary without a phone, in the rust container: --help works, and a
-# start-up failure (no usbmuxd at the given path) writes exactly one `error` control frame to
-# stdout, logs to stderr, and exits 2. Run ./build.sh first.
+# Smoke test of a release binary without a device: --help and --version work, and a start-up failure
+# (no usbmuxd at the given path) writes exactly one `error` control frame to stdout, logs to stderr,
+# and exits 2. Runs the binary on this host, so give it one built for this host:
+#
+#   scripts/smoke.sh [BINARY]   (default: target/release/scrios)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUST_IMAGE="${RUST_IMAGE:-docker.io/library/rust:1-bookworm}"
-BIN=/work/target/release/jumpstarter-ios-display
-run() { podman run --rm -i -v "$ROOT:/work:ro" "$RUST_IMAGE" "$@"; }
+BIN="${1:-${ROOT}/target/release/scrios}"
+[ -x "$BIN" ] || { echo "no binary at $BIN: build it first (cargo build --release)" >&2; exit 2; }
+run() { "$@"; }
 
 run $BIN --help > /dev/null
 run $BIN --version > /dev/null

@@ -98,11 +98,7 @@ impl Axes {
             let (inner_src, inner_inv) = first[*src];
             net[out] = (inner_src, inner_inv ^ inv);
         }
-        Axes {
-            swap_xy: net[0].0 == 1,
-            flip_x: net[0].1,
-            flip_y: net[1].1,
-        }
+        Axes { swap_xy: net[0].0 == 1, flip_x: net[0].1, flip_y: net[1].1 }
     }
 
     fn is_identity(self) -> bool {
@@ -138,12 +134,7 @@ pub struct HidMapping {
 
 impl Default for HidMapping {
     fn default() -> Self {
-        HidMapping {
-            space: HidSpace::Auto,
-            flip_x: false,
-            flip_y: false,
-            swap_xy: false,
-        }
+        HidMapping { space: HidSpace::Auto, flip_x: false, flip_y: false, swap_xy: false }
     }
 }
 
@@ -232,11 +223,7 @@ pub fn map_touch(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) 
 impl HidMapping {
     /// The mapping in effect, given the display's native orientation in degrees (if known).
     pub fn effective(&self, native_degrees: Option<u16>) -> Effective {
-        let user = Axes {
-            swap_xy: self.swap_xy,
-            flip_x: self.flip_x,
-            flip_y: self.flip_y,
-        };
+        let user = Axes { swap_xy: self.swap_xy, flip_x: self.flip_x, flip_y: self.flip_y };
         match self.space {
             HidSpace::Auto => match auto_axes(native_degrees) {
                 Some(auto) => Effective { label: "auto", axes: auto.then(user) },
@@ -483,14 +470,8 @@ impl Hid {
             button_steps: VecDeque::new(),
             tokens: BURST,
             tokens_at: None,
-            replies: ReplyLimit {
-                last: None,
-                held: 0,
-            },
-            warnings: ReplyLimit {
-                last: None,
-                held: 0,
-            },
+            replies: ReplyLimit { last: None, held: 0 },
+            warnings: ReplyLimit { last: None, held: 0 },
             actions: Vec::new(),
             announced: None,
             kb_pressed: BTreeSet::new(),
@@ -519,20 +500,10 @@ impl Hid {
 
     /// When a held move or a key release is due.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let move_due = self
-            .pending_move
-            .and(self.last_touch_sent)
-            .map(|t| t + MOVE_INTERVAL);
-        let key_due = self
-            .keys_down
-            .iter()
-            .map(|k| k.at)
-            .chain(self.button_steps.front().map(|s| s.at))
-            .min();
+        let move_due = self.pending_move.and(self.last_touch_sent).map(|t| t + MOVE_INTERVAL);
+        let key_due = self.keys_down.iter().map(|k| k.at).chain(self.button_steps.front().map(|s| s.at)).min();
         let type_due = self.typing.front().map(|s| s.at);
-        let idle_due = (!self.kb_pressed.is_empty())
-            .then(|| self.kb_last.map(|t| t + KEYBOARD_IDLE_RELEASE))
-            .flatten();
+        let idle_due = (!self.kb_pressed.is_empty()).then(|| self.kb_last.map(|t| t + KEYBOARD_IDLE_RELEASE)).flatten();
         [move_due, key_due, type_due, idle_due].into_iter().flatten().min()
     }
 
@@ -558,21 +529,14 @@ impl Hid {
     /// Writes `{"event":"hid","ok":false,"message":...}`, at most once a second (with a count of
     /// what was held back).
     fn fail(&mut self, now: Instant, message: &str) {
-        let quiet = self
-            .replies
-            .last
-            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1));
+        let quiet = self.replies.last.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1));
         if quiet {
             self.replies.held += 1;
             return;
         }
         let held = std::mem::take(&mut self.replies.held);
         self.replies.last = Some(now);
-        let message = if held > 0 {
-            format!("{message} ({held} more failures)")
-        } else {
-            message.to_string()
-        };
+        let message = if held > 0 { format!("{message} ({held} more failures)") } else { message.to_string() };
         tracing::warn!("hid: {message}");
         self.queue.push_droppable_control(Frame::control(&Event::Hid(HidEvent {
             ok: Some(false),
@@ -597,10 +561,7 @@ impl Hid {
 
     /// Writes `{"event":"hid","warning":...}`, at most once a second.
     fn warn(&mut self, now: Instant, message: String) {
-        let quiet = self
-            .warnings
-            .last
-            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1));
+        let quiet = self.warnings.last.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1));
         if quiet {
             self.warnings.held += 1;
             return;
@@ -673,10 +634,7 @@ impl Hid {
             );
         }
         if skipped > 0 {
-            self.warn(
-                now,
-                format!("kb type: {skipped} characters are not in the US layout table and were skipped"),
-            );
+            self.warn(now, format!("kb type: {skipped} characters are not in the US layout table and were skipped"));
         }
         self.kb_last = Some(now);
         self.typing_chars += chars;
@@ -761,8 +719,7 @@ impl Hid {
         );
         // The display info arrived (or changed) after the mapping was announced: say so.
         if self.announced.as_ref().is_some_and(|a| *a != effective) {
-            self.queue
-                .push_control(Frame::control(&mapping_event(None, None, &effective)));
+            self.queue.push_control(Frame::control(&mapping_event(None, None, &effective)));
             self.announced = Some(effective);
         }
         match touch.phase {
@@ -782,9 +739,7 @@ impl Hid {
                     debug!("hid: move without a finger down ignored");
                     return;
                 }
-                let due = self
-                    .last_touch_sent
-                    .is_none_or(|t| now.saturating_duration_since(t) >= MOVE_INTERVAL);
+                let due = self.last_touch_sent.is_none_or(|t| now.saturating_duration_since(t) >= MOVE_INTERVAL);
                 if due {
                     self.pending_move = None;
                     self.send_touch(now, true, x, y);
@@ -826,16 +781,8 @@ impl Hid {
         let (page, code) = key.usage();
         let hold_ms = key.hold_ms(press);
         debug!("hid: key {key:?} {press:?} (usage page {page:#x}, code {code:#x}, held {hold_ms} ms)");
-        self.actions.push(Action::Button {
-            page,
-            code,
-            down: true,
-        });
-        self.keys_down.push_back(KeyUp {
-            at: now + Duration::from_millis(hold_ms),
-            page,
-            code,
-        });
+        self.actions.push(Action::Button { page, code, down: true });
+        self.keys_down.push_back(KeyUp { at: now + Duration::from_millis(hold_ms), page, code });
     }
 
     /// `key app-switcher`: the Home button, pressed and released, then after a gap pressed and
@@ -868,23 +815,16 @@ impl Hid {
     pub fn on_tick(&mut self, now: Instant) {
         self.run_typing(now);
         if !self.kb_pressed.is_empty()
-            && self
-                .kb_last
-                .is_some_and(|t| now.saturating_duration_since(t) >= KEYBOARD_IDLE_RELEASE)
+            && self.kb_last.is_some_and(|t| now.saturating_duration_since(t) >= KEYBOARD_IDLE_RELEASE)
         {
             self.release_keyboard();
             self.warn(
                 now,
-                format!(
-                    "keys held for {} s without a keyboard command were released",
-                    KEYBOARD_IDLE_RELEASE.as_secs()
-                ),
+                format!("keys held for {} s without a keyboard command were released", KEYBOARD_IDLE_RELEASE.as_secs()),
             );
         }
         if let Some((x, y)) = self.pending_move {
-            let due = self
-                .last_touch_sent
-                .is_none_or(|t| now.saturating_duration_since(t) >= MOVE_INTERVAL);
+            let due = self.last_touch_sent.is_none_or(|t| now.saturating_duration_since(t) >= MOVE_INTERVAL);
             if due && self.finger.is_some() {
                 self.pending_move = None;
                 self.send_touch(now, true, x, y);
@@ -896,11 +836,7 @@ impl Hid {
         }
         while let Some(i) = self.keys_down.iter().position(|k| k.at <= now) {
             let k = self.keys_down.remove(i).expect("position is in range");
-            self.actions.push(Action::Button {
-                page: k.page,
-                code: k.code,
-                down: false,
-            });
+            self.actions.push(Action::Button { page: k.page, code: k.code, down: false });
         }
     }
 
@@ -910,11 +846,7 @@ impl Hid {
         self.release_keyboard();
         self.pending_move = None;
         if let Some((x, y)) = self.finger.take() {
-            self.actions.push(Action::Touch {
-                down: false,
-                x,
-                y,
-            });
+            self.actions.push(Action::Touch { down: false, x, y });
         }
         // A double press under way: if the button is down (the next step is its release), let go of
         // it; the rest of the sequence is dropped.
@@ -923,11 +855,7 @@ impl Hid {
         }
         self.button_steps.clear();
         for k in self.keys_down.drain(..) {
-            self.actions.push(Action::Button {
-                page: k.page,
-                code: k.code,
-                down: false,
-            });
+            self.actions.push(Action::Button { page: k.page, code: k.code, down: false });
         }
     }
 }
@@ -968,19 +896,13 @@ mod tests {
     fn rotation_0_maps_straight() {
         let m = 65535;
         // top-left, top-right, bottom-left, bottom-right, centre
-        assert_eq!(
-            corners(FB_W, FB_H, 0),
-            [(0, 0), (m, 0), (0, m), (m, m), (32768, 32768)]
-        );
+        assert_eq!(corners(FB_W, FB_H, 0), [(0, 0), (m, 0), (0, m), (m, m), (32768, 32768)]);
     }
 
     #[test]
     fn rotation_180_maps_through_the_centre() {
         let m = 65535;
-        assert_eq!(
-            corners(FB_W, FB_H, 180),
-            [(m, m), (0, m), (m, 0), (0, 0), (32768, 32768)]
-        );
+        assert_eq!(corners(FB_W, FB_H, 180), [(m, m), (0, m), (m, 0), (0, 0), (32768, 32768)]);
     }
 
     #[test]
@@ -990,10 +912,10 @@ mod tests {
         assert_eq!(
             corners(FB_H, FB_W, 90),
             [
-                (0, m),  // upright top-left is the framebuffer's bottom-left
-                (0, 0),  // upright top-right is its top-left
-                (m, m),  // upright bottom-left is its bottom-right
-                (m, 0),  // upright bottom-right is its top-right
+                (0, m), // upright top-left is the framebuffer's bottom-left
+                (0, 0), // upright top-right is its top-left
+                (m, m), // upright bottom-left is its bottom-right
+                (m, 0), // upright bottom-right is its top-right
                 (32768, 32768),
             ]
         );
@@ -1002,10 +924,7 @@ mod tests {
     #[test]
     fn rotation_270_turns_the_framebuffer_counter_clockwise_to_be_upright() {
         let m = 65535;
-        assert_eq!(
-            corners(FB_H, FB_W, 270),
-            [(m, 0), (m, m), (0, 0), (0, m), (32768, 32768)]
-        );
+        assert_eq!(corners(FB_H, FB_W, 270), [(m, 0), (m, m), (0, 0), (0, m), (32768, 32768)]);
     }
 
     #[test]
@@ -1052,10 +971,7 @@ mod tests {
 
     #[test]
     fn the_ui_space_ignores_the_rotation_and_the_escape_hatches_apply_in_order() {
-        let ui = HidMapping {
-            space: HidSpace::Ui,
-            ..HidMapping::default()
-        };
+        let ui = HidMapping { space: HidSpace::Ui, ..HidMapping::default() };
         assert_eq!(ui.map(250.0, 500.0, 1001, 2001, 90, None), (to_axis(0.25), to_axis(0.25)));
         assert_eq!(ui.map(250.0, 500.0, 1001, 2001, 270, None), ui.map(250.0, 500.0, 1001, 2001, 0, None));
         // Panel space is map_touch, whatever the native orientation.
@@ -1135,10 +1051,7 @@ mod tests {
         let m = HidMapping::default();
         // Rotation 0: the picture is the framebuffer, 2388x1668. Upright (0.25, 0.5) of the way is pixel (596.75, 833.5);
         // the digitizer point is (1 - 0.5, 0.25).
-        assert_eq!(
-            m.map(along(0.25, 2388), along(0.5, 1668), 2388, 1668, 0, Some(270)),
-            (to_axis(0.5), to_axis(0.25))
-        );
+        assert_eq!(m.map(along(0.25, 2388), along(0.5, 1668), 2388, 1668, 0, Some(270)), (to_axis(0.5), to_axis(0.25)));
         // The same as the flags that landed on the device.
         let landed = HidMapping { space: HidSpace::Panel, swap_xy: true, flip_x: true, flip_y: false };
         for (x, y) in [(0.0, 0.0), (597.0, 834.0), (2388.0, 1668.0), (1000.0, 100.0), (5.0, 1600.0)] {
@@ -1224,8 +1137,10 @@ mod tests {
                 for (fx, fy) in points {
                     let stepwise = user.apply(auto_axes(native).unwrap_or_default().apply((fx, fy)));
                     let net = eff.axes.apply((fx, fy));
-                    assert!((stepwise.0 - net.0).abs() < 1e-12 && (stepwise.1 - net.1).abs() < 1e-12,
-                        "native {native:?} overrides {bits:03b} at ({fx}, {fy})");
+                    assert!(
+                        (stepwise.0 - net.0).abs() < 1e-12 && (stepwise.1 - net.1).abs() < 1e-12,
+                        "native {native:?} overrides {bits:03b} at ({fx}, {fy})"
+                    );
                     let digitizer = m.map(fx * 1000.0, fy * 2000.0, 1001, 2001, 0, native);
                     assert_eq!(digitizer, (to_axis(net.0), to_axis(net.1)));
                 }
@@ -1253,22 +1168,26 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0]["event"], "hid");
         assert_eq!(c[0]["mapping"], "auto");
-        assert_eq!((c[0]["swap_xy"].as_bool(), c[0]["flip_x"].as_bool(), c[0]["flip_y"].as_bool()), (Some(true), Some(true), Some(false)));
+        assert_eq!(
+            (c[0]["swap_xy"].as_bool(), c[0]["flip_x"].as_bool(), c[0]["flip_y"].as_bool()),
+            (Some(true), Some(true), Some(false))
+        );
         assert!(c[0].get("ready").is_none());
         // The picture turned (rotation 90): the same upright point is another digitizer point, and
         // the mapping did not change, so nothing is announced.
         h.on_touch(ms(t0, 40), touch(TouchPhase::Down, 416.75, 1193.5), ipad(90));
-        assert_eq!(
-            h.take_actions(),
-            vec![Action::Touch { down: true, x: to_axis(0.25), y: to_axis(0.5) }]
-        );
+        assert_eq!(h.take_actions(), vec![Action::Touch { down: true, x: to_axis(0.25), y: to_axis(0.5) }]);
         assert!(controls(&q).is_empty());
     }
 
     #[test]
     fn nothing_is_announced_before_the_ready_event_names_a_mapping() {
         let (mut h, q, t0) = rig();
-        h.on_touch(t0, touch(TouchPhase::Down, 5.0, 5.0), Some(View { width: 100, height: 200, rotation: 0, native: Some(270) }));
+        h.on_touch(
+            t0,
+            touch(TouchPhase::Down, 5.0, 5.0),
+            Some(View { width: 100, height: 200, rotation: 0, native: Some(270) }),
+        );
         assert!(controls(&q).is_empty());
     }
 
@@ -1288,23 +1207,14 @@ mod tests {
         (Hid::new(HidMapping::default(), q.clone()), q, Instant::now())
     }
 
-    const VIEW: Option<View> = Some(View {
-        width: 1001,
-        height: 2001,
-        rotation: 0,
-        native: None,
-    });
+    const VIEW: Option<View> = Some(View { width: 1001, height: 2001, rotation: 0, native: None });
 
     fn touch(phase: TouchPhase, x: f64, y: f64) -> Touch {
         Touch { phase, x, y, id: 0 }
     }
 
     fn controls(q: &OutQueue) -> Vec<serde_json::Value> {
-        q.drain()
-            .iter()
-            .filter(|f| f.is_control())
-            .map(|f| serde_json::from_slice(&f.payload).unwrap())
-            .collect()
+        q.drain().iter().filter(|f| f.is_control()).map(|f| serde_json::from_slice(&f.payload).unwrap()).collect()
     }
 
     #[test]
@@ -1340,10 +1250,7 @@ mod tests {
         h.on_tick(ms(t0, 7));
         assert!(h.take_actions().is_empty());
         h.on_tick(ms(t0, 8));
-        assert_eq!(
-            h.take_actions(),
-            vec![Action::Touch { down: true, x: to_axis(0.07), y: 0 }]
-        );
+        assert_eq!(h.take_actions(), vec![Action::Touch { down: true, x: to_axis(0.07), y: 0 }]);
         assert_eq!(h.next_deadline(), None);
         // A move after a quiet 8 ms goes out at once.
         h.on_touch(ms(t0, 100), touch(TouchPhase::Move, 500.0, 0.0), VIEW);
@@ -1373,10 +1280,7 @@ mod tests {
         h.on_touch(ms(t0, 20), touch(TouchPhase::Move, 300.0, 600.0), VIEW);
         h.take_actions();
         h.release_all(); // stop, or end of stdin
-        assert_eq!(
-            h.take_actions(),
-            vec![Action::Touch { down: false, x: to_axis(0.3), y: to_axis(0.3) }]
-        );
+        assert_eq!(h.take_actions(), vec![Action::Touch { down: false, x: to_axis(0.3), y: to_axis(0.3) }]);
         assert!(!h.finger_down());
         // Nothing to lift the second time.
         h.release_all();
@@ -1535,8 +1439,8 @@ mod tests {
         // Each stop time, with everything sent after the first press (the loop ticks at every deadline
         // up to the stop, then lets go of everything): the button is up at the end, whenever the stop is.
         let cases: [(u64, Vec<Action>); 9] = [
-            (0, vec![HOME_UP]),   // as the first press goes down
-            (40, vec![HOME_UP]),  // during the first press
+            (0, vec![HOME_UP]),  // as the first press goes down
+            (40, vec![HOME_UP]), // during the first press
             (79, vec![HOME_UP]),
             (80, vec![HOME_UP]),  // as it comes up: once, not twice
             (150, vec![HOME_UP]), // in the gap: it is up; the second press never happens
@@ -1830,10 +1734,7 @@ mod tests {
             h.on_tick(ms(t0, t));
         }
         // The key presses, with no second Shift down and no Shift up between them.
-        assert_eq!(
-            h.take_actions(),
-            vec![kb_down(0x04), kb_up(0x04), kb_down(0x05), kb_up(0x05)]
-        );
+        assert_eq!(h.take_actions(), vec![kb_down(0x04), kb_up(0x04), kb_down(0x05), kb_up(0x05)]);
         // Shift is still down: the 30 s idle release has a deadline.
         assert!(h.next_deadline().is_some());
     }
@@ -1955,7 +1856,11 @@ mod tests {
         h.shutdown();
         assert_eq!(
             h.take_actions(),
-            vec![Action::KeyboardRelease, Action::Touch { down: false, x: to_axis(0.005), y: to_axis(0.0025) }, Action::KeyboardRemove]
+            vec![
+                Action::KeyboardRelease,
+                Action::Touch { down: false, x: to_axis(0.005), y: to_axis(0.0025) },
+                Action::KeyboardRemove
+            ]
         );
         // With nothing held it is only the removal.
         h.shutdown();
@@ -2053,11 +1958,8 @@ mod tests {
             ..HidEvent::default()
         }));
         assert_eq!(not_ready.payload, br#"{"event":"hid","ready":false,"message":"no service"}"#);
-        let failed = Frame::control(&Event::Hid(HidEvent {
-            ok: Some(false),
-            message: Some("x".into()),
-            ..HidEvent::default()
-        }));
+        let failed =
+            Frame::control(&Event::Hid(HidEvent { ok: Some(false), message: Some("x".into()), ..HidEvent::default() }));
         assert_eq!(failed.payload, br#"{"event":"hid","ok":false,"message":"x"}"#);
         let warned = Frame::control(&Event::Hid(HidEvent { warning: Some("w".into()), ..HidEvent::default() }));
         assert_eq!(warned.payload, br#"{"event":"hid","warning":"w"}"#);
@@ -2084,16 +1986,7 @@ mod tests {
     /// and bottom-right corners of an upright `w` x `h` picture, at its outermost columns and rows.
     fn edge_points(w: u32, h: u32) -> [(f64, f64); 8] {
         let (lx, ly) = (f64::from(w - 1), f64::from(h - 1));
-        [
-            (0.0, ly / 2.0),
-            (lx, ly / 2.0),
-            (lx / 2.0, 0.0),
-            (lx / 2.0, ly),
-            (0.0, 0.0),
-            (lx, 0.0),
-            (0.0, ly),
-            (lx, ly),
-        ]
+        [(0.0, ly / 2.0), (lx, ly / 2.0), (lx / 2.0, 0.0), (lx / 2.0, ly), (0.0, 0.0), (lx, 0.0), (0.0, ly), (lx, ly)]
     }
 
     fn mapped(m: &HidMapping, w: u32, h: u32, rotation: u16, native: Option<u16>) -> [(u16, u16); 8] {
@@ -2147,7 +2040,10 @@ mod tests {
             let limit = |v: u16| v == 0 || v == m;
             for (i, (x, y)) in got.into_iter().enumerate() {
                 if i < 4 {
-                    assert!(limit(x) != limit(y) && (x == mid || y == mid), "edge {i} at rotation {rotation}: ({x}, {y})");
+                    assert!(
+                        limit(x) != limit(y) && (x == mid || y == mid),
+                        "edge {i} at rotation {rotation}: ({x}, {y})"
+                    );
                 } else {
                     assert!(limit(x) && limit(y), "corner {i} at rotation {rotation}: ({x}, {y})");
                 }
@@ -2201,7 +2097,8 @@ mod tests {
             assert!(moved_at(size / 4) < moved_at(size / 2) && moved_at(size / 2) < moved_at(size - 1));
             assert_eq!(map_touch(0.0, 0.0, size, 10, 0).0, 0);
             let mid = size / 2;
-            let moved = f64::from(map_touch(f64::from(mid), 0.0, size, 10, 0).0) - f64::from(mid) / f64::from(size) * AXIS_MAX;
+            let moved =
+                f64::from(map_touch(f64::from(mid), 0.0, size, 10, 0).0) - f64::from(mid) / f64::from(size) * AXIS_MAX;
             assert!(moved > 0.0 && moved < pixel, "size {size}: mid-screen moved {moved} of one pixel ({pixel})");
         }
         // The iPad's long axis: mid-screen moves by about 14 units (half a pixel), the far end by 27.
@@ -2287,13 +2184,16 @@ mod tests {
         let (x0, y0) = hid_at(800.0, 2387.0);
         assert_eq!(y0, MAX);
         assert!(
-            lines[0].ends_with(&format!("edge touch down at HID ({x0}, {y0}) from upright pixel (800, 2387), edge: bottom")),
+            lines[0].ends_with(&format!(
+                "edge touch down at HID ({x0}, {y0}) from upright pixel (800, 2387), edge: bottom"
+            )),
             "{text}"
         );
         let (x1, y1) = hid_at(0.0, 1000.0);
         assert_eq!(x1, 0);
         assert!(
-            lines[1].ends_with(&format!("edge touch down at HID ({x1}, {y1}) from upright pixel (0, 1000), edge: left")),
+            lines[1]
+                .ends_with(&format!("edge touch down at HID ({x1}, {y1}) from upright pixel (0, 1000), edge: left")),
             "{text}"
         );
         assert!(

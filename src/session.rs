@@ -126,22 +126,19 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
 
     let exit = loop {
         query_wanted |= engine.take_display_query();
-        if query_wanted && query.is_none() {
-            if let Some(source) = source {
-                query = Some(source.query());
-                query_wanted = false;
-            }
+        if query_wanted
+            && query.is_none()
+            && let Some(source) = source
+        {
+            query = Some(source.query());
+            query_wanted = false;
         }
         let now = clock.now();
-        let deadline = [
-            engine.next_deadline(),
-            next_poll,
-            hid.as_ref().and_then(|h| h.hid.next_deadline()),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(now + Duration::from_secs(3600));
+        let deadline = [engine.next_deadline(), next_poll, hid.as_ref().and_then(|h| h.hid.next_deadline())]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(now + Duration::from_secs(3600));
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
 
         tokio::select! {
@@ -233,6 +230,7 @@ mod tests {
     const PORT: u16 = 50001;
 
     #[derive(Clone)]
+    #[allow(clippy::type_complexity)]
     struct FakeSocket {
         rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<io::Result<Datagram>>>>,
         sent: Arc<Mutex<Vec<(u16, Vec<u8>)>>>,
@@ -242,14 +240,7 @@ mod tests {
 
     fn fake() -> (FakeSocket, mpsc::UnboundedSender<io::Result<Datagram>>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (
-            FakeSocket {
-                rx: Arc::new(AsyncMutex::new(rx)),
-                sent: Arc::default(),
-                stall_send: Arc::default(),
-            },
-            tx,
-        )
+        (FakeSocket { rx: Arc::new(AsyncMutex::new(rx)), sent: Arc::default(), stall_send: Arc::default() }, tx)
     }
 
     impl DatagramSocket for FakeSocket {
@@ -271,10 +262,7 @@ mod tests {
     }
 
     fn dg(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> io::Result<Datagram> {
-        Ok(Datagram {
-            src_port: PORT,
-            data: rtp_bytes(seq, ts, marker, DEV, payload),
-        })
+        Ok(Datagram { src_port: PORT, data: rtp_bytes(seq, ts, marker, DEV, payload) })
     }
 
     /// The first picture: sets, then the IDR in three fragments (seq 1..=4).
@@ -365,12 +353,8 @@ mod tests {
             assert_eq!(&bytes[4..8], &OUR.to_be_bytes());
         }
         // Two stats events among the frames.
-        let stats = r
-            .queue
-            .drain()
-            .iter()
-            .filter(|f| f.is_control() && f.payload.starts_with(br#"{"event":"stats""#))
-            .count();
+        let stats =
+            r.queue.drain().iter().filter(|f| f.is_control() && f.payload.starts_with(br#"{"event":"stats""#)).count();
         assert_eq!(stats, 2);
     }
 
@@ -471,6 +455,7 @@ mod tests {
     }
 
     /// Answers queries from a list (the last answer repeats), each after `delay`.
+    #[allow(clippy::type_complexity)]
     struct FakeDisplay {
         replies: Arc<Mutex<VecDeque<Result<Vec<DisplayInfo>, String>>>>,
         calls: Arc<AtomicUsize>,
@@ -479,11 +464,7 @@ mod tests {
 
     impl FakeDisplay {
         fn new(replies: Vec<Result<Vec<DisplayInfo>, String>>, delay: Duration) -> Self {
-            FakeDisplay {
-                replies: Arc::new(Mutex::new(replies.into())),
-                calls: Arc::default(),
-                delay,
-            }
+            FakeDisplay { replies: Arc::new(Mutex::new(replies.into())), calls: Arc::default(), delay }
         }
     }
 
@@ -515,10 +496,7 @@ mod tests {
     }
 
     fn sizes(configs: &[serde_json::Value]) -> Vec<(u64, u64)> {
-        configs
-            .iter()
-            .map(|c| (c["width"].as_u64().unwrap(), c["height"].as_u64().unwrap()))
-            .collect()
+        configs.iter().map(|c| (c["width"].as_u64().unwrap(), c["height"].as_u64().unwrap())).collect()
     }
 
     fn display_rig() -> Rig {
@@ -566,10 +544,8 @@ mod tests {
         let mut r = display_rig();
         let portrait = Ok(vec![info(1206, 2622, "rot0")]);
         let landscape = Ok(vec![info(2622, 1206, "rot90")]);
-        let src = FakeDisplay::new(
-            vec![portrait.clone(), landscape.clone(), landscape, portrait],
-            Duration::from_millis(10),
-        );
+        let src =
+            FakeDisplay::new(vec![portrait.clone(), landscape.clone(), landscape, portrait], Duration::from_millis(10));
         send_first_idr(&tx);
         stop_after(&r, 5500).await;
         let links = Links {
@@ -580,10 +556,7 @@ mod tests {
         let c = configs(&r.queue.drain());
         // The SPS size, then portrait, landscape, portrait: the repeated answers (the 3rd, 5th poll)
         // made no event.
-        assert_eq!(
-            sizes(&c),
-            vec![(1216, 2656), (1206, 2622), (2622, 1206), (1206, 2622)]
-        );
+        assert_eq!(sizes(&c), vec![(1216, 2656), (1206, 2622), (2622, 1206), (1206, 2622)]);
         assert_eq!(
             c.iter().map(|c| c["rotation"].as_u64()).collect::<Vec<_>>(),
             vec![None, Some(0), Some(90), Some(0)]
@@ -601,10 +574,8 @@ mod tests {
         tx.send(dg(5, 2000, false, &ap(&[&VPS, &rotated, &PPS]))).unwrap();
         tx.send(dg(6, 2000, true, &idr(&[6; 8]))).unwrap();
         stop_after(&r, 500).await;
-        let links = Links {
-            display: Some(DisplayLink { source: &src, poll_interval: None, pending: None }),
-            hid: None,
-        };
+        let links =
+            Links { display: Some(DisplayLink { source: &src, poll_interval: None, pending: None }), hid: None };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         let c = configs(&r.queue.drain());
         assert_eq!(sizes(&c), vec![(1216, 2656), (2656, 1216), (2622, 1206)]);
@@ -696,7 +667,7 @@ mod tests {
                 Action::Button { page: 0x0C, code: 0xE9, down: true },  // the long volume press starts
                 Action::Touch { down: false, x: 65535, y: 0 },          // the stop lifts the finger ...
                 Action::Button { page: 0x0C, code: 0xE9, down: false }, // ... and lets go of the key
-                Action::KeyboardRemove,                                  // and takes the keyboard down
+                Action::KeyboardRemove,                                 // and takes the keyboard down
             ]
         );
     }
@@ -933,10 +904,8 @@ mod tests {
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         let done = done.lock().unwrap();
-        let release = done
-            .iter()
-            .find(|(a, _)| *a == Action::KeyboardRelease)
-            .map(|(_, t)| (*t - t0).as_millis() as u64);
+        let release =
+            done.iter().find(|(a, _)| *a == Action::KeyboardRelease).map(|(_, t)| (*t - t0).as_millis() as u64);
         assert_eq!(release, Some(30_100), "30 s after the last keyboard command");
         // At the stop nothing was left down: only the keyboard is taken down.
         assert_eq!(done.last().map(|(a, _)| *a), Some(Action::KeyboardRemove));

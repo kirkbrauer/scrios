@@ -43,7 +43,7 @@ impl DisplayInfo {
 /// `rot0`, `rot90`, `rot180`, `rot270` (or just the number) as degrees.
 pub fn orientation_degrees(s: &str) -> Option<u16> {
     let n: u16 = s.trim().strip_prefix("rot").unwrap_or(s.trim()).parse().ok()?;
-    (n % 90 == 0 && n < 360).then_some(n)
+    (n.is_multiple_of(90) && n < 360).then_some(n)
 }
 
 /// The display the screen is on: the primary one that is not external, else any primary one,
@@ -59,10 +59,7 @@ pub fn primary(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
 fn as_f64(v: &plist::Value) -> Option<f64> {
     match v {
         plist::Value::Real(r) => Some(*r),
-        plist::Value::Integer(i) => i
-            .as_signed()
-            .map(|n| n as f64)
-            .or_else(|| i.as_unsigned().map(|n| n as f64)),
+        plist::Value::Integer(i) => i.as_signed().map(|n| n as f64).or_else(|| i.as_unsigned().map(|n| n as f64)),
         plist::Value::String(s) => s.trim().parse().ok(),
         // CoreDevice wraps some values in a single-key dictionary ({"int": 3}).
         plist::Value::Dictionary(d) if d.len() == 1 => d.iter().next().and_then(|(_, v)| as_f64(v)),
@@ -104,9 +101,9 @@ fn find<'a>(v: &'a plist::Value, key: &str, depth: u32) -> Option<&'a plist::Val
         return None;
     }
     match v {
-        plist::Value::Dictionary(d) => d
-            .get(key)
-            .or_else(|| d.iter().find_map(|(_, inner)| find(inner, key, depth + 1))),
+        plist::Value::Dictionary(d) => {
+            d.get(key).or_else(|| d.iter().find_map(|(_, inner)| find(inner, key, depth + 1)))
+        }
         plist::Value::Array(a) => a.iter().find_map(|inner| find(inner, key, depth + 1)),
         _ => None,
     }
@@ -129,18 +126,10 @@ fn parse_display(d: &plist::Dictionary) -> Option<DisplayInfo> {
 /// Reads the `displays` array of a `getdisplayinfo` reply. Displays without a usable `nativeSize`
 /// are skipped; no usable display at all is an error.
 pub fn parse_display_info(reply: &plist::Value) -> Result<Vec<DisplayInfo>, String> {
-    let displays = find(reply, "displays", 0)
-        .and_then(|v| v.as_array())
-        .ok_or("the reply has no `displays` array")?;
-    let parsed: Vec<DisplayInfo> = displays
-        .iter()
-        .filter_map(|d| d.as_dictionary().and_then(parse_display))
-        .collect();
+    let displays = find(reply, "displays", 0).and_then(|v| v.as_array()).ok_or("the reply has no `displays` array")?;
+    let parsed: Vec<DisplayInfo> = displays.iter().filter_map(|d| d.as_dictionary().and_then(parse_display)).collect();
     if parsed.is_empty() {
-        return Err(format!(
-            "none of the {} displays in the reply has a usable nativeSize",
-            displays.len()
-        ));
+        return Err(format!("none of the {} displays in the reply has a usable nativeSize", displays.len()));
     }
     Ok(parsed)
 }
@@ -165,6 +154,7 @@ mod tests {
         plist::Value::Dictionary(d)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn display(
         id: i64,
         name: &str,
@@ -275,10 +265,8 @@ mod tests {
             ("pointScale", dict(vec![("double", plist::Value::Real(3.0))])),
             ("currentOrientation", s("rot0")),
         ]);
-        let reply = dict(vec![(
-            "result",
-            dict(vec![("info", dict(vec![("displays", plist::Value::Array(vec![wrapped]))]))]),
-        )]);
+        let reply =
+            dict(vec![("result", dict(vec![("info", dict(vec![("displays", plist::Value::Array(vec![wrapped]))]))]))]);
         let all = parse_display_info(&reply).unwrap();
         assert_eq!(all[0].native_size, (1206, 2622));
         assert_eq!(all[0].point_scale, Some(3.0));

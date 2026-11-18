@@ -75,10 +75,7 @@ pub struct ProbeReport {
 
 impl ProbeReport {
     pub fn new(window: Duration) -> Self {
-        ProbeReport {
-            window,
-            ..Default::default()
-        }
+        ProbeReport { window, ..Default::default() }
     }
 
     /// Takes one datagram from the device into the counts.
@@ -94,8 +91,7 @@ impl ProbeReport {
         *self.rtp_by_pt.entry(pkt.payload_type).or_default() += 1;
         if self.first_payloads.len() < FIRST_PACKETS {
             let head = pkt.payload.iter().take(FIRST_BYTES).copied().collect();
-            self.first_payloads
-                .push((pkt.payload_type, pkt.sequence_number, head));
+            self.first_payloads.push((pkt.payload_type, pkt.sequence_number, head));
         }
         if pkt.payload_type == HEVC_PAYLOAD_TYPE {
             // HEVC: single NAL, aggregation (48) and fragmentation (49) by RFC 7798.
@@ -190,10 +186,7 @@ impl ProbeReport {
             ));
         }
         if self.raw_datagrams > 0 {
-            out.push(format!(
-                "raw dump: {} datagrams, {} bytes of datagram data",
-                self.raw_datagrams, self.raw_bytes
-            ));
+            out.push(format!("raw dump: {} datagrams, {} bytes of datagram data", self.raw_datagrams, self.raw_bytes));
         }
         match &self.sps {
             None => out.push("no H.264 SPS seen whole".to_string()),
@@ -228,16 +221,12 @@ impl ProbeReport {
                 self.junk
             ));
         }
-        let (&pt, &n) = self
-            .rtp_by_pt
-            .iter()
-            .max_by_key(|(_, n)| **n)
-            .expect("there are packets");
+        let (&pt, &n) = self.rtp_by_pt.iter().max_by_key(|(_, n)| **n).expect("there are packets");
         let looks_h264 = self.nal_types.contains_key(&avc::NAL_SPS) || self.nal_types.contains_key(&avc::NAL_IDR);
         match pt {
-            H264_PAYLOAD_TYPE => Ok(format!(
-                "the device sent H.264: {n} of {total} RTP packets have payload type {H264_PAYLOAD_TYPE}"
-            )),
+            H264_PAYLOAD_TYPE => {
+                Ok(format!("the device sent H.264: {n} of {total} RTP packets have payload type {H264_PAYLOAD_TYPE}"))
+            }
             HEVC_PAYLOAD_TYPE => Err(format!(
                 "the device answered with HEVC (payload type {HEVC_PAYLOAD_TYPE}: {n} of {total} RTP packets) although the offer named only H.264"
             )),
@@ -255,10 +244,7 @@ fn fmt_counts(m: &BTreeMap<u8, u64>) -> String {
     if m.is_empty() {
         return "none".to_string();
     }
-    m.iter()
-        .map(|(k, v)| format!("{k}: {v}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    m.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", ")
 }
 
 fn fmt_level(level_idc: u8) -> String {
@@ -266,10 +252,7 @@ fn fmt_level(level_idc: u8) -> String {
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter()
-        .map(|x| format!("{x:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
 }
 
 /// How the probe window ended.
@@ -516,7 +499,11 @@ mod tests {
         }
         assert_eq!(r.odd_total, 1000);
         assert_eq!(r.odd.len(), 200);
-        assert!(r.lines().join("\n").contains("1000 packets have a payload kind other than 1, 5 and 28 (logged in full below, 200 shown)"));
+        assert!(
+            r.lines()
+                .join("\n")
+                .contains("1000 packets have a payload kind other than 1, 5 and 28 (logged in full below, 200 shown)")
+        );
     }
 
     /// Reads a raw dump back: 4-byte big-endian length, then the datagram.
@@ -590,7 +577,6 @@ mod tests {
         assert!(report.raw_datagrams < 7, "the dump stopped early: {}", report.raw_datagrams);
         assert_eq!(report.rtp_by_pt[&123], 7, "every packet was still counted");
     }
-
 
     struct FakeSocket {
         rx: AsyncMutex<mpsc::UnboundedReceiver<io::Result<Datagram>>>,

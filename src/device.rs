@@ -5,8 +5,8 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,11 +14,10 @@ use std::time::Duration;
 use idevice::{
     IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::{
-        ButtonState, CallInfoBlob, CoreDeviceServiceClient, DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
-        DisplayServiceClient, HidSurface, IndigoHidClient, KeyboardUsage, MainKeyboardService,
-        MediaNegotiationBlob,
-        TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient,
-        build_screen_audio_offer, build_start_audio_parameters, build_start_video_parameters,
+        ButtonState, CallInfoBlob, CoreDeviceServiceClient, DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, DisplayServiceClient,
+        HidSurface, IndigoHidClient, KeyboardUsage, MainKeyboardService, MediaNegotiationBlob,
+        TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE, UniversalHidServiceClient, build_screen_audio_offer,
+        build_start_audio_parameters, build_start_video_parameters,
     },
     core_device_proxy::CoreDeviceProxy,
     rsd::RsdHandshake,
@@ -33,7 +32,7 @@ use crate::offer::{OfferFlags, build_video_offer};
 use crate::session::{Datagram, DatagramSocket};
 
 /// The label usbmuxd sees for our connections.
-const LABEL: &str = "jumpstarter-ios-display";
+const LABEL: &str = "scrios";
 /// `clientSupportedFeatures` is what the controller supports (what the system's own screen-sharing
 /// client sends), not the device's mask.
 const CLIENT_SUPPORTED_FEATURES: u64 = 140;
@@ -104,11 +103,8 @@ pub fn parse_usbmuxd_addr(spec: &str) -> Result<UsbmuxdAddr, String> {
         return Ok(UsbmuxdAddr::TcpSocket(a));
     }
     // host:port with a name.
-    let (host, port) = spec
-        .rsplit_once(':')
-        .ok_or_else(|| format!("bad usbmuxd address {spec:?}"))?;
-    port.parse::<u16>()
-        .map_err(|_| format!("bad port in usbmuxd address {spec:?}"))?;
+    let (host, port) = spec.rsplit_once(':').ok_or_else(|| format!("bad usbmuxd address {spec:?}"))?;
+    port.parse::<u16>().map_err(|_| format!("bad port in usbmuxd address {spec:?}"))?;
     spec.to_socket_addrs()
         .map_err(|e| format!("cannot resolve usbmuxd host {host:?}: {e}"))?
         .next()
@@ -118,10 +114,7 @@ pub fn parse_usbmuxd_addr(spec: &str) -> Result<UsbmuxdAddr, String> {
 
 /// Picks the device: the one named by `udid`, else the only one. A device that usbmuxd lists both
 /// over USB and over the network is one device (USB wins).
-pub fn select_device<'a>(
-    devices: &'a [UsbmuxdDevice],
-    udid: Option<&str>,
-) -> Result<&'a UsbmuxdDevice, String> {
+pub fn select_device<'a>(devices: &'a [UsbmuxdDevice], udid: Option<&str>) -> Result<&'a UsbmuxdDevice, String> {
     let candidates: Vec<&UsbmuxdDevice> = match udid {
         Some(u) => devices.iter().filter(|d| d.udid == u).collect(),
         None => devices.iter().collect(),
@@ -140,29 +133,20 @@ pub fn select_device<'a>(
             }
             None => Err("no device is connected (usbmuxd lists none)".into()),
         },
-        1 => Ok(candidates
-            .iter()
-            .find(|d| d.connection_type == Connection::Usb)
-            .copied()
-            .unwrap_or(candidates[0])),
-        _ => Err(format!(
-            "several devices are connected ({}): pass --udid",
-            udids.join(", ")
-        )),
+        1 => Ok(candidates.iter().find(|d| d.connection_type == Connection::Usb).copied().unwrap_or(candidates[0])),
+        _ => Err(format!("several devices are connected ({}): pass --udid", udids.join(", "))),
     }
 }
 
 /// A plist number, or a string of digits, or the `{"int": n}` wrapper CoreDevice uses.
 fn value_u64(v: &plist::Value) -> Option<u64> {
     match v {
-        plist::Value::Integer(_) => v
-            .as_unsigned_integer()
-            .or_else(|| v.as_signed_integer().and_then(|i| u64::try_from(i).ok())),
+        plist::Value::Integer(_) => {
+            v.as_unsigned_integer().or_else(|| v.as_signed_integer().and_then(|i| u64::try_from(i).ok()))
+        }
         plist::Value::Real(r) if *r >= 0.0 => Some(*r as u64),
         plist::Value::String(s) => s.trim().parse().ok(),
-        plist::Value::Dictionary(d) if d.len() == 1 => {
-            d.iter().next().and_then(|(_, inner)| value_u64(inner))
-        }
+        plist::Value::Dictionary(d) if d.len() == 1 => d.iter().next().and_then(|(_, inner)| value_u64(inner)),
         _ => None,
     }
 }
@@ -190,10 +174,7 @@ fn find_key(v: &plist::Value, key: &str, depth: u32) -> Option<plist::Value> {
 }
 
 fn find_u32(v: &plist::Value, key: &str) -> Option<u32> {
-    find_key(v, key, 0)
-        .as_ref()
-        .and_then(value_u64)
-        .and_then(|n| u32::try_from(n).ok())
+    find_key(v, key, 0).as_ref().and_then(value_u64).and_then(|n| u32::try_from(n).ok())
 }
 
 /// The HEVC payload's `rtp_sample_rate` from the negotiation blob in the answer, if it says.
@@ -220,9 +201,7 @@ fn negotiated_clock_hz(answer: &plist::Value) -> Option<u32> {
 /// carries the same stream config).
 pub fn answer_info(answer: &plist::Value) -> StreamInfo {
     StreamInfo {
-        source_port: find_u32(answer, "SourcePort")
-            .and_then(|p| u16::try_from(p).ok())
-            .filter(|p| *p != 0),
+        source_port: find_u32(answer, "SourcePort").and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0),
         device_ssrc: find_u32(answer, "LocalSSRC").filter(|s| *s != 0),
         fps: find_u32(answer, "Framerate").filter(|f| (1..=240).contains(f)),
         clock_hz: negotiated_clock_hz(answer),
@@ -232,9 +211,8 @@ pub fn answer_info(answer: &plist::Value) -> StreamInfo {
 
 /// Words in a key that make its value worth showing when the answer is read for what it says of
 /// the codec and the stream.
-const SUMMARY_WORDS: [&str; 12] = [
-    "payload", "codec", "ssrc", "port", "frame", "rtcp", "bitrate", "width", "height", "profile", "level", "ip",
-];
+const SUMMARY_WORDS: [&str; 12] =
+    ["payload", "codec", "ssrc", "port", "frame", "rtcp", "bitrate", "width", "height", "profile", "level", "ip"];
 
 fn collect_summary(v: &plist::Value, path: &str, depth: u32, out: &mut Vec<String>) {
     if depth > 8 || out.len() >= 80 {
@@ -245,7 +223,8 @@ fn collect_summary(v: &plist::Value, path: &str, depth: u32, out: &mut Vec<Strin
             for (k, inner) in d {
                 let here = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
                 let lower = k.to_ascii_lowercase();
-                let scalar = !matches!(inner, plist::Value::Dictionary(_) | plist::Value::Array(_) | plist::Value::Data(_));
+                let scalar =
+                    !matches!(inner, plist::Value::Dictionary(_) | plist::Value::Array(_) | plist::Value::Data(_));
                 if scalar && SUMMARY_WORDS.iter().any(|w| lower.contains(w)) {
                     out.push(format!("{here} = {inner:?}"));
                 }
@@ -318,9 +297,7 @@ impl StreamInfo {
 }
 
 async fn timed<T, F: Future<Output = T>>(what: &str, limit: Duration, fut: F) -> Result<T, String> {
-    tokio::time::timeout(limit, fut)
-        .await
-        .map_err(|_| format!("timed out after {} s: {what}", limit.as_secs()))
+    tokio::time::timeout(limit, fut).await.map_err(|_| format!("timed out after {} s: {what}", limit.as_secs()))
 }
 
 // ---- display info ----------------------------------------------------------------------------
@@ -336,9 +313,7 @@ impl RsdService for DeviceInfoClient {
     }
 
     async fn from_stream(stream: Box<dyn ReadWrite>) -> Result<Self, IdeviceError> {
-        Ok(Self {
-            inner: CoreDeviceServiceClient::new(stream).await?,
-        })
+        Ok(Self { inner: CoreDeviceServiceClient::new(stream).await? })
     }
 }
 
@@ -361,9 +336,7 @@ pub struct DisplayInfoClient {
 
 impl DisplayInfoClient {
     fn new(client: Option<DeviceInfoClient>) -> Self {
-        DisplayInfoClient {
-            inner: Arc::new(tokio::sync::Mutex::new(client)),
-        }
+        DisplayInfoClient { inner: Arc::new(tokio::sync::Mutex::new(client)) }
     }
 }
 
@@ -393,13 +366,12 @@ impl DisplayInfoSource for DisplayInfoClient {
 pub struct VideoSocket(UdpSocketHandle);
 
 impl DatagramSocket for VideoSocket {
+    // The trait asks for a `Send` future; spelled out so that the bound is checked here.
+    #[allow(clippy::manual_async_fn)]
     fn recv(&self) -> impl Future<Output = io::Result<Datagram>> + Send {
         async move {
             let dg = self.0.recv().await?;
-            Ok(Datagram {
-                src_port: dg.source_port,
-                data: dg.data,
-            })
+            Ok(Datagram { src_port: dg.source_port, data: dg.data })
         }
     }
 
@@ -478,17 +450,11 @@ impl Session {
         info!("using device {} ({:?})", dev.udid, dev.connection_type);
         let provider = dev.to_provider(addr, LABEL);
 
-        let proxy = timed(
-            "opening the CoreDevice tunnel",
-            CONNECT_TIMEOUT,
-            CoreDeviceProxy::connect(&provider),
-        )
-        .await?
-        .map_err(|e| format!("cannot open the CoreDevice tunnel: {e:?}"))?;
+        let proxy = timed("opening the CoreDevice tunnel", CONNECT_TIMEOUT, CoreDeviceProxy::connect(&provider))
+            .await?
+            .map_err(|e| format!("cannot open the CoreDevice tunnel: {e:?}"))?;
         let rsd_port = proxy.tunnel_info().server_rsd_port;
-        let adapter = proxy
-            .create_software_tunnel()
-            .map_err(|e| format!("cannot create the tunnel adapter: {e:?}"))?;
+        let adapter = proxy.create_software_tunnel().map_err(|e| format!("cannot create the tunnel adapter: {e:?}"))?;
         let mut adapter = adapter.to_async_handle();
         self.adapter = Some(adapter.clone());
         let stream = timed("connecting to RSD", CONNECT_TIMEOUT, adapter.connect(rsd_port))
@@ -503,7 +469,9 @@ impl Session {
             DisplayServiceClient::connect_rsd(&mut adapter, &mut handshake),
         )
         .await?
-        .map_err(|e| format!("this device has no display service (needs iOS 27 and a mounted developer image): {e:?}"))?;
+        .map_err(|e| {
+            format!("this device has no display service (needs iOS 27 and a mounted developer image): {e:?}")
+        })?;
         let client = self.client.insert(client);
 
         // The display's size and orientation, best effort: a slow or missing answer must not hold
@@ -513,14 +481,8 @@ impl Session {
         self.first_display = started.first;
         self.pending_display = started.pending;
 
-        let audio_udp = adapter
-            .bind_udp(0)
-            .await
-            .map_err(|e| format!("cannot bind the audio socket: {e}"))?;
-        let video_udp = adapter
-            .bind_udp(0)
-            .await
-            .map_err(|e| format!("cannot bind the video socket: {e}"))?;
+        let audio_udp = adapter.bind_udp(0).await.map_err(|e| format!("cannot bind the audio socket: {e}"))?;
+        let video_udp = adapter.bind_udp(0).await.map_err(|e| format!("cannot bind the video socket: {e}"))?;
         let receiver_ip = adapter.host_ip().to_string();
         let sender_ip = adapter.peer_ip().to_string();
         let audio_port = audio_udp.local_port();
@@ -558,9 +520,7 @@ impl Session {
             .await?
             .map_err(|e| format!("the audio stream did not start: {e:?}"))?;
         // Nothing reads the audio; drain it so the tunnel's queue for that socket cannot grow.
-        self.audio_drain = Some(tokio::spawn(async move {
-            while audio_udp.recv().await.is_ok() {}
-        }));
+        self.audio_drain = Some(tokio::spawn(async move { while audio_udp.recv().await.is_ok() {} }));
 
         // Then the video, on the same session, with our SSRC in the offer.
         self.our_ssrc = fresh_ssrc();
@@ -584,10 +544,7 @@ impl Session {
         let answer = timed("starting the video stream", START_TIMEOUT, client.start_media_stream(params))
             .await?
             .map_err(|e| format!("the video stream did not start: {e:?}"))?;
-        info!(
-            "video stream started (session {session_id}, our SSRC {:#x})",
-            self.our_ssrc
-        );
+        info!("video stream started (session {session_id}, our SSRC {:#x})", self.our_ssrc);
 
         let mut info_from = answer_info(&answer);
         if opts.log_answer {
@@ -708,10 +665,10 @@ impl Session {
         self.display = None;
         self.pending_display = None;
         self.handshake = None;
-        if let Some(mut adapter) = self.adapter.take() {
-            if let Err(e) = adapter.close().await {
-                debug!("closing the tunnel: {e}");
-            }
+        if let Some(mut adapter) = self.adapter.take()
+            && let Err(e) = adapter.close().await
+        {
+            debug!("closing the tunnel: {e}");
         }
     }
 }
@@ -743,10 +700,7 @@ pub fn surface_warnings(surfaces: &[HidSurface]) -> Vec<String> {
     let mut out = Vec::new();
     if surfaces.is_empty() {
         out.push("the device lists no HID surface".to_string());
-    } else if !surfaces
-        .iter()
-        .any(|s| s.service_id == DIGITIZER_SURFACE_MAIN_TOUCHSCREEN)
-    {
+    } else if !surfaces.iter().any(|s| s.service_id == DIGITIZER_SURFACE_MAIN_TOUCHSCREEN) {
         out.push(format!(
             "the device lists no touchscreen surface with id {DIGITIZER_SURFACE_MAIN_TOUCHSCREEN} (it lists: {})",
             surfaces
@@ -790,10 +744,7 @@ impl HidBackend for DeviceHid {
                     // One report type for a finger on the screen (0xC2) and one for its lift (0x02);
                     // a move is another contact sample. The timestamp is the wall clock.
                     let state = if down { TOUCHSCREEN_STATE_CONTACT } else { TOUCHSCREEN_STATE_RELEASE };
-                    client
-                        .send_touchscreen(state, x, y, None)
-                        .await
-                        .map_err(|e| format!("touch report failed: {e:?}"))
+                    client.send_touchscreen(state, x, y, None).await.map_err(|e| format!("touch report failed: {e:?}"))
                 }
                 Action::Key { usage, down } => {
                     let (Some(client), Some(kb)) = (self.touch.as_mut(), self.keyboard.as_mut()) else {
@@ -836,10 +787,7 @@ impl HidBackend for DeviceHid {
                             .unwrap_or_else(|| "the button service is not connected".into()));
                     };
                     let state = if down { ButtonState::Down } else { ButtonState::Up };
-                    client
-                        .send_button(page, code, state)
-                        .await
-                        .map_err(|e| format!("button event failed: {e:?}"))
+                    client.send_button(page, code, state).await.map_err(|e| format!("button event failed: {e:?}"))
                 }
             }
         })
@@ -867,7 +815,9 @@ async fn connect_display_info(adapter: &mut AdapterHandle, handshake: &mut RsdHa
     {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            warn!("no display info (the device info service did not open: {e:?}): the picture size comes from --visible-size or the SPS");
+            warn!(
+                "no display info (the device info service did not open: {e:?}): the picture size comes from --visible-size or the SPS"
+            );
             return DisplayStart::default();
         }
         Err(e) => {
@@ -881,10 +831,7 @@ async fn connect_display_info(adapter: &mut AdapterHandle, handshake: &mut RsdHa
     match tokio::time::timeout(DISPLAY_INFO_WAIT, &mut query).await {
         Ok(reply) => out.first = Some(reply),
         Err(_) => {
-            warn!(
-                "the display info is slow ({} s): going on without it, it will follow",
-                DISPLAY_INFO_WAIT.as_secs()
-            );
+            warn!("the display info is slow ({} s): going on without it, it will follow", DISPLAY_INFO_WAIT.as_secs());
             out.pending = Some(query);
         }
     }
@@ -909,11 +856,7 @@ mod tests {
     use super::*;
 
     fn dev(udid: &str, conn: Connection, id: u32) -> UsbmuxdDevice {
-        UsbmuxdDevice {
-            connection_type: conn,
-            udid: udid.into(),
-            device_id: id,
-        }
+        UsbmuxdDevice { connection_type: conn, udid: udid.into(), device_id: id }
     }
 
     #[test]
@@ -922,14 +865,8 @@ mod tests {
             parse_usbmuxd_addr("/var/run/usbmuxd"),
             Ok(UsbmuxdAddr::UnixSocket(p)) if p == "/var/run/usbmuxd"
         ));
-        assert!(matches!(
-            parse_usbmuxd_addr("./run/usbmuxd"),
-            Ok(UsbmuxdAddr::UnixSocket(_))
-        ));
-        assert!(matches!(
-            parse_usbmuxd_addr("usbmuxd.sock"),
-            Ok(UsbmuxdAddr::UnixSocket(_))
-        ));
+        assert!(matches!(parse_usbmuxd_addr("./run/usbmuxd"), Ok(UsbmuxdAddr::UnixSocket(_))));
+        assert!(matches!(parse_usbmuxd_addr("usbmuxd.sock"), Ok(UsbmuxdAddr::UnixSocket(_))));
         match parse_usbmuxd_addr("127.0.0.1:27015") {
             Ok(UsbmuxdAddr::TcpSocket(a)) => assert_eq!(a.to_string(), "127.0.0.1:27015"),
             other => panic!("{other:?}"),
@@ -952,10 +889,7 @@ mod tests {
         assert_eq!(select_device(&one, None).unwrap().device_id, 1);
         assert_eq!(select_device(&one, Some("AAA")).unwrap().device_id, 1);
 
-        let both = [
-            dev("AAA", Connection::Network("10.0.0.2".parse().unwrap()), 7),
-            dev("AAA", Connection::Usb, 8),
-        ];
+        let both = [dev("AAA", Connection::Network("10.0.0.2".parse().unwrap()), 7), dev("AAA", Connection::Usb, 8)];
         assert_eq!(select_device(&both, None).unwrap().device_id, 8);
     }
 
@@ -1025,11 +959,7 @@ mod tests {
 
     #[test]
     fn nonsense_values_are_ignored() {
-        let answer = dict(vec![
-            ("SourcePort", int(0)),
-            ("LocalSSRC", int(-4)),
-            ("Framerate", int(100_000)),
-        ]);
+        let answer = dict(vec![("SourcePort", int(0)), ("LocalSSRC", int(-4)), ("Framerate", int(100_000))]);
         assert_eq!(answer_info(&answer), StreamInfo::default());
         assert_eq!(answer_info(&plist::Value::Boolean(true)), StreamInfo::default());
     }
@@ -1037,11 +967,7 @@ mod tests {
     fn blob_with_rate(rate: u32) -> MediaNegotiationBlob {
         let mut blob = MediaNegotiationBlob::default();
         let mut group = StreamGroup::default();
-        group.payloads.push(StreamGroupPayload {
-            rtp_payload: 100,
-            rtp_sample_rate: rate,
-            ..Default::default()
-        });
+        group.payloads.push(StreamGroupPayload { rtp_payload: 100, rtp_sample_rate: rate, ..Default::default() });
         blob.stream_groups.push(group);
         blob
     }
@@ -1049,41 +975,23 @@ mod tests {
     #[test]
     fn the_clock_rate_comes_from_the_negotiation_blob_raw_or_compressed() {
         let raw = blob_with_rate(24_000).encode();
-        let answer = dict(vec![(
-            "avcMediaStreamNegotiatorMediaBlob",
-            plist::Value::Data(raw),
-        )]);
+        let answer = dict(vec![("avcMediaStreamNegotiatorMediaBlob", plist::Value::Data(raw))]);
         assert_eq!(answer_info(&answer).clock_hz, Some(24_000));
 
         let zipped = blob_with_rate(90_000).to_negotiator_offer().unwrap();
-        let answer = dict(vec![(
-            "answer",
-            dict(vec![(
-                "avcMediaStreamNegotiatorMediaBlob",
-                plist::Value::Data(zipped),
-            )]),
-        )]);
+        let answer =
+            dict(vec![("answer", dict(vec![("avcMediaStreamNegotiatorMediaBlob", plist::Value::Data(zipped))]))]);
         assert_eq!(answer_info(&answer).clock_hz, Some(90_000));
 
         // A rate of zero says nothing.
-        let zero = dict(vec![(
-            "avcMediaStreamNegotiatorMediaBlob",
-            plist::Value::Data(blob_with_rate(0).encode()),
-        )]);
+        let zero = dict(vec![("avcMediaStreamNegotiatorMediaBlob", plist::Value::Data(blob_with_rate(0).encode()))]);
         assert_eq!(answer_info(&zero).clock_hz, None);
     }
 
     #[test]
     fn fill_from_keeps_what_is_already_known() {
-        let mut a = StreamInfo {
-            source_port: Some(1),
-            ..Default::default()
-        };
-        a.fill_from(StreamInfo {
-            source_port: Some(2),
-            device_ssrc: Some(9),
-            ..Default::default()
-        });
+        let mut a = StreamInfo { source_port: Some(1), ..Default::default() };
+        a.fill_from(StreamInfo { source_port: Some(2), device_ssrc: Some(9), ..Default::default() });
         assert_eq!((a.source_port, a.device_ssrc), (Some(1), Some(9)));
     }
 
@@ -1109,8 +1017,7 @@ mod tests {
     fn the_answer_summary_picks_out_the_codec_and_stream_values() {
         use idevice::core_device::display_stream::negotiation::{StreamGroup, StreamGroupPayload, StreamGroupStream};
         let mut blob = MediaNegotiationBlob::default();
-        let mut group = StreamGroup::default();
-        group.stream_group = 3;
+        let mut group = StreamGroup { stream_group: 3, ..Default::default() };
         group.payloads.push(StreamGroupPayload {
             rtp_payload: 123,
             codec_type: 2,
@@ -1138,7 +1045,14 @@ mod tests {
         ]);
         let lines = answer_summary(&answer);
         let text = lines.join("\n");
-        for want in ["streamConfig.PayloadType = ", "streamConfig.SourcePort", "streamConfig.LocalSSRC", "streamConfig.Framerate", "streamConfig.RTCPTimeoutInterval", "streamConfig.Codec = String(\"H264\")"] {
+        for want in [
+            "streamConfig.PayloadType = ",
+            "streamConfig.SourcePort",
+            "streamConfig.LocalSSRC",
+            "streamConfig.Framerate",
+            "streamConfig.RTCPTimeoutInterval",
+            "streamConfig.Codec = String(\"H264\")",
+        ] {
             assert!(text.contains(want), "{want} missing from {text}");
         }
         assert!(!text.contains("Unrelated") && !text.contains("something"));

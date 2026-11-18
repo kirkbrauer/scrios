@@ -37,11 +37,7 @@ impl Frame {
         if params {
             flags |= FLAG_PARAMS;
         }
-        Frame {
-            pts_us,
-            flags,
-            payload,
-        }
+        Frame { pts_us, flags, payload }
     }
 
     /// A control frame carrying `event` as JSON (pts is 0).
@@ -49,11 +45,7 @@ impl Frame {
         // Serializing these plain structs cannot fail; fall back to an error object anyway.
         let payload = serde_json::to_vec(event)
             .unwrap_or_else(|_| br#"{"event":"error","message":"internal: event encoding"}"#.to_vec());
-        Frame {
-            pts_us: 0,
-            flags: FLAG_CONTROL,
-            payload,
-        }
+        Frame { pts_us: 0, flags: FLAG_CONTROL, payload }
     }
 
     pub fn is_control_frame(&self) -> bool {
@@ -218,18 +210,8 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), String> {
     }
     let pts_us = u64::from_be_bytes(buf[4..12].try_into().unwrap());
     let flags = buf[12];
-    let payload = buf
-        .get(HEADER_LEN..HEADER_LEN + len)
-        .ok_or("short payload")?
-        .to_vec();
-    Ok((
-        Frame {
-            pts_us,
-            flags,
-            payload,
-        },
-        HEADER_LEN + len,
-    ))
+    let payload = buf.get(HEADER_LEN..HEADER_LEN + len).ok_or("short payload")?.to_vec();
+    Ok((Frame { pts_us, flags, payload }, HEADER_LEN + len))
 }
 
 /// Splits a byte stream into frames (tests).
@@ -360,9 +342,7 @@ mod tests {
             String::from_utf8(Frame::control(&s).payload).unwrap(),
             r#"{"event":"stats","packets":1,"access_units":2,"bytes":3,"lost":4,"dropped_units":5,"keyframes":6,"plis":7,"rtcp":8,"b_slices":9,"edge_downs":10}"#
         );
-        let e = Event::Error {
-            message: "boom \"x\"".into(),
-        };
+        let e = Event::Error { message: "boom \"x\"".into() };
         assert_eq!(
             String::from_utf8(Frame::control(&e).payload).unwrap(),
             r#"{"event":"error","message":"boom \"x\""}"#

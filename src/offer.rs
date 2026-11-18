@@ -59,11 +59,7 @@ pub struct OfferFlags {
 impl Default for OfferFlags {
     /// The stock offer: `allowRTCPFB` 0, long-term references on.
     fn default() -> Self {
-        OfferFlags {
-            allow_rtcp_fb: false,
-            ltr: true,
-            codec: Codec::Hevc,
-        }
+        OfferFlags { allow_rtcp_fb: false, ltr: true, codec: Codec::Hevc }
     }
 }
 
@@ -161,10 +157,7 @@ pub fn encode(fields: &[Field]) -> Vec<u8> {
 
 fn set_varint(fields: &mut [Field], num: u32, value: u64) -> Result<(), String> {
     match fields.iter_mut().find(|f| f.num == num) {
-        Some(Field {
-            wire: wire @ Wire::Varint(_),
-            ..
-        }) => {
+        Some(Field { wire: wire @ Wire::Varint(_), .. }) => {
             *wire = Wire::Varint(value);
             Ok(())
         }
@@ -195,9 +188,7 @@ pub fn patch_blob(raw: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
         .iter_mut()
         .find(|f| f.num == VIDEO_SETTINGS && matches!(f.wire, Wire::Len(_)))
         .ok_or("the offer has no video settings (field 5)")?;
-    let Wire::Len(video_bytes) = &video.wire else {
-        unreachable!("checked above")
-    };
+    let Wire::Len(video_bytes) = &video.wire else { unreachable!("checked above") };
     let mut settings = parse(video_bytes)?;
 
     set_varint(&mut settings, F_ALLOW_RTCP_FB, u64::from(flags.allow_rtcp_fb))?;
@@ -239,12 +230,10 @@ fn bank_payload_type(bank: &Field) -> Result<Option<u64>, String> {
     let Wire::Len(bytes) = &bank.wire else {
         return Ok(None);
     };
-    Ok(parse(bytes)?
-        .iter()
-        .find_map(|f| match (f.num, &f.wire) {
-            (F_BANK_PAYLOAD, Wire::Varint(v)) => Some(*v),
-            _ => None,
-        }))
+    Ok(parse(bytes)?.iter().find_map(|f| match (f.num, &f.wire) {
+        (F_BANK_PAYLOAD, Wire::Varint(v)) => Some(*v),
+        _ => None,
+    }))
 }
 
 /// Drops `LTR;` from the feature string of the HEVC codec bank; other banks are not touched.
@@ -253,19 +242,17 @@ fn remove_ltr_feature(bank: &mut Field) -> Result<bool, String> {
         return Ok(false);
     };
     let mut inner = parse(bytes)?;
-    let is_hevc = inner
-        .iter()
-        .any(|f| f.num == F_BANK_PAYLOAD && f.wire == Wire::Varint(HEVC_PAYLOAD_TYPE));
+    let is_hevc = inner.iter().any(|f| f.num == F_BANK_PAYLOAD && f.wire == Wire::Varint(HEVC_PAYLOAD_TYPE));
     if !is_hevc {
         return Ok(false);
     }
     let mut changed = false;
     for f in inner.iter_mut().filter(|f| f.num == F_BANK_FEATURES) {
-        if let Wire::Len(s) = &mut f.wire {
-            if let Some(i) = s.windows(LTR_FEATURE.len()).position(|w| w == LTR_FEATURE) {
-                s.drain(i..i + LTR_FEATURE.len());
-                changed = true;
-            }
+        if let Wire::Len(s) = &mut f.wire
+            && let Some(i) = s.windows(LTR_FEATURE.len()).position(|w| w == LTR_FEATURE)
+        {
+            s.drain(i..i + LTR_FEATURE.len());
+            changed = true;
         }
     }
     if changed {
@@ -276,14 +263,9 @@ fn remove_ltr_feature(bank: &mut Field) -> Result<bool, String> {
 
 /// Rewrites the stock offer (a binary plist) with `flags`.
 pub fn patch_offer(stock: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
-    let mut value: plist::Value =
-        plist::from_bytes(stock).map_err(|e| format!("the offer is not a plist: {e}"))?;
+    let mut value: plist::Value = plist::from_bytes(stock).map_err(|e| format!("the offer is not a plist: {e}"))?;
     let dict = value.as_dictionary_mut().ok_or("the offer is not a dictionary")?;
-    let blob = dict
-        .get(BLOB_KEY)
-        .and_then(|v| v.as_data())
-        .ok_or("the offer has no media blob")?
-        .to_vec();
+    let blob = dict.get(BLOB_KEY).and_then(|v| v.as_data()).ok_or("the offer has no media blob")?.to_vec();
     let patched = deflate(&patch_blob(&inflate(&blob)?, flags)?)?;
     dict.insert(BLOB_KEY.into(), plist::Value::Data(patched));
     let mut out = Vec::new();
@@ -361,9 +343,7 @@ mod tests {
     }
 
     fn features(bank: &[Field]) -> String {
-        let Wire::Len(s) = &bank.iter().find(|f| f.num == F_BANK_FEATURES).unwrap().wire else {
-            panic!("features")
-        };
+        let Wire::Len(s) = &bank.iter().find(|f| f.num == F_BANK_FEATURES).unwrap().wire else { panic!("features") };
         String::from_utf8(s.clone()).unwrap()
     }
 
@@ -383,11 +363,7 @@ mod tests {
     }
 
     /// `allowRTCPFB` 1 and LTR off: the configuration a bare PLI was measured to work in.
-    const RTCP_FB_NO_LTR: OfferFlags = OfferFlags {
-        allow_rtcp_fb: true,
-        ltr: false,
-        codec: Codec::Hevc,
-    };
+    const RTCP_FB_NO_LTR: OfferFlags = OfferFlags { allow_rtcp_fb: true, ltr: false, codec: Codec::Hevc };
 
     #[test]
     fn the_default_flags_reproduce_the_builders_blob_byte_for_byte() {
@@ -465,11 +441,7 @@ mod tests {
         assert_eq!(sb.iter().find(|b| b.0 == 123), ob.iter().find(|b| b.0 == 123));
     }
 
-    const H264_ONLY: OfferFlags = OfferFlags {
-        allow_rtcp_fb: false,
-        ltr: true,
-        codec: Codec::H264,
-    };
+    const H264_ONLY: OfferFlags = OfferFlags { allow_rtcp_fb: false, ltr: true, codec: Codec::H264 };
 
     #[test]
     fn the_h264_offer_has_only_the_h264_bank_and_nothing_else_changes() {
@@ -522,7 +494,13 @@ mod tests {
     #[test]
     fn the_flags_are_independent() {
         for (fb, ltr) in [(false, false), (false, true), (true, false), (true, true)] {
-            let offer = build_video_offer("C", &call_info(), SSRC, OfferFlags { allow_rtcp_fb: fb, ltr, ..OfferFlags::default() }).unwrap();
+            let offer = build_video_offer(
+                "C",
+                &call_info(),
+                SSRC,
+                OfferFlags { allow_rtcp_fb: fb, ltr, ..OfferFlags::default() },
+            )
+            .unwrap();
             let vs = video_settings(&plist_blob(&offer));
             assert_eq!(varint(&vs, F_ALLOW_RTCP_FB), u64::from(fb));
             assert_eq!(varint(&vs, F_LTRP_ENABLED), u64::from(ltr));
