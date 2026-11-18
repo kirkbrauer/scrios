@@ -129,9 +129,11 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     if nal.len() < 5 || nal[0] & 0x80 != 0 || nal_type(nal[0]) != NAL_SPS {
         return Err(SpsError::NotSps);
     }
-    let (profile_idc, constraint_flags, level_idc) = (nal[1], nal[2], nal[3]);
-    let rbsp = unescape_rbsp(&nal[4..]);
+    // Emulation prevention covers everything after the NAL header byte, the profile, constraint flags and level
+    // too (a `00 00` there is followed by `03` if the next byte is 0..=3): unescape it all, as the rewrite does.
+    let rbsp = unescape_rbsp(&nal[1..]);
     let mut b = Bits::new(&rbsp);
+    let (profile_idc, constraint_flags, level_idc) = (b.u(8)? as u8, b.u(8)? as u8, b.u(8)? as u8);
     b.ue()?; // seq_parameter_set_id
     let mut chroma_format_idc = 1;
     if has_chroma_info(profile_idc) {
@@ -943,6 +945,7 @@ pub mod testutil {
 
     #[derive(Clone)]
     pub struct AvcSpsSpec {
+        pub sps_id: u32,
         pub profile_idc: u8,
         pub constraint_flags: u8,
         pub level_idc: u8,
@@ -964,6 +967,7 @@ pub mod testutil {
         /// Baseline, level 3.0, 640x480.
         pub fn baseline_vga() -> Self {
             AvcSpsSpec {
+                sps_id: 0,
                 profile_idc: 66,
                 constraint_flags: 0xC0,
                 level_idc: 30,
@@ -983,6 +987,7 @@ pub mod testutil {
         /// High, level 4.0, 1920x1088 coded and cropped to 1080.
         pub fn high_1080p() -> Self {
             AvcSpsSpec {
+                sps_id: 0,
                 profile_idc: 100,
                 constraint_flags: 0,
                 level_idc: 40,
@@ -1001,7 +1006,7 @@ pub mod testutil {
 
         pub fn nal(&self) -> Vec<u8> {
             let mut w = BitWriter::default();
-            w.ue(0); // seq_parameter_set_id
+            w.ue(self.sps_id); // seq_parameter_set_id
             if has_chroma_info(self.profile_idc) {
                 w.ue(self.chroma_format_idc);
                 if self.chroma_format_idc == 3 {
@@ -1127,6 +1132,26 @@ mod tests {
         spec.width_mbs = 1 << 28; // x 16 = 2^32: wrapped to 0 as a u32
         spec.crop = Some([0, 0, 0, 0]);
         assert_eq!(parse_avc_sps(&spec.nal()), Err(SpsError::Invalid("picture size")));
+    }
+
+    #[test]
+    fn an_emulation_prevention_byte_between_the_level_and_the_first_field_is_removed() {
+        // Constraint flags 0 and level 0 followed by an SPS id of 255 (eight zero bits) make `00 00 00`, which the
+        // NAL unit escapes as `00 00 03 00` across the end of the header fields: the byte after the level is 03.
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.sps_id = 255;
+        spec.constraint_flags = 0;
+        spec.level_idc = 0;
+        let unescaped = spec.nal();
+        let mut escaped = vec![unescaped[0]];
+        escaped.extend_from_slice(&escape_rbsp(&unescaped[1..]));
+        assert_eq!(&escaped[1..6], &[66, 0, 0, 3, 0], "the escape byte is there");
+        let want = parse_avc_sps(&unescaped).unwrap();
+        assert_eq!((want.width, want.height), (640, 480));
+        assert_eq!(parse_avc_sps(&escaped), Ok(want.clone()));
+        // And the rewrite, which always unescaped it, leaves the same picture.
+        let SpsRewrite::Patched(patched) = add_bitstream_restriction(&escaped).unwrap() else { panic!("not patched") };
+        assert_eq!(parse_avc_sps(&patched), Ok(want));
     }
 
     #[test]
