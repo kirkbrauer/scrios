@@ -48,6 +48,25 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 
+# The lints that apply to every build (`cargo build`, `clippy`, `test`, `doc`), CI included, where warnings are errors.
+# The parser modules (avc, sps, depack, commands) deny more, at the top of each file: no unwrap, expect, panic,
+# indexing or unchecked arithmetic on what comes off the wire. Nothing is allowed here crate-wide: a lint that does
+# not fit one item is `#[expect(.., reason = "..")]` on that item.
+[lints.rust]
+# The one `unsafe` block, `dup`/`dup2` of stdout in main.rs, is allowed on its function, with its safety argument.
+unsafe_code = "deny"
+# The crate's types are public, so a consumer can print them in a log or an `assert_eq!`.
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# A failed unwrap is a panic that a stream can hear: outside the tests (clippy.toml) they are errors to handle.
+unwrap_used = "warn"
+expect_used = "warn"
+
 [profile.release]
 opt-level = 2
 lto = "thin"
