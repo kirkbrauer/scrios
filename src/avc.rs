@@ -1,6 +1,6 @@
 //! H.264 (RFC 6184) helpers for the codec probe: NAL unit types and the sequence parameter set.
 
-use crate::sps::{Bits, SpsError, unescape_rbsp};
+use crate::sps::{BitWriter, Bits, SpsError, escape_rbsp, unescape_rbsp};
 
 pub const NAL_IDR: u8 = 5;
 pub const NAL_SPS: u8 = 7;
@@ -222,6 +222,290 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
         coded_width: (width_mbs * 16) as u32,
         coded_height: (frame_height_mbs * 16) as u32,
     })
+}
+
+// ---- the SPS rewrite: a VUI bitstream restriction ------------------------------------------------
+//
+// A browser's hardware H.264 decoder that finds no `bitstream_restriction` in the SPS assumes the level's
+// whole decoded picture buffer may be needed to reorder pictures and holds that many frames (11 at
+// 2400x1680, level 5.1) before it outputs the first: a latency of several hundred milliseconds. The
+// display stream has no B-frames, so saying so costs nothing: the SPS is rewritten to carry
+// `max_num_reorder_frames = 0` and `max_dec_frame_buffering = max_num_ref_frames`.
+
+/// The fields of the VUI's `bitstream_restriction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restriction {
+    pub motion_vectors_over_pic_boundaries: bool,
+    pub max_bytes_per_pic_denom: u32,
+    pub max_bits_per_mb_denom: u32,
+    pub log2_max_mv_length_horizontal: u32,
+    pub log2_max_mv_length_vertical: u32,
+    pub max_num_reorder_frames: u32,
+    pub max_dec_frame_buffering: u32,
+}
+
+/// What came of the rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpsRewrite {
+    /// The SPS with the restriction added (the NAL unit, emulation prevention included).
+    Patched(Vec<u8>),
+    /// The SPS has a restriction already: it is left as it is.
+    AlreadyRestricted(Restriction),
+}
+
+/// Reads bits and, if asked to, writes the same bits.
+struct Copier<'a> {
+    r: Bits<'a>,
+    w: Option<BitWriter>,
+}
+
+impl Copier<'_> {
+    fn u(&mut self, n: u32) -> Result<u32, SpsError> {
+        let v = self.r.u(n)?;
+        if let Some(w) = self.w.as_mut() {
+            w.u(n, u64::from(v));
+        }
+        Ok(v)
+    }
+
+    fn ue(&mut self) -> Result<u32, SpsError> {
+        let v = self.r.ue()?;
+        if let Some(w) = self.w.as_mut() {
+            w.ue(v);
+        }
+        Ok(v)
+    }
+
+    fn se(&mut self) -> Result<i64, SpsError> {
+        let v = self.r.se()?;
+        if let Some(w) = self.w.as_mut() {
+            w.se(v);
+        }
+        Ok(v)
+    }
+
+    fn scaling_list(&mut self, size: usize) -> Result<(), SpsError> {
+        let (mut last, mut next) = (8i64, 8i64);
+        for _ in 0..size {
+            if next != 0 {
+                next = (last + self.se()? + 256).rem_euclid(256);
+            }
+            if next != 0 {
+                last = next;
+            }
+        }
+        Ok(())
+    }
+
+    /// `hrd_parameters()` (Annex E).
+    fn hrd(&mut self) -> Result<(), SpsError> {
+        let cpb_cnt = self.ue()?;
+        if cpb_cnt > 31 {
+            return Err(SpsError::Invalid("cpb_cnt_minus1"));
+        }
+        self.u(4)?; // bit_rate_scale
+        self.u(4)?; // cpb_size_scale
+        for _ in 0..=cpb_cnt {
+            self.ue()?; // bit_rate_value_minus1
+            self.ue()?; // cpb_size_value_minus1
+            self.u(1)?; // cbr_flag
+        }
+        self.u(5)?; // initial_cpb_removal_delay_length_minus1
+        self.u(5)?; // cpb_removal_delay_length_minus1
+        self.u(5)?; // dpb_output_delay_length_minus1
+        self.u(5)?; // time_offset_length
+        Ok(())
+    }
+}
+
+/// Walks the SPS up to its `bitstream_restriction_flag`. With `write`, the bits are copied to a writer, and an
+/// SPS with no VUI gets one that holds nothing but flags that are off. Returns the number of reference
+/// frames, the restriction if the SPS has one, and the writer (positioned at the restriction flag).
+fn walk_sps(nal: &[u8], write: bool) -> Result<(u32, Option<Restriction>, Option<BitWriter>), SpsError> {
+    if nal.len() < 5 || nal[0] & 0x80 != 0 || nal_type(nal[0]) != NAL_SPS {
+        return Err(SpsError::NotSps);
+    }
+    let rbsp = unescape_rbsp(&nal[1..]);
+    let mut c = Copier {
+        r: Bits::new(&rbsp),
+        w: write.then(BitWriter::default),
+    };
+    let profile_idc = c.u(8)?;
+    c.u(8)?; // constraint flags
+    c.u(8)?; // level_idc
+    c.ue()?; // seq_parameter_set_id
+    if has_chroma_info(profile_idc as u8) {
+        let chroma_format_idc = c.ue()?;
+        if chroma_format_idc > 3 {
+            return Err(SpsError::Invalid("chroma_format_idc"));
+        }
+        if chroma_format_idc == 3 {
+            c.u(1)?; // separate_colour_plane_flag
+        }
+        c.ue()?; // bit_depth_luma_minus8
+        c.ue()?; // bit_depth_chroma_minus8
+        c.u(1)?; // qpprime_y_zero_transform_bypass_flag
+        if c.u(1)? == 1 {
+            // seq_scaling_matrix_present_flag
+            for i in 0..(if chroma_format_idc == 3 { 12 } else { 8 }) {
+                if c.u(1)? == 1 {
+                    c.scaling_list(if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+    c.ue()?; // log2_max_frame_num_minus4
+    match c.ue()? {
+        0 => {
+            c.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        }
+        1 => {
+            c.u(1)?; // delta_pic_order_always_zero_flag
+            c.se()?; // offset_for_non_ref_pic
+            c.se()?; // offset_for_top_to_bottom_field
+            let n = c.ue()?;
+            if n > 255 {
+                return Err(SpsError::Invalid("num_ref_frames_in_pic_order_cnt_cycle"));
+            }
+            for _ in 0..n {
+                c.se()?;
+            }
+        }
+        _ => {}
+    }
+    let max_num_ref_frames = c.ue()?;
+    c.u(1)?; // gaps_in_frame_num_value_allowed_flag
+    c.ue()?; // pic_width_in_mbs_minus1
+    c.ue()?; // pic_height_in_map_units_minus1
+    if c.u(1)? == 0 {
+        c.u(1)?; // mb_adaptive_frame_field_flag
+    }
+    c.u(1)?; // direct_8x8_inference_flag
+    if c.u(1)? == 1 {
+        // frame_cropping_flag
+        for _ in 0..4 {
+            c.ue()?;
+        }
+    }
+
+    // vui_parameters_present_flag, and the VUI up to bitstream_restriction_flag.
+    if c.r.bit()? == 0 {
+        if let Some(w) = c.w.as_mut() {
+            // A VUI of its own: present, with every flag before the restriction off (aspect ratio,
+            // overscan, video signal type, chroma location, timing, NAL HRD, VCL HRD, pic_struct).
+            w.u(1, 1);
+            for _ in 0..8 {
+                w.u(1, 0);
+            }
+        }
+        return Ok((max_num_ref_frames, None, c.w));
+    }
+    if let Some(w) = c.w.as_mut() {
+        w.u(1, 1);
+    }
+    if c.u(1)? == 1 {
+        // aspect_ratio_info_present_flag
+        if c.u(8)? == 255 {
+            c.u(16)?; // sar_width
+            c.u(16)?; // sar_height
+        }
+    }
+    if c.u(1)? == 1 {
+        c.u(1)?; // overscan_appropriate_flag
+    }
+    if c.u(1)? == 1 {
+        // video_signal_type_present_flag
+        c.u(3)?; // video_format
+        c.u(1)?; // video_full_range_flag
+        if c.u(1)? == 1 {
+            c.u(8)?; // colour_primaries
+            c.u(8)?; // transfer_characteristics
+            c.u(8)?; // matrix_coefficients
+        }
+    }
+    if c.u(1)? == 1 {
+        c.ue()?; // chroma_sample_loc_type_top_field
+        c.ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    if c.u(1)? == 1 {
+        // timing_info_present_flag
+        c.u(32)?; // num_units_in_tick
+        c.u(32)?; // time_scale
+        c.u(1)?; // fixed_frame_rate_flag
+    }
+    let nal_hrd = c.u(1)? == 1;
+    if nal_hrd {
+        c.hrd()?;
+    }
+    let vcl_hrd = c.u(1)? == 1;
+    if vcl_hrd {
+        c.hrd()?;
+    }
+    if nal_hrd || vcl_hrd {
+        c.u(1)?; // low_delay_hrd_flag
+    }
+    c.u(1)?; // pic_struct_present_flag
+    if c.r.bit()? == 0 {
+        // bitstream_restriction_flag: not written, the caller writes it with its fields
+        return Ok((max_num_ref_frames, None, c.w));
+    }
+    let restriction = Restriction {
+        motion_vectors_over_pic_boundaries: c.r.bit()? == 1,
+        max_bytes_per_pic_denom: c.r.ue()?,
+        max_bits_per_mb_denom: c.r.ue()?,
+        log2_max_mv_length_horizontal: c.r.ue()?,
+        log2_max_mv_length_vertical: c.r.ue()?,
+        max_num_reorder_frames: c.r.ue()?,
+        max_dec_frame_buffering: c.r.ue()?,
+    };
+    Ok((max_num_ref_frames, Some(restriction), c.w))
+}
+
+/// The VUI `bitstream_restriction` of an SPS NAL unit, if it has one.
+#[cfg(test)]
+pub fn sps_restriction(nal: &[u8]) -> Result<Option<Restriction>, SpsError> {
+    Ok(walk_sps(nal, false)?.1)
+}
+
+/// Adds `bitstream_restriction` (no reordering; a decoded picture buffer of `max_num_ref_frames`, at
+/// least 1) to an H.264 SPS NAL unit, copying every bit before it as it was. An SPS with no VUI gets one
+/// that holds only the restriction. An SPS that has a restriction already is not touched. The NAL header
+/// byte is kept, and the result has its emulation prevention bytes.
+pub fn add_bitstream_restriction(nal: &[u8]) -> Result<SpsRewrite, SpsError> {
+    let (max_num_ref_frames, existing, writer) = walk_sps(nal, true)?;
+    if let Some(r) = existing {
+        return Ok(SpsRewrite::AlreadyRestricted(r));
+    }
+    let mut w = writer.expect("write was asked for");
+    w.u(1, 1); // bitstream_restriction_flag
+    w.u(1, 1); // motion_vectors_over_pic_boundaries_flag
+    w.ue(0); // max_bytes_per_pic_denom
+    w.ue(0); // max_bits_per_mb_denom
+    w.ue(15); // log2_max_mv_length_horizontal
+    w.ue(15); // log2_max_mv_length_vertical
+    w.ue(0); // max_num_reorder_frames
+    w.ue(max_num_ref_frames.max(1)); // max_dec_frame_buffering
+    let mut out = vec![nal[0]];
+    out.extend_from_slice(&escape_rbsp(&w.finish()));
+    Ok(SpsRewrite::Patched(out))
+}
+
+/// The slice type of a slice NAL unit (types 1 and 5): the second `ue(v)` of its header, 0 to 9.
+pub fn slice_type(nal: &[u8]) -> Option<u32> {
+    if !matches!(nal_type(*nal.first()?), 1 | 5) {
+        return None;
+    }
+    let head = unescape_rbsp(nal.get(1..nal.len().min(17))?);
+    let mut b = Bits::new(&head);
+    b.ue().ok()?; // first_mb_in_slice
+    let t = b.ue().ok()?;
+    (t <= 9).then_some(t)
+}
+
+/// A B slice (slice_type 1 or 6) of a non-IDR picture: an IDR picture has only I slices (H.264 7.4.3),
+/// so a slice of NAL type 5 is never counted, whatever its header says.
+pub fn is_b_slice(nal: &[u8]) -> bool {
+    nal.first().is_some_and(|&b| nal_type(b) == 1) && matches!(slice_type(nal), Some(1 | 6))
 }
 
 // ---- the display stream's configuration packet: an avc1 box with an avcC record ----------------
@@ -514,6 +798,176 @@ pub mod testutil {
         make_box(b"avc1", &c)
     }
 
+    /// The HRD parameters of a VUI.
+    #[derive(Clone, Default)]
+    pub struct HrdSpec {
+        pub cpb_cnt_minus1: u32,
+        pub bit_rate_scale: u32,
+        pub cpb_size_scale: u32,
+        pub entries: Vec<(u32, u32, bool)>,
+        /// initial_cpb_removal_delay_length_minus1, cpb_removal_delay_length_minus1,
+        /// dpb_output_delay_length_minus1, time_offset_length
+        pub lengths: [u32; 4],
+    }
+
+    /// The VUI of an SPS, field by field.
+    #[derive(Clone, Default)]
+    pub struct VuiSpec {
+        /// aspect_ratio_idc, and the SAR for 255.
+        pub aspect: Option<(u8, Option<(u16, u16)>)>,
+        pub overscan: Option<bool>,
+        /// video_format, full range, and the three colour description bytes.
+        pub video_signal: Option<(u32, bool, Option<(u8, u8, u8)>)>,
+        pub chroma_loc: Option<(u32, u32)>,
+        /// num_units_in_tick, time_scale, fixed_frame_rate_flag
+        pub timing: Option<(u32, u32, bool)>,
+        pub nal_hrd: Option<HrdSpec>,
+        pub vcl_hrd: Option<HrdSpec>,
+        pub low_delay_hrd: bool,
+        pub pic_struct: bool,
+        pub restriction: Option<Restriction>,
+    }
+
+    impl VuiSpec {
+        /// What the iPad's SPS has: the video signal type with full range and no colour description.
+        pub fn ipad() -> Self {
+            VuiSpec {
+                video_signal: Some((5, true, None)),
+                ..VuiSpec::default()
+            }
+        }
+
+        /// Everything there is, with an HRD of two CPBs for both kinds.
+        pub fn everything() -> Self {
+            let hrd = HrdSpec {
+                cpb_cnt_minus1: 1,
+                bit_rate_scale: 4,
+                cpb_size_scale: 6,
+                entries: vec![(9_999, 19_999, false), (49_999, 99_999, true)],
+                lengths: [23, 23, 23, 24],
+            };
+            VuiSpec {
+                aspect: Some((255, Some((4, 3)))),
+                overscan: Some(true),
+                video_signal: Some((5, true, Some((1, 1, 1)))),
+                chroma_loc: Some((0, 1)),
+                timing: Some((1001, 60_000, true)),
+                nal_hrd: Some(hrd.clone()),
+                vcl_hrd: Some(hrd),
+                low_delay_hrd: true,
+                pic_struct: true,
+                restriction: None,
+            }
+        }
+
+        fn write(&self, w: &mut BitWriter) {
+            w.bit(1); // vui_parameters_present_flag
+            match self.aspect {
+                None => w.bit(0),
+                Some((idc, sar)) => {
+                    w.bit(1);
+                    w.u(8, u64::from(idc));
+                    if idc == 255 {
+                        let (x, y) = sar.expect("the extended SAR needs its size");
+                        w.u(16, u64::from(x));
+                        w.u(16, u64::from(y));
+                    }
+                }
+            }
+            match self.overscan {
+                None => w.bit(0),
+                Some(v) => {
+                    w.bit(1);
+                    w.bit(u32::from(v));
+                }
+            }
+            match self.video_signal {
+                None => w.bit(0),
+                Some((format, full_range, colour)) => {
+                    w.bit(1);
+                    w.u(3, u64::from(format));
+                    w.bit(u32::from(full_range));
+                    match colour {
+                        None => w.bit(0),
+                        Some((p, t, m)) => {
+                            w.bit(1);
+                            w.u(8, u64::from(p));
+                            w.u(8, u64::from(t));
+                            w.u(8, u64::from(m));
+                        }
+                    }
+                }
+            }
+            match self.chroma_loc {
+                None => w.bit(0),
+                Some((top, bottom)) => {
+                    w.bit(1);
+                    w.ue(top);
+                    w.ue(bottom);
+                }
+            }
+            match self.timing {
+                None => w.bit(0),
+                Some((ticks, scale, fixed)) => {
+                    w.bit(1);
+                    w.u(32, u64::from(ticks));
+                    w.u(32, u64::from(scale));
+                    w.bit(u32::from(fixed));
+                }
+            }
+            for hrd in [&self.nal_hrd, &self.vcl_hrd] {
+                match hrd {
+                    None => w.bit(0),
+                    Some(h) => {
+                        w.bit(1);
+                        w.ue(h.cpb_cnt_minus1);
+                        w.u(4, u64::from(h.bit_rate_scale));
+                        w.u(4, u64::from(h.cpb_size_scale));
+                        for (rate, size, cbr) in &h.entries {
+                            w.ue(*rate);
+                            w.ue(*size);
+                            w.bit(u32::from(*cbr));
+                        }
+                        for l in h.lengths {
+                            w.u(5, u64::from(l));
+                        }
+                    }
+                }
+            }
+            if self.nal_hrd.is_some() || self.vcl_hrd.is_some() {
+                w.bit(u32::from(self.low_delay_hrd));
+            }
+            w.bit(u32::from(self.pic_struct));
+            match self.restriction {
+                None => w.bit(0),
+                Some(r) => {
+                    w.bit(1);
+                    w.bit(u32::from(r.motion_vectors_over_pic_boundaries));
+                    w.ue(r.max_bytes_per_pic_denom);
+                    w.ue(r.max_bits_per_mb_denom);
+                    w.ue(r.log2_max_mv_length_horizontal);
+                    w.ue(r.log2_max_mv_length_vertical);
+                    w.ue(r.max_num_reorder_frames);
+                    w.ue(r.max_dec_frame_buffering);
+                }
+            }
+        }
+    }
+
+    /// The restriction the rewrite adds, for a stream with `refs` reference frames.
+    pub fn added_restriction(refs: u32) -> Restriction {
+        Restriction {
+            motion_vectors_over_pic_boundaries: true,
+            max_bytes_per_pic_denom: 0,
+            max_bits_per_mb_denom: 0,
+            log2_max_mv_length_horizontal: 15,
+            log2_max_mv_length_vertical: 15,
+            max_num_reorder_frames: 0,
+            max_dec_frame_buffering: refs.max(1),
+        }
+    }
+
+    #[derive(Clone)]
     pub struct AvcSpsSpec {
         pub profile_idc: u8,
         pub constraint_flags: u8,
@@ -524,6 +978,8 @@ pub mod testutil {
         pub poc_type: u32,
         /// `log2_max_pic_order_cnt_lsb_minus4` for poc type 0 (its value is never used).
         pub poc_lsb: u32,
+        pub num_ref_frames: u32,
+        pub vui: Option<VuiSpec>,
         pub width_mbs: u32,
         pub height_map_units: u32,
         pub frame_mbs_only: bool,
@@ -541,6 +997,8 @@ pub mod testutil {
                 scaling_lists: None,
                 poc_type: 2,
                 poc_lsb: 2,
+                num_ref_frames: 4,
+                vui: None,
                 width_mbs: 40,
                 height_map_units: 30,
                 frame_mbs_only: true,
@@ -558,6 +1016,8 @@ pub mod testutil {
                 scaling_lists: None,
                 poc_type: 0,
                 poc_lsb: 2,
+                num_ref_frames: 4,
+                vui: None,
                 width_mbs: 120,
                 height_map_units: 68,
                 frame_mbs_only: true,
@@ -609,7 +1069,7 @@ pub mod testutil {
                 }
                 _ => {}
             }
-            w.ue(4); // max_num_ref_frames
+            w.ue(self.num_ref_frames); // max_num_ref_frames
             w.bit(0); // gaps_in_frame_num_value_allowed_flag
             w.ue(self.width_mbs - 1);
             w.ue(self.height_map_units - 1);
@@ -627,7 +1087,10 @@ pub mod testutil {
                 }
                 None => w.bit(0),
             }
-            w.bit(0); // vui_parameters_present_flag
+            match &self.vui {
+                None => w.bit(0), // vui_parameters_present_flag
+                Some(v) => v.write(&mut w),
+            }
             let rbsp = w.finish();
             let mut nal = vec![0x67, self.profile_idc, self.constraint_flags, self.level_idc];
             nal.extend_from_slice(&escape_rbsp(&rbsp));
@@ -776,6 +1239,226 @@ mod tests {
         assert!(scan_payload(&middle).nal_types.is_empty());
         assert!(scan_payload(&end).nal_types.is_empty());
         assert_eq!(scan_payload(&middle).kind, Some(28));
+    }
+
+    // ---- the SPS rewrite --------------------------------------------------------------------
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    fn patched(nal: &[u8]) -> Vec<u8> {
+        match add_bitstream_restriction(nal).unwrap() {
+            SpsRewrite::Patched(p) => p,
+            other => panic!("expected a rewrite, got {other:?}"),
+        }
+    }
+
+    /// The same SPS, built with the restriction that the rewrite adds.
+    fn built_with_restriction(spec: &AvcSpsSpec) -> Vec<u8> {
+        let mut spec = spec.clone();
+        let mut vui = spec.vui.take().unwrap_or_default();
+        vui.restriction = Some(added_restriction(spec.num_ref_frames));
+        spec.vui = Some(vui);
+        spec.nal()
+    }
+
+    #[test]
+    fn the_ipads_sps_gets_its_restriction_bit_for_bit() {
+        // The vector verified with ffmpeg's trace_headers and by decoding the whole capture identically.
+        let input = unhex("27640033ac131450096034e9b810101010");
+        let want = unhex("27640033ac131450096034e9b81010103c201096");
+        assert_eq!((input.len(), want.len()), (17, 20));
+        assert_eq!(patched(&input), want);
+        // It reads back as a restriction with no reordering and four frames of buffer (the SPS has 4 references).
+        let r = sps_restriction(&want).unwrap().unwrap();
+        assert_eq!(r, added_restriction(4));
+        assert_eq!(sps_restriction(&input).unwrap(), None);
+        // Nothing the browser is told about the stream changed: profile, level, size, codec string.
+        assert_eq!(parse_avc_sps(&want).unwrap(), parse_avc_sps(&input).unwrap());
+        assert_eq!(parse_avc_sps(&want).unwrap().codec_string(), "avc1.640033");
+        // Rewriting it again is leaving it alone.
+        assert!(matches!(add_bitstream_restriction(&want).unwrap(), SpsRewrite::AlreadyRestricted(r2) if r2 == r));
+    }
+
+    #[test]
+    fn an_sps_with_no_vui_gets_one_with_only_the_restriction() {
+        let spec = AvcSpsSpec::high_1080p();
+        let out = patched(&spec.nal());
+        assert_eq!(out, built_with_restriction(&spec), "the VUI holds the restriction and flags that are off");
+        assert_eq!(sps_restriction(&out).unwrap(), Some(added_restriction(4)));
+        // Baseline and interlaced streams too.
+        for spec in [AvcSpsSpec::baseline_vga(), {
+            let mut s = AvcSpsSpec::baseline_vga();
+            s.frame_mbs_only = false;
+            s.height_map_units = 15;
+            s
+        }] {
+            assert_eq!(patched(&spec.nal()), built_with_restriction(&spec));
+        }
+    }
+
+    #[test]
+    fn the_buffer_is_the_number_of_reference_frames_and_at_least_one() {
+        for refs in [0u32, 1, 2, 4, 16] {
+            let mut spec = AvcSpsSpec::high_1080p();
+            spec.num_ref_frames = refs;
+            let out = patched(&spec.nal());
+            let r = sps_restriction(&out).unwrap().unwrap();
+            assert_eq!(r.max_dec_frame_buffering, refs.max(1), "{refs} reference frames");
+            assert_eq!(r.max_num_reorder_frames, 0);
+            assert_eq!(out, built_with_restriction(&spec));
+        }
+    }
+
+    #[test]
+    fn every_part_of_a_vui_is_copied_exactly() {
+        let hrd = VuiSpec::everything().nal_hrd;
+        let variants = [
+            ("the iPad's", VuiSpec::ipad()),
+            ("everything", VuiSpec::everything()),
+            ("aspect idc only", VuiSpec { aspect: Some((1, None)), ..VuiSpec::default() }),
+            ("extended SAR", VuiSpec { aspect: Some((255, Some((16, 9)))), ..VuiSpec::default() }),
+            ("overscan", VuiSpec { overscan: Some(false), ..VuiSpec::default() }),
+            ("colour description", VuiSpec { video_signal: Some((1, false, Some((9, 16, 9)))), ..VuiSpec::default() }),
+            ("chroma location", VuiSpec { chroma_loc: Some((2, 3)), ..VuiSpec::default() }),
+            ("timing", VuiSpec { timing: Some((1, 120, false)), ..VuiSpec::default() }),
+            ("NAL HRD only", VuiSpec { nal_hrd: hrd.clone(), low_delay_hrd: true, ..VuiSpec::default() }),
+            ("VCL HRD only", VuiSpec { vcl_hrd: hrd, low_delay_hrd: false, ..VuiSpec::default() }),
+            ("pic_struct", VuiSpec { pic_struct: true, ..VuiSpec::default() }),
+        ];
+        for (name, vui) in variants {
+            for base in [AvcSpsSpec::high_1080p(), AvcSpsSpec::baseline_vga()] {
+                let mut spec = base;
+                spec.vui = Some(vui.clone());
+                let input = spec.nal();
+                assert_eq!(patched(&input), built_with_restriction(&spec), "{name} (profile {})", spec.profile_idc);
+            }
+        }
+    }
+
+    #[test]
+    fn profile_dependent_fields_scaling_lists_and_poc_types_are_copied() {
+        let mut spec = AvcSpsSpec::high_1080p();
+        spec.vui = Some(VuiSpec::ipad());
+        // Scaling lists: one that ends early, a full one, a 64-entry one.
+        spec.profile_idc = 110;
+        spec.scaling_lists = Some(vec![
+            (0, vec![-8]),
+            (3, (0..16).map(|i| if i % 2 == 0 { 3 } else { -2 }).collect()),
+            (7, (0..64).map(|i| (i % 5) - 2).collect()),
+        ]);
+        assert_eq!(patched(&spec.nal()), built_with_restriction(&spec));
+        // 4:4:4 has twelve lists and a separate-plane flag.
+        spec.profile_idc = 244;
+        spec.chroma_format_idc = 3;
+        spec.scaling_lists = Some(vec![(2, vec![1, -1, 1, -9]), (11, vec![-8])]);
+        assert_eq!(patched(&spec.nal()), built_with_restriction(&spec));
+        // Picture order count types 0, 1 and 2, cropping, a big picture.
+        for poc in 0..3 {
+            let mut s = AvcSpsSpec::high_1080p();
+            s.poc_type = poc;
+            s.vui = Some(VuiSpec::ipad());
+            assert_eq!(patched(&s.nal()), built_with_restriction(&s), "poc type {poc}");
+        }
+        let mut s = AvcSpsSpec::high_1080p();
+        s.width_mbs = 150;
+        s.height_map_units = 105;
+        s.crop = Some([1, 2, 3, 4]);
+        assert_eq!(patched(&s.nal()), built_with_restriction(&s));
+    }
+
+    #[test]
+    fn an_sps_that_has_a_restriction_already_is_left_alone() {
+        let own = Restriction {
+            motion_vectors_over_pic_boundaries: false,
+            max_bytes_per_pic_denom: 2,
+            max_bits_per_mb_denom: 1,
+            log2_max_mv_length_horizontal: 12,
+            log2_max_mv_length_vertical: 11,
+            max_num_reorder_frames: 2,
+            max_dec_frame_buffering: 3,
+        };
+        let mut spec = AvcSpsSpec::high_1080p();
+        spec.vui = Some(VuiSpec { restriction: Some(own), ..VuiSpec::ipad() });
+        let input = spec.nal();
+        assert_eq!(add_bitstream_restriction(&input).unwrap(), SpsRewrite::AlreadyRestricted(own));
+        assert_eq!(sps_restriction(&input).unwrap(), Some(own));
+    }
+
+    #[test]
+    fn emulation_prevention_bytes_are_read_and_written_back() {
+        // A long run of zero bits in a field makes 00 00 in the bytes, so the NAL unit has 00 00 03.
+        let mut escaped = 0;
+        for n in 22..=30u32 {
+            let mut spec = AvcSpsSpec::high_1080p();
+            spec.crop = None;
+            spec.poc_lsb = (1u32 << n) - 1;
+            spec.vui = Some(VuiSpec::ipad());
+            let input = spec.nal();
+            let out = patched(&input);
+            assert_eq!(out, built_with_restriction(&spec), "poc_lsb {}", spec.poc_lsb);
+            escaped += usize::from(input.windows(3).any(|w| w == [0, 0, 3]));
+            // The output is a valid NAL unit: no 00 00 00/01/02 inside, and it parses to the same stream.
+            assert!(!out.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 2), "{out:02x?}");
+            assert_eq!(parse_avc_sps(&out).unwrap(), parse_avc_sps(&input).unwrap());
+        }
+        assert!(escaped >= 3, "only {escaped} of the inputs had an emulation prevention byte");
+        // The NAL header byte is kept as it is (a different NRI is not turned into 0x67).
+        let mut input = AvcSpsSpec::baseline_vga().nal();
+        input[0] = 0x47;
+        assert_eq!(patched(&input)[0], 0x47);
+    }
+
+    #[test]
+    fn a_truncated_or_odd_sps_is_an_error_and_never_a_panic() {
+        let mut spec = AvcSpsSpec::high_1080p();
+        spec.vui = Some(VuiSpec::everything());
+        let input = spec.nal();
+        // Cut anywhere before the last bytes (which hold only the end of the VUI and the trailing bits).
+        for n in 0..input.len() - 2 {
+            assert!(add_bitstream_restriction(&input[..n]).is_err(), "cut at {n}");
+        }
+        for n in input.len() - 2..=input.len() {
+            let _ = add_bitstream_restriction(&input[..n]);
+        }
+        // Not an SPS, or with the forbidden bit.
+        assert_eq!(add_bitstream_restriction(&[0x68, 0xEE, 0x3C, 0x80, 0x80]), Err(SpsError::NotSps));
+        assert_eq!(add_bitstream_restriction(&[0xE7, 100, 0, 51, 0xFF]), Err(SpsError::NotSps));
+        // Impossible values: a huge HRD count, a huge POC cycle.
+        let mut bad = vec![0x67, 66, 0, 30];
+        bad.extend_from_slice(&[0xFF; 20]);
+        assert!(add_bitstream_restriction(&bad).is_err());
+        for fill in 0..=255u8 {
+            let mut v = vec![0x67, 100, 0, 40];
+            v.extend(std::iter::repeat(fill).take(30));
+            let _ = add_bitstream_restriction(&v);
+        }
+    }
+
+    #[test]
+    fn slice_types_are_read_from_the_slice_header() {
+        use crate::sps::testutil::BitWriter;
+        let slice_nal = |nal_header: u8, slice_type: u32| {
+            let mut w = BitWriter::default();
+            w.ue(0); // first_mb_in_slice
+            w.ue(slice_type);
+            w.ue(0); // pic_parameter_set_id
+            let mut n = vec![nal_header];
+            n.extend_from_slice(&crate::sps::testutil::escape_rbsp(&w.finish()));
+            n
+        };
+        for (t, b) in [(0, false), (1, true), (2, false), (3, false), (4, false), (5, false), (6, true), (7, false), (8, false), (9, false)] {
+            assert_eq!(slice_type(&slice_nal(0x41, t)), Some(t));
+            assert_eq!(is_b_slice(&slice_nal(0x41, t)), b, "slice_type {t} in a non-IDR slice");
+            assert!(!is_b_slice(&slice_nal(0x65, t)), "an IDR slice is never a B slice (slice_type {t})");
+        }
+        // Not a slice, or nonsense: no type.
+        assert_eq!(slice_type(&[0x67, 0x80]), None);
+        assert_eq!(slice_type(&[0x41]), None);
+        assert_eq!(slice_type(&[]), None);
+        assert_eq!(slice_type(&slice_nal(0x41, 10)), None);
+        assert_eq!(slice_type(&[0x41, 0x00, 0x00, 0x00]), None);
     }
 
     // ---- the configuration packet ----------------------------------------------------------

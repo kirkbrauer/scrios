@@ -173,6 +173,67 @@ pub fn unescape_rbsp(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// MSB-first bit writer for RBSP bytes.
+#[derive(Default)]
+pub(crate) struct BitWriter {
+    pub bytes: Vec<u8>,
+    nbits: usize,
+}
+
+impl BitWriter {
+    pub fn bit(&mut self, v: u32) {
+        if self.nbits % 8 == 0 {
+            self.bytes.push(0);
+        }
+        if v & 1 == 1 {
+            *self.bytes.last_mut().expect("a byte was pushed") |= 0x80 >> (self.nbits % 8);
+        }
+        self.nbits += 1;
+    }
+
+    pub fn u(&mut self, n: u32, v: u64) {
+        for i in (0..n).rev() {
+            self.bit(((v >> i) & 1) as u32);
+        }
+    }
+
+    pub fn ue(&mut self, v: u32) {
+        let x = u64::from(v) + 1;
+        let len = 64 - x.leading_zeros(); // bits in x
+        self.u(len - 1, 0);
+        self.u(len, x);
+    }
+
+    /// Signed Exp-Golomb.
+    pub fn se(&mut self, v: i64) {
+        self.ue(if v > 0 { (2 * v - 1) as u32 } else { (-2 * v) as u32 });
+    }
+
+    /// rbsp_trailing_bits: a one, then zeros to the byte boundary.
+    pub fn finish(mut self) -> Vec<u8> {
+        self.bit(1);
+        while self.nbits % 8 != 0 {
+            self.bit(0);
+        }
+        self.bytes
+    }
+}
+
+/// Inserts emulation prevention bytes: a `03` after any `00 00` followed by a byte <= 3.
+pub fn escape_rbsp(rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rbsp.len() + 8);
+    let mut zeros = 0;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        out.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
 /// Parses an SPS NAL unit (including its two-byte NAL unit header, without a start code).
 pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
     if nal.len() < 3 {
@@ -260,65 +321,7 @@ pub mod testutil {
     //! Builds SPS NAL units for tests: a bit writer plus the fields `parse_sps` reads, followed by
     //! the fields of a plain low-delay Main stream so the result looks like a real SPS.
 
-    #[derive(Default)]
-    pub struct BitWriter {
-        pub bytes: Vec<u8>,
-        nbits: usize,
-    }
-
-    impl BitWriter {
-        pub fn bit(&mut self, v: u32) {
-            if self.nbits % 8 == 0 {
-                self.bytes.push(0);
-            }
-            if v & 1 == 1 {
-                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.nbits % 8);
-            }
-            self.nbits += 1;
-        }
-
-        pub fn u(&mut self, n: u32, v: u64) {
-            for i in (0..n).rev() {
-                self.bit(((v >> i) & 1) as u32);
-            }
-        }
-
-        pub fn ue(&mut self, v: u32) {
-            let x = v as u64 + 1;
-            let len = 64 - x.leading_zeros(); // bits in x
-            self.u(len - 1, 0);
-            self.u(len, x);
-        }
-
-        /// Signed Exp-Golomb.
-        pub fn se(&mut self, v: i64) {
-            self.ue(if v > 0 { (2 * v - 1) as u32 } else { (-2 * v) as u32 });
-        }
-
-        /// rbsp_trailing_bits
-        pub fn finish(mut self) -> Vec<u8> {
-            self.bit(1);
-            while self.nbits % 8 != 0 {
-                self.bit(0);
-            }
-            self.bytes
-        }
-    }
-
-    /// Inserts emulation prevention bytes: a `03` after any `00 00` followed by a byte <= 3.
-    pub fn escape_rbsp(rbsp: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(rbsp.len() + 8);
-        let mut zeros = 0;
-        for &b in rbsp {
-            if zeros >= 2 && b <= 3 {
-                out.push(3);
-                zeros = 0;
-            }
-            out.push(b);
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-        }
-        out
-    }
+    pub(crate) use super::{BitWriter, escape_rbsp};
 
     pub struct SpsSpec {
         pub profile_idc: u8,

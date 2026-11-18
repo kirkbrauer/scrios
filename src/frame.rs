@@ -198,6 +198,9 @@ pub struct Stats {
     pub plis: u64,
     /// RTCP datagrams sent to the device (receiver reports and keyframe requests).
     pub rtcp: u64,
+    /// B slices seen in an H.264 stream. The SPS is rewritten to say there is no reordering, so a B slice is
+    /// a surprise (pictures may then come out of order); nothing is done about it but to count it.
+    pub b_slices: u64,
 }
 
 /// Decodes one frame from the front of `buf` (tests and tools): the frame and the bytes used.
@@ -347,10 +350,11 @@ mod tests {
             keyframes: 6,
             plis: 7,
             rtcp: 8,
+            b_slices: 9,
         });
         assert_eq!(
             String::from_utf8(Frame::control(&s).payload).unwrap(),
-            r#"{"event":"stats","packets":1,"access_units":2,"bytes":3,"lost":4,"dropped_units":5,"keyframes":6,"plis":7,"rtcp":8}"#
+            r#"{"event":"stats","packets":1,"access_units":2,"bytes":3,"lost":4,"dropped_units":5,"keyframes":6,"plis":7,"rtcp":8,"b_slices":9}"#
         );
         let e = Event::Error {
             message: "boom \"x\"".into(),

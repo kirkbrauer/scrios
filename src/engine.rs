@@ -489,6 +489,7 @@ impl Engine {
             access_units: w.units,
             bytes: w.bytes,
             keyframes: w.keyframes,
+            b_slices: self.asm.b_slices(),
             ..self.counters
         }
     }
@@ -1848,8 +1849,16 @@ mod tests {
                 self.eng.on_datagram(self.at(ms), PORT, &d);
             }
 
+            /// The SPS as the device sends it, and as it goes out (with a bitstream restriction).
             fn sps() -> Vec<u8> {
                 AvcSpsSpec::baseline_vga().nal()
+            }
+
+            fn sent_sps() -> Vec<u8> {
+                match crate::avc::add_bitstream_restriction(&Self::sps()).unwrap() {
+                    crate::avc::SpsRewrite::Patched(p) => p,
+                    other => panic!("{other:?}"),
+                }
             }
 
             /// SPS and PPS in a STAP-A, then the IDR in three fragments.
@@ -1885,7 +1894,7 @@ mod tests {
             assert_eq!((c["coded_width"].as_u64(), c["coded_height"].as_u64()), (Some(640), Some(480)));
             assert_eq!(f[1].flags, FLAG_KEY | FLAG_PARAMS);
             let mut want = Vec::new();
-            for nal in [&H264Rig::sps()[..], &PPS264[..]] {
+            for nal in [&H264Rig::sent_sps()[..], &PPS264[..]] {
                 want.extend_from_slice(&[0, 0, 0, 1]);
                 want.extend_from_slice(nal);
             }
@@ -1893,6 +1902,48 @@ mod tests {
             assert_eq!(f[2].flags, 0);
             let s = r.eng.stats();
             assert_eq!((s.access_units, s.keyframes, s.dropped_units), (2, 1, 0));
+        }
+
+        /// A non-IDR slice with the given slice_type in its header.
+        fn typed_slice(slice_type: u32) -> Vec<u8> {
+            let mut w = crate::sps::testutil::BitWriter::default();
+            w.ue(0);
+            w.ue(slice_type);
+            w.ue(0);
+            for _ in 0..8 {
+                w.u(8, 0x5A);
+            }
+            let mut n = vec![0x41];
+            n.extend_from_slice(&crate::sps::testutil::escape_rbsp(&w.finish()));
+            n
+        }
+
+        #[test]
+        fn b_slices_are_counted_in_the_stats_and_the_stream_goes_on_unchanged() {
+            let mut r = H264Rig::new();
+            r.idr(0, true);
+            let b = typed_slice(1);
+            let p = typed_slice(0);
+            r.pkt(10, true, &p);
+            r.ts += 3000;
+            assert_eq!(r.eng.stats().b_slices, 0);
+            r.pkt(20, true, &b);
+            r.ts += 3000;
+            r.pkt(30, true, &typed_slice(6));
+            r.ts += 3000;
+            r.pkt(40, true, &p);
+            let f = r.q.drain();
+            let s = r.eng.stats();
+            assert_eq!(s.b_slices, 2);
+            // Every picture was written, in order, with the slice as it came.
+            assert_eq!((s.access_units, s.keyframes, s.dropped_units), (5, 1, 0));
+            let units: Vec<_> = f.iter().filter(|f| !f.is_control_frame()).collect();
+            assert_eq!(units.len(), 5);
+            assert_eq!(units[2].payload, [&[0u8, 0, 0, 1][..], &b[..]].concat());
+            assert!(units.windows(2).all(|w| w[0].pts_us <= w[1].pts_us));
+            // And the stats line carries the count.
+            let line = crate::frame::Frame::control(&crate::frame::Event::Stats(s));
+            assert!(String::from_utf8_lossy(&line.payload).contains("\"b_slices\":2"));
         }
 
         #[test]

@@ -143,6 +143,15 @@ pub trait NalFormat {
     fn check_nal(nal: &[u8]) -> NalCheck;
     /// Splits one RTP payload.
     fn parse<'a>(payload: &'a [u8], out: &mut Vec<Item<'a>>);
+    /// A replacement for a whole NAL unit of type `typ` that goes into the stream instead of it
+    /// (`None`: as it is). H.264 uses this to give its SPS a VUI bitstream restriction.
+    fn transform_nal(_typ: u8, _nal: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    /// Whether a whole NAL unit is a B slice.
+    fn is_b_slice(_typ: u8, _nal: &[u8]) -> bool {
+        false
+    }
 }
 
 /// HEVC, RFC 7798: single NAL unit, aggregation packets (48), fragmentation units (49).
@@ -248,6 +257,7 @@ pub const H264_CONFIG_KIND: u8 = 18;
 /// Each of the two things worth saying about the configuration packet is said once per process.
 static CONFIG_READ_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONFIG_FAILED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SPS_PATCH_FAILED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl NalFormat for H264 {
     const PARAM_TYPES: &'static [u8] = &[crate::avc::NAL_SPS, crate::avc::NAL_PPS];
@@ -256,6 +266,32 @@ impl NalFormat for H264 {
 
     fn is_key(t: u8) -> bool {
         t == crate::avc::NAL_IDR
+    }
+
+    /// The SPS gets `bitstream_restriction` with no reordering (see `avc::add_bitstream_restriction`); one
+    /// that cannot be read is passed on as it came, with one warning.
+    fn transform_nal(typ: u8, nal: &[u8]) -> Option<Vec<u8>> {
+        use crate::avc::{SpsRewrite, add_bitstream_restriction};
+        use std::sync::atomic::Ordering::Relaxed;
+        if typ != crate::avc::NAL_SPS {
+            return None;
+        }
+        match add_bitstream_restriction(nal) {
+            Ok(SpsRewrite::Patched(p)) => Some(p),
+            Ok(SpsRewrite::AlreadyRestricted(_)) => None,
+            Err(e) => {
+                if !SPS_PATCH_FAILED_LOGGED.swap(true, Relaxed) {
+                    tracing::warn!(
+                        "an H.264 SPS could not be rewritten with a bitstream restriction ({e}): passing it on as it is, a browser's hardware decoder may buffer a full DPB before its first picture"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    fn is_b_slice(typ: u8, nal: &[u8]) -> bool {
+        typ == 1 && crate::avc::is_b_slice(nal)
     }
 
     fn check_nal(nal: &[u8]) -> NalCheck {
@@ -373,6 +409,13 @@ impl NalFormat for H264 {
     }
 }
 
+/// Says once that the stream has B slices although its SPS says it has no reordering.
+fn note_b_slice(warned: &mut bool) {
+    if !std::mem::replace(warned, true) {
+        tracing::warn!("B slices with max_num_reorder_frames=0: pictures may be out of order");
+    }
+}
+
 /// What a depacketizer offers the engine, whichever the codec.
 pub trait Depacketizer {
     /// Feeds one RTP packet; finished units and drops are appended to `out`.
@@ -384,6 +427,10 @@ pub trait Depacketizer {
     /// Units that ended by the next timestamp rather than by a marker bit.
     fn units_without_marker(&self) -> u64;
     fn has_parameter_sets(&self) -> bool;
+    /// B slices seen (H.264): the stream says it has no reordering, so these are a surprise.
+    fn b_slices(&self) -> u64 {
+        0
+    }
     /// Forgets the sequence state, the unit in progress and the cached parameter sets (the stream
     /// restarted with a new source).
     fn reset(&mut self);
@@ -442,6 +489,9 @@ pub struct UnitAssembler<F: NalFormat> {
     lost: u64,
     late: u64,
     units_without_marker: u64,
+    b_slices: u64,
+    /// The warning about B slices has been given.
+    b_warned: bool,
     _format: PhantomData<F>,
 }
 
@@ -472,6 +522,8 @@ impl<F: NalFormat> UnitAssembler<F> {
             lost: 0,
             late: 0,
             units_without_marker: 0,
+            b_slices: 0,
+            b_warned: false,
             _format: PhantomData,
         }
     }
@@ -579,6 +631,10 @@ impl<F: NalFormat> UnitAssembler<F> {
             Item::Config(sets) => {
                 if let Some(cur) = self.cur.as_mut() {
                     for (i, nal) in sets {
+                        let nal = F::PARAM_TYPES
+                            .get(i)
+                            .and_then(|t| F::transform_nal(*t, &nal))
+                            .unwrap_or(nal);
                         if let Some(slot) = cur.params.get_mut(i) {
                             *slot = Some(nal);
                         }
@@ -633,7 +689,18 @@ impl<F: NalFormat> UnitAssembler<F> {
             cur.fu_open = false;
             let n = cur.nals.last_mut().expect("an open fragment has an entry");
             n.end = cur.buf.len();
-            let (s, e, t) = (n.start, n.end, n.typ);
+            let (s, t) = (n.start, n.typ);
+            // The finished NAL unit may be replaced (an SPS gets its restriction): it is the tail of the buffer.
+            if let Some(new) = F::transform_nal(t, &cur.buf[s..]) {
+                cur.buf.truncate(s);
+                cur.buf.extend_from_slice(&new);
+                n.end = cur.buf.len();
+            }
+            let e = n.end;
+            if F::is_b_slice(t, &cur.buf[s..e]) {
+                self.b_slices += 1;
+                note_b_slice(&mut self.b_warned);
+            }
             if let Some(i) = F::PARAM_TYPES.iter().position(|p| *p == t) {
                 cur.params[i] = Some(cur.buf[s..e].to_vec());
             }
@@ -650,6 +717,13 @@ impl<F: NalFormat> UnitAssembler<F> {
                 return;
             }
         };
+        if F::is_b_slice(typ, nal) {
+            self.b_slices += 1;
+            note_b_slice(&mut self.b_warned);
+        }
+        // An SPS may be rewritten on its way in; the unit and the cache get the same bytes.
+        let replaced = F::transform_nal(typ, nal);
+        let nal = replaced.as_deref().unwrap_or(nal);
         let max = self.max_unit_bytes;
         let Some(cur) = self.cur.as_mut() else { return };
         if cur.buf.len() + nal.len() + 4 > max {
@@ -791,6 +865,9 @@ impl<F: NalFormat> Depacketizer for UnitAssembler<F> {
     }
     fn has_parameter_sets(&self) -> bool {
         UnitAssembler::has_parameter_sets(self)
+    }
+    fn b_slices(&self) -> u64 {
+        self.b_slices
     }
     fn reset(&mut self) {
         UnitAssembler::reset(self)
@@ -1409,13 +1486,22 @@ mod h264_tests {
         v
     }
 
-    fn sps() -> Vec<u8> {
+    /// The SPS as the device sends it (no VUI).
+    fn raw_sps() -> Vec<u8> {
         AvcSpsSpec::baseline_vga().nal()
+    }
+
+    /// The SPS as the assembler passes it on: with a VUI bitstream restriction.
+    fn sps() -> Vec<u8> {
+        match crate::avc::add_bitstream_restriction(&raw_sps()).unwrap() {
+            crate::avc::SpsRewrite::Patched(p) => p,
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The first picture: SPS and PPS in a STAP-A, the IDR slice in three FU-A fragments (seq, seq+1..=seq+3).
     fn first_idr(a: &mut H264Assembler, seq: u16, ts: u32) -> Vec<Output> {
-        let mut out = feed(a, seq, ts, false, &stap_a(&[&sps(), &PPS]));
+        let mut out = feed(a, seq, ts, false, &stap_a(&[&raw_sps(), &PPS]));
         let frags = fu_a(&idr(&[7; 30]), 12);
         assert_eq!(frags.len(), 3);
         for (i, f) in frags.iter().enumerate() {
@@ -1453,7 +1539,7 @@ mod h264_tests {
     #[test]
     fn the_nal_header_of_a_fragmented_unit_keeps_its_nri() {
         let mut a = H264Assembler::new();
-        feed(&mut a, 1, 1, false, &stap_a(&[&sps(), &PPS]));
+        feed(&mut a, 1, 1, false, &stap_a(&[&raw_sps(), &PPS]));
         // NRI 1 (0x20) instead of 3: the rebuilt header is 0x25, not 0x65.
         let nal = [0x25u8, 9, 9, 9, 9, 9];
         let frags = fu_a(&nal, 3);
@@ -1470,7 +1556,7 @@ mod h264_tests {
     fn multi_slice_pictures_keep_every_slice_in_one_unit() {
         let mut a = H264Assembler::new();
         let (s1, s2) = (idr(&[1; 8]), idr(&[2; 8]));
-        let mut out = feed(&mut a, 1, 9, false, &stap_a(&[&sps(), &PPS]));
+        let mut out = feed(&mut a, 1, 9, false, &stap_a(&[&raw_sps(), &PPS]));
         out.extend(feed(&mut a, 2, 9, false, &s1));
         out.extend(feed(&mut a, 3, 9, true, &s2));
         assert_eq!(out.len(), 1);
@@ -1503,7 +1589,7 @@ mod h264_tests {
         let slice_nal = idr(&[3; 5]);
         let mut out = feed(&mut a, 5, 200, false, &stap_a(&[&PPS, &sei]));
         out.extend(feed(&mut a, 6, 200, false, &slice_nal));
-        out.extend(feed(&mut a, 7, 200, true, &sps()));
+        out.extend(feed(&mut a, 7, 200, true, &raw_sps()));
         assert_eq!(unit(&out[0]).payload, annexb(&[&sps(), &PPS, &sei, &slice_nal]));
     }
 
@@ -1511,7 +1597,7 @@ mod h264_tests {
     fn a_delta_unit_with_both_sets_gets_the_params_flag_and_one_with_only_a_pps_does_not() {
         let mut a = H264Assembler::new();
         let t = slice(&[1; 3]);
-        let out = feed(&mut a, 1, 50, true, &stap_a(&[&t, &sps(), &PPS]));
+        let out = feed(&mut a, 1, 50, true, &stap_a(&[&t, &raw_sps(), &PPS]));
         let u = unit(&out[0]);
         assert!(!u.key && u.params);
         assert_eq!(u.payload, annexb(&[&sps(), &PPS, &t]));
@@ -1681,7 +1767,7 @@ mod h264_tests {
     // ---- the display stream's configuration packet -------------------------------------------
 
     fn config_packet() -> Vec<u8> {
-        let avcc = make_box(b"avcC", &avcc_record(66, 0xC0, 30, &[&sps()], &[&PPS]));
+        let avcc = make_box(b"avcC", &avcc_record(66, 0xC0, 30, &[&raw_sps()], &[&PPS]));
         let mut p = vec![0x92, 0xE6, 0xC0, 0xA3];
         p.extend_from_slice(&avc1_box(640, 480, &[avcc]));
         p
@@ -1733,7 +1819,7 @@ mod h264_tests {
         let out = feed(&mut a, 2, 200, true, &idr(&[1; 4]));
         assert_eq!(out, vec![Output::Dropped { timestamp: 200, reason: DropReason::MissingParams }]);
         // ... but the in-band sets of the next one are used, and cached for the ones after it.
-        let mut out = feed(&mut a, 3, 300, false, &stap_a(&[&sps(), &PPS]));
+        let mut out = feed(&mut a, 3, 300, false, &stap_a(&[&raw_sps(), &PPS]));
         out.extend(feed(&mut a, 4, 300, true, &idr(&[2; 4])));
         assert_eq!(unit(&out[0]).payload, annexb(&[&sps(), &PPS, &idr(&[2; 4])]));
         let out = feed(&mut a, 5, 400, true, &idr(&[3; 4]));
@@ -1742,9 +1828,9 @@ mod h264_tests {
 
     #[test]
     fn a_configuration_packet_that_is_a_bare_record_or_annexb_works_too() {
-        let record = avcc_record(66, 0xC0, 30, &[&sps()], &[&PPS]);
+        let record = avcc_record(66, 0xC0, 30, &[&raw_sps()], &[&PPS]);
         let mut annexb_config = vec![0x92, 0xE6, 0xC0, 0xA3, 0, 0, 0, 1];
-        annexb_config.extend_from_slice(&sps());
+        annexb_config.extend_from_slice(&raw_sps());
         annexb_config.extend_from_slice(&[0, 0, 0, 1]);
         annexb_config.extend_from_slice(&PPS);
         for (name, packet) in [("a bare record", [vec![0x92, 0xE6, 0xC0, 0xA3], record].concat()), ("Annex-B", annexb_config)] {
@@ -1784,6 +1870,126 @@ mod h264_tests {
         let out = feed(&mut a, 3, 100, true, &slice(&[1; 3]));
         assert!(matches!(out[0], Output::Dropped { reason: DropReason::Loss, .. }));
         assert!(!a.has_parameter_sets());
+    }
+
+    // ---- the SPS rewrite and the B-slice guard, end to end -------------------------------------
+
+    #[test]
+    fn the_sps_goes_on_with_its_restriction_whichever_way_it_arrives() {
+        let want = sps();
+        assert_ne!(want, raw_sps());
+        // In a STAP-A (first_idr): the payload and the unit's SPS are the rewritten one.
+        let mut a = H264Assembler::new();
+        let out = first_idr(&mut a, 1, 100);
+        assert_eq!(unit(&out[0]).sps.as_deref(), Some(&want[..]));
+        assert!(unit(&out[0]).payload.windows(want.len()).any(|w| w == &want[..]));
+        assert!(!unit(&out[0]).payload.windows(raw_sps().len()).any(|w| w == &raw_sps()[..]));
+        // As a single NAL unit.
+        let mut a = H264Assembler::new();
+        let mut out = feed(&mut a, 1, 100, false, &raw_sps());
+        out.extend(feed(&mut a, 2, 100, false, &PPS));
+        out.extend(feed(&mut a, 3, 100, true, &idr(&[1; 4])));
+        assert_eq!(unit(&out[0]).payload, annexb(&[&want, &PPS, &idr(&[1; 4])]));
+        // In FU-A fragments.
+        let mut a = H264Assembler::new();
+        let mut out = Vec::new();
+        let frags = fu_a(&raw_sps(), 3);
+        assert!(frags.len() > 2);
+        for (i, f) in frags.iter().enumerate() {
+            out.extend(feed(&mut a, 1 + i as u16, 100, false, f));
+        }
+        let n = frags.len() as u16;
+        out.extend(feed(&mut a, 1 + n, 100, false, &PPS));
+        out.extend(feed(&mut a, 2 + n, 100, true, &idr(&[2; 4])));
+        assert_eq!(unit(&out[0]).payload, annexb(&[&want, &PPS, &idr(&[2; 4])]));
+        // Through the configuration packet: the cached set is the rewritten one.
+        let mut a = H264Assembler::new();
+        assert!(feed(&mut a, 1, 100, true, &config_packet()).is_empty());
+        let out = feed(&mut a, 2, 200, true, &idr(&[3; 4]));
+        assert_eq!(unit(&out[0]).payload, annexb(&[&want, &PPS, &idr(&[3; 4])]));
+        assert_eq!(unit(&out[0]).sps.as_deref(), Some(&want[..]));
+    }
+
+    #[test]
+    fn the_rewritten_sps_describes_the_same_stream() {
+        let described = |nal: &[u8]| crate::codec::CodecKind::H264.describe_sps(nal).unwrap();
+        assert_eq!(described(&sps()), described(&raw_sps()));
+    }
+
+    #[test]
+    fn an_sps_that_cannot_be_read_goes_on_as_it_was_and_one_that_is_restricted_already_is_not_touched() {
+        // Garbage after a valid SPS header: not parseable to its end.
+        let junk_sps = vec![0x67u8, 100, 0, 51, 0x00, 0x00, 0x03, 0xFF, 0xFF];
+        let mut a = H264Assembler::new();
+        let mut out = feed(&mut a, 1, 100, false, &junk_sps);
+        out.extend(feed(&mut a, 2, 100, false, &PPS));
+        out.extend(feed(&mut a, 3, 100, true, &idr(&[1; 4])));
+        assert_eq!(unit(&out[0]).payload, annexb(&[&junk_sps, &PPS, &idr(&[1; 4])]));
+        // A restriction of its own stays.
+        let own = crate::avc::Restriction {
+            motion_vectors_over_pic_boundaries: true,
+            max_bytes_per_pic_denom: 0,
+            max_bits_per_mb_denom: 0,
+            log2_max_mv_length_horizontal: 13,
+            log2_max_mv_length_vertical: 13,
+            max_num_reorder_frames: 1,
+            max_dec_frame_buffering: 2,
+        };
+        let mut spec = AvcSpsSpec::baseline_vga();
+        spec.vui = Some(crate::avc::testutil::VuiSpec { restriction: Some(own), ..Default::default() });
+        let restricted = spec.nal();
+        let mut a = H264Assembler::new();
+        let mut out = feed(&mut a, 1, 100, false, &restricted);
+        out.extend(feed(&mut a, 2, 100, false, &PPS));
+        out.extend(feed(&mut a, 3, 100, true, &idr(&[1; 4])));
+        assert_eq!(unit(&out[0]).payload, annexb(&[&restricted, &PPS, &idr(&[1; 4])]));
+    }
+
+    /// A slice NAL unit of the given NAL header byte and slice_type.
+    fn typed_slice(header: u8, slice_type: u32) -> Vec<u8> {
+        let mut w = crate::sps::testutil::BitWriter::default();
+        w.ue(0);
+        w.ue(slice_type);
+        w.ue(0);
+        for _ in 0..20 {
+            w.u(8, 0xA5);
+        }
+        let mut n = vec![header];
+        n.extend_from_slice(&crate::sps::testutil::escape_rbsp(&w.finish()));
+        n
+    }
+
+    #[test]
+    fn b_slices_are_counted_and_change_nothing() {
+        let mut a = H264Assembler::new();
+        first_idr(&mut a, 1, 100);
+        assert_eq!(a.b_slices(), 0);
+        // P and I slices: not counted.
+        let (p, i) = (typed_slice(0x41, 0), typed_slice(0x41, 7));
+        assert_eq!(unit(&feed(&mut a, 5, 200, true, &p)[0]).payload, annexb(&[&p]));
+        assert_eq!(unit(&feed(&mut a, 6, 300, true, &i)[0]).payload, annexb(&[&i]));
+        assert_eq!(a.b_slices(), 0);
+        // slice_type 1 and 6 are B slices: the unit is produced as ever, and counted.
+        let (b1, b6) = (typed_slice(0x41, 1), typed_slice(0x41, 6));
+        assert_eq!(unit(&feed(&mut a, 7, 400, true, &b1)[0]).payload, annexb(&[&b1]));
+        assert_eq!(a.b_slices(), 1);
+        assert_eq!(unit(&feed(&mut a, 8, 500, true, &b6)[0]).payload, annexb(&[&b6]));
+        assert_eq!(a.b_slices(), 2);
+        // Inside a STAP-A and in an FU-A, too.
+        feed(&mut a, 9, 600, true, &stap_a(&[&typed_slice(0x41, 1), &typed_slice(0x41, 6)]));
+        assert_eq!(a.b_slices(), 4);
+        let frags = fu_a(&typed_slice(0x41, 6), 9);
+        assert!(frags.len() > 2);
+        let n = frags.len();
+        for (k, f) in frags.iter().enumerate() {
+            feed(&mut a, 10 + k as u16, 700, k == n - 1, f);
+        }
+        assert_eq!(a.b_slices(), 5);
+        // An IDR picture has only I slices: never counted, whatever the header says.
+        feed(&mut a, 10 + n as u16, 800, true, &typed_slice(0x65, 1));
+        assert_eq!(a.b_slices(), 5);
+        // HEVC has no such count.
+        assert_eq!(Assembler::new().b_slices(), 0);
     }
 
     #[test]

@@ -112,12 +112,12 @@ unit sent) and when the clock rate is corrected.
     nearer of 24 and 90 kHz was taken; checked once, from two sender reports at least a second apart), or
     `default` (24 kHz assumed).
   - `ssrc` is ours (the one the offer declares and every RTCP packet carries), `device_ssrc` the device's.
-- `{"event":"stats","packets":..,"access_units":..,"bytes":..,"lost":..,"dropped_units":..,"keyframes":..,"plis":..,"rtcp":..}`
+- `{"event":"stats","packets":..,"access_units":..,"bytes":..,"lost":..,"dropped_units":..,"keyframes":..,"plis":..,"rtcp":..,"b_slices":..}`
   every `--stats-interval-ms`, counts since start: RTP packets accepted; access units **written to stdout**; their
   payload bytes; RTP packets declared lost (sequence gaps); access units not written (incomplete,
   withheld until a keyframe, or dropped because stdout could not keep up); KEY units written; keyframe
   requests (PLI + FIR) sent; RTCP datagrams sent (receiver reports, keyframe requests, and Device Hub
-  feedback when enabled).
+  feedback when enabled); `b_slices` the H.264 B slices seen (always 0 for HEVC; see "The SPS gets a bitstream restriction").
 - `{"event":"hid","ready":true,"keyboard":true,"mapping":"auto",...}` or `{"event":"hid","ready":false,"message":"..."}` once, after `--hid` asked
   for the HID services (`ready` is true when touch works; `keyboard` is true once the virtual keyboard was created and `kb` commands can be used, false with
   the reason in `message` otherwise: touch and keys keep working; a `message` may also say that the buttons did not connect); later `{"event":"hid","ok":false,"message":"..."}` for a command that failed (nothing for a
@@ -249,6 +249,27 @@ come in-band (a STAP-A or single NAL units) are used as well, and the latest of 
 packet was read off one capture, not specified, so the reading is lenient and degrades instead of failing: first an `avc1` box with an `avcC` child, then a bare `avcC`
 box, then a bare `AVCDecoderConfigurationRecord` at one of the first nine offsets, then SPS and PPS NAL units in Annex-B form. If none of them fits, the packet is ignored, the
 sets are taken from the stream's own NAL units, and the log says so once (`--probe-raw` records the real packet). What is read is also said once, at INFO.
+
+### The SPS gets a bitstream restriction (H.264)
+
+**Every H.264 SPS the sidecar writes carries a VUI `bitstream_restriction` with `max_num_reorder_frames = 0` and
+`max_dec_frame_buffering = max(max_num_ref_frames, 1)`.** The iPad's SPS has no such restriction, and without it a browser's hardware decoder
+(Chrome's) cannot know that pictures come out in the order they went in, so it holds back a full decoded picture buffer before it
+shows anything: 11 frames in the measurement, 391 ms of latency against 2 ms with the restriction. The stream itself is the same; only the SPS is
+rewritten, once, where NAL units enter the depacketizer, so the SPS inside a key unit and the one cached from the configuration packet (the `avcC` record) are the same bytes.
+
+- The SPS is read in full: profile-dependent chroma and scaling lists, picture order count types 0, 1 and 2, cropping, and the whole VUI (aspect ratio, overscan, video
+  signal type, colour description, chroma location, timing, NAL and VCL HRD, low delay, `pic_struct`). Everything is **copied bit for bit** up to the restriction, which is written
+  with `motion_vectors_over_pic_boundaries_flag` 1, `max_bytes_per_pic_denom` 0, `max_bits_per_mb_denom` 0, `log2_max_mv_length_horizontal` and `_vertical` 15,
+  `max_num_reorder_frames` 0 and `max_dec_frame_buffering` as above. An SPS **without a VUI** gets one with only the restriction. An SPS that **has a restriction already** is
+  left as it is. The emulation prevention bytes are taken out to read and put back in to write; the NAL header byte is kept.
+  The iPad's `27640033ac131450096034e9b810101010` (17 bytes) becomes `27640033ac131450096034e9b81010103c201096` (20 bytes).
+- Nothing else changes: `config.codec` (`avc1.PPCCLL`, from the profile, constraint and level bytes), the picture sizes, the NAL units of the slices.
+- **An SPS that cannot be read** (truncated, or not a valid SPS) **goes on exactly as it came**, with one `WARN` in the log for the process; the stream keeps working, only with the
+  decoder's own delay.
+- **Pictures may come out in the wrong order if the stream has B slices:** `max_num_reorder_frames = 0` promises there is no reordering. The iPad's stream has none (all 2188 access units of one capture were IDR I slices and P slices), and the
+  sidecar only watches: a non-IDR slice with `slice_type` 1 or 6 (an IDR picture has only I slices) is counted in `b_slices` of the `stats` event, and the first one logs one `WARN` ("B slices with
+  max_num_reorder_frames=0: pictures may be out of order"). The stream is not changed because of it.
 
 ## Codec probe (what does the device send for an H.264-only offer?)
 
