@@ -16,6 +16,8 @@ pub(crate) struct Script {
     pub(crate) display_service: VecDeque<Result<bool, DevError>>,
     pub(crate) reveals: u32,
     pub(crate) mounts: u32,
+    /// A mount here succeeded.
+    pub(crate) mounted_here: bool,
 }
 
 #[derive(Clone, Default)]
@@ -51,11 +53,20 @@ impl Ops for FakeDevice {
         }
         self.with(|s| {
             s.mounts += 1;
-            next(&mut s.mount, Ok(Mounted::Now))
+            let result = next(&mut s.mount, Ok(Mounted::Now));
+            s.mounted_here |= result.is_ok();
+            result
         })
     }
 
+    /// Unless scripted, the display service is offered exactly when the image is mounted (or was mounted here).
     async fn display_service_offered(&self) -> Result<bool, DevError> {
-        self.with(|s| next(&mut s.display_service, Ok(true)))
+        self.with(|s| {
+            if s.display_service.is_empty() {
+                let mounted = s.mounted_here || matches!(s.mounted.front(), None | Some(Ok(true)));
+                return Ok(mounted);
+            }
+            next(&mut s.display_service, Ok(true))
+        })
     }
 }

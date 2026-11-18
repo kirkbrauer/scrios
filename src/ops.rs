@@ -16,6 +16,8 @@ use idevice::rsd::RsdHandshake;
 use idevice::usbmuxd::UsbmuxdDevice;
 use idevice::{IdeviceError, IdeviceService, ReadWrite, RsdService};
 
+use tracing::debug;
+
 use crate::ddi::DdiFolder;
 use crate::mux::Mux;
 
@@ -228,10 +230,19 @@ impl Device {
 
     /// Whether the developer disk image is mounted: the personalized image on iOS 17 and later, the older one before.
     ///
+    /// The mounted images (`CopyDevices`) are looked at first: on recent iOS the personalized image can arrive as a
+    /// `MobileAsset` cryptex, which `LookupImage` does not report although it is mounted (see
+    /// [`entries_show_developer_image`]). `LookupImage` is the second opinion.
+    ///
     /// # Errors
     ///
     /// Why the device could not be asked.
     pub async fn image_mounted(&self) -> Result<bool, DevError> {
+        match self.mounted_images().await {
+            Ok(entries) if entries_show_developer_image(&entries) => return Ok(true),
+            Ok(_) => {}
+            Err(e) => debug!("cannot list the mounted images, looking the image up instead: {e}"),
+        }
         let version = self.product_version().await?;
         limited("looking up the developer image", QUERY_TIMEOUT, async {
             let mut mounter = self.mounter().await?;
@@ -272,6 +283,10 @@ impl Device {
         folder: &DdiFolder,
         progress: &mut (dyn FnMut(u8) + Send),
     ) -> Result<Mounted, DevError> {
+        // Never mount over an image that is there: the mounted images say so even when LookupImage does not.
+        if self.image_mounted().await? {
+            return Ok(Mounted::Already);
+        }
         let mut lockdown = self.lockdown().await?;
         let chip = lockdown
             .get_value(Some("UniqueChipID"), None)
@@ -423,6 +438,21 @@ impl Device {
     }
 }
 
+/// Whether the image mounter's `CopyDevices` entries show a developer disk image: an entry whose `DiskImageType` is
+/// `Personalized` (iOS 17 and later) or `Developer` (before), whose `BackingImage` is the `MobileAsset` DDI cryptex
+/// (`.../com.apple.MobileAsset.DDI/...`), or whose `MountPath` is `/System/Developer` (or `/Developer`).
+#[must_use]
+pub fn entries_show_developer_image(entries: &[plist::Value]) -> bool {
+    entries.iter().filter_map(plist::Value::as_dictionary).any(|entry| {
+        let text = |key: &str| entry.get(key).and_then(plist::Value::as_string);
+        matches!(text("DiskImageType"), Some("Personalized" | "Developer"))
+            || text("BackingImage").is_some_and(|path| path.contains("com.apple.MobileAsset.DDI"))
+            || text("MountPath").is_some_and(|path| {
+                path == "/System/Developer" || path == "/Developer" || path.starts_with("/System/Developer/")
+            })
+    })
+}
+
 /// The major number of an iOS version (`27.2` is 27); 0 for what is not a version.
 #[must_use]
 pub fn major(version: &str) -> u32 {
@@ -437,6 +467,45 @@ fn image_type(major: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(pairs: &[(&str, &str)]) -> plist::Value {
+        plist::Value::Dictionary(pairs.iter().map(|(k, v)| ((*k).to_string(), plist::Value::from(*v))).collect())
+    }
+
+    #[test]
+    fn a_personalized_image_from_the_mobileasset_cryptex_counts_as_mounted() {
+        // The CopyDevices entry an iPhone on iOS 27 reported while its display service was offered (LookupImage
+        // said "not found").
+        let cryptex = entry(&[
+            (
+                "BackingImage",
+                "/private/var/db/com.apple.security.cryptexd/codex.system/cryptex/com.apple.MobileAsset.DDI/gdmg",
+            ),
+            ("DeviceNode", "/dev/disk5s1"),
+            ("DeviceType", "DiskImage"),
+            ("DiskImageType", "Personalized"),
+        ]);
+        assert!(entries_show_developer_image(std::slice::from_ref(&cryptex)));
+        // Each sign on its own is enough.
+        assert!(entries_show_developer_image(&[entry(&[
+            ("DeviceType", "DiskImage"),
+            ("DiskImageType", "Personalized")
+        ])]));
+        assert!(entries_show_developer_image(&[entry(&[(
+            "BackingImage",
+            "/private/var/db/com.apple.security.cryptexd/codex.system/cryptex/com.apple.MobileAsset.DDI/gdmg",
+        )])]));
+        assert!(entries_show_developer_image(&[entry(&[("MountPath", "/System/Developer")])]));
+        assert!(entries_show_developer_image(&[entry(&[("DiskImageType", "Developer")])]));
+        // Other disk images, and nothing at all, do not.
+        assert!(!entries_show_developer_image(&[]));
+        assert!(!entries_show_developer_image(&[entry(&[
+            ("BackingImage", "/private/var/mobile/Media/other.dmg"),
+            ("DeviceType", "DiskImage"),
+            ("DiskImageType", "Cryptex"),
+        ])]));
+        assert!(!entries_show_developer_image(&[plist::Value::from("not a dictionary")]));
+    }
 
     #[test]
     fn versions_and_image_types() {

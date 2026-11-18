@@ -136,13 +136,18 @@ pub(crate) async fn run_with<O: Ops>(
     }
     let on_device = make(&mux, &device);
     let mode_ok = check_developer_mode(&on_device, &device.udid, &mut report).await;
-    let mounted = check_image_mounted(&on_device, &mut report).await;
-    report.push(image_source(&opts.ddi, Some(mounted == Some(true))));
-    if mode_ok && mounted == Some(true) {
-        report.push(check_display_service(&on_device).await);
+    // The display service is the sure sign that the image is in place (on recent iOS the image mounter may not
+    // report a personalized image that is mounted): ask for it first, and the image mounter only when it is absent.
+    let display = if mode_ok { Some(check_display_service(&on_device).await) } else { None };
+    let offered = display.as_ref().is_some_and(|check| check.status == Status::Ok);
+    let mounted = if offered {
+        report.push(Check::ok("developer disk image", "mounted (the device offers the display service)"));
+        Some(true)
     } else {
-        report.push(Check::skipped("display service", "Developer Mode and the developer disk image"));
-    }
+        check_image_mounted(&on_device, &mut report).await
+    };
+    report.push(image_source(&opts.ddi, Some(mounted == Some(true))));
+    report.push(display.unwrap_or_else(|| Check::skipped("display service", "Developer Mode")));
     report
 }
 
@@ -453,6 +458,26 @@ mod tests {
         let text = report.render();
         assert_eq!(text.matches("FAIL").count(), 3, "{text}");
         assert_eq!(text.matches("fix: ").count(), 3, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_device_that_offers_the_display_service_has_its_image_whatever_the_image_mounter_says() {
+        // iOS 27 can mount the personalized image as a MobileAsset cryptex that LookupImage does not report.
+        let fake = FakeMux::tcp();
+        fake.attach_usb(UDID, 1);
+        fake.set_pair_record(UDID, pair_record_bytes(UDID));
+        let device = FakeDevice::default();
+        device.with(|s| {
+            s.mounted = VecDeque::from([Ok(false)]);
+            s.display_service = VecDeque::from([Ok(true)]);
+        });
+        let ddi = DdiSources { cache: Some("/nonexistent/cache/scrios/ddi".into()), ..DdiSources::default() };
+        let report = run_with(&opts(&fake, ddi), |_, _| device.clone()).await;
+        assert!(report.passed(), "{}", report.render());
+        let by_name = statuses(&report);
+        assert!(by_name.contains(&("developer disk image", Status::Ok)));
+        assert!(by_name.contains(&("display service", Status::Ok)));
+        assert_eq!(device.with(|s| s.mounts), 0);
     }
 
     #[tokio::test]

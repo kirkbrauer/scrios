@@ -410,8 +410,26 @@ async fn attempt<O: Ops>(
         Err(e) => return Err(device_error(e, &udid, waited)),
     }
 
-    // The developer disk image.
+    // The display service is what the stream needs, and the one sure sign that the developer disk image is in place:
+    // when the device offers it, there is nothing to mount.
+    let offered = match on_device.display_service_offered().await {
+        Ok(offered) => Some(offered),
+        Err(e) => {
+            debug!("cannot ask for the display service, asking the image mounter instead: {e}");
+            None
+        }
+    };
+    if offered == Some(true) {
+        return Ok(ReadyDevice { udid, usbmuxd: mux.spec().to_string(), mux: mux.clone(), device });
+    }
+
+    // The developer disk image: mounted only when the device has none (never over one that is there).
     match on_device.image_mounted().await {
+        Ok(true) if offered == Some(false) => {
+            return Err(PreflightError::Failed(format!(
+                "the developer disk image is mounted on {udid}, but the device does not offer the display service: it needs iOS 27 or later; if it has that, restart the device"
+            )));
+        }
         Ok(true) => {}
         Ok(false) => mount_image(&on_device, opts, progress, &udid).await?,
         Err(e) => return Err(device_error(e, &udid, waited)),
@@ -722,6 +740,32 @@ mod tests {
         let PreflightError::Failed(why) = result.unwrap_err() else { panic!() };
         assert!(why.contains("no developer disk image") && why.contains("copy the iOS_DDI folder"), "{why}");
         device.with(|s| assert_eq!(s.mounts, 0));
+    }
+
+    #[tokio::test]
+    async fn the_display_service_is_asked_first_and_an_image_is_never_mounted_over_one_that_is_there() {
+        let fake = trusted();
+        let (_dir, ddi) = ddi_folder();
+        let opts = PreflightOptions { ddi, ..options(&fake, false) };
+        // The device offers the display service while the image mounter says "not mounted": ready, nothing mounted.
+        let device = FakeDevice::default();
+        device.with(|s| {
+            s.mounted = VecDeque::from([Ok(false)]);
+            s.display_service = VecDeque::from([Ok(true)]);
+        });
+        let (result, _) = go(&opts, &device).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(device.with(|s| s.mounts), 0);
+        // No display service, but an image is mounted: an error that says so, and still nothing mounted over it.
+        let device = FakeDevice::default();
+        device.with(|s| {
+            s.mounted = VecDeque::from([Ok(true)]);
+            s.display_service = VecDeque::from([Ok(false)]);
+        });
+        let (result, _) = go(&opts, &device).await;
+        let Err(PreflightError::Failed(why)) = result else { panic!("expected a failure, got {result:?}") };
+        assert!(why.contains("is mounted") && why.contains("display service"), "{why}");
+        assert_eq!(device.with(|s| s.mounts), 0);
     }
 
     #[tokio::test]
