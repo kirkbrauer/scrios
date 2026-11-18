@@ -5,6 +5,7 @@
 //! RTCP datagrams to send are collected for the caller ([`Engine::take_rtcp`]). That keeps all of
 //! the protocol logic testable without a socket or a phone.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -794,8 +795,8 @@ impl Engine {
     /// it is written again.
     pub fn on_display_info(&mut self, result: Result<Vec<DisplayInfo>, String>) {
         match result {
-            Ok(displays) => match primary(&displays) {
-                Some(d) => {
+            Ok(displays) => {
+                if let Some(d) = primary(&displays) {
                     let facts = DisplayFacts::from_display(d);
                     if self.display.as_ref() == Some(&facts) {
                         return; // polled again: nothing changed
@@ -810,9 +811,10 @@ impl Engine {
                         facts.native_orientation
                     );
                     self.display = Some(facts);
+                } else {
+                    warn!("display info lists no display");
                 }
-                None => warn!("display info lists no display"),
-            },
+            }
             Err(e) => {
                 warn!(
                     "display info unavailable ({e}); the picture size is {}",
@@ -944,7 +946,10 @@ const MAX_HEX_BYTES: usize = 32;
 /// The bytes in hex, the first [`MAX_HEX_BYTES`] of them, then `...` and the length if there are more (the
 /// device can send an SPS of any size up to the packet's, and the message goes to the log).
 fn hex(b: &[u8]) -> String {
-    let shown: String = b.iter().take(MAX_HEX_BYTES).map(|x| format!("{x:02x}")).collect();
+    let shown = b.iter().take(MAX_HEX_BYTES).fold(String::new(), |mut s, x| {
+        let _ = write!(s, "{x:02x}");
+        s
+    });
     if b.len() > MAX_HEX_BYTES { format!("{shown}... ({} bytes in all)", b.len()) } else { shown }
 }
 
@@ -1463,7 +1468,7 @@ mod tests {
     fn other_payload_types_and_junk_are_ignored() {
         let mut r = Rig::new();
         let mut other = rtp_bytes(1, 1, true, DEV, &trail(&[1; 4]));
-        other[1] = 96 | 0x80;
+        other[1] = 0x60 | 0x80;
         r.eng.on_datagram(r.at(1), PORT, &other);
         r.eng.on_datagram(r.at(2), PORT, &[1, 2, 3]);
         r.eng.on_datagram(r.at(3), PORT, &[]);
@@ -2020,7 +2025,7 @@ mod tests {
             fn sent_sps() -> Vec<u8> {
                 match crate::avc::add_bitstream_restriction(&Self::sps()).unwrap() {
                     crate::avc::SpsRewrite::Patched(p) => p,
-                    other => panic!("{other:?}"),
+                    other @ crate::avc::SpsRewrite::AlreadyRestricted(_) => panic!("{other:?}"),
                 }
             }
 
@@ -2170,7 +2175,7 @@ mod tests {
         fn payload_types_of_the_other_codec_are_ignored() {
             let mut r = H264Rig::new();
             let mut d = rtp_bytes(1, 1, true, DEV, &slice(&[1; 4]));
-            d[1] = 100 | 0x80; // an HEVC payload type
+            d[1] = 0x64 | 0x80; // an HEVC payload type (100)
             r.eng.on_datagram(r.at(1), PORT, &d);
             assert_eq!(r.eng.stats().packets, 0);
         }

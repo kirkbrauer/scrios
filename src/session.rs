@@ -230,8 +230,8 @@ impl HidSide<'_> {
                 return;
             }
             tokio::select! {
-                _ = self.shared.done.notified() => {}
-                _ = tokio::time::sleep_until(give_up) => {
+                () = self.shared.done.notified() => {}
+                () = tokio::time::sleep_until(give_up) => {
                     warn!("the HID service did not finish within {} s of the end: giving up", HID_SHUTDOWN_BUDGET.as_secs());
                     return;
                 }
@@ -316,28 +316,40 @@ async fn session_loop<S: DatagramSocket, C: Clock>(
             cmd = commands.recv() => match cmd {
                 Some(Command::Keyframe) => engine.on_keyframe_command(clock.now()),
                 Some(Command::Stop) | None => break Exit::Stopped(StopCause::Command),
-                Some(Command::Touch(t)) => match hid.as_mut() {
-                    Some(h) => h.hid.on_touch(clock.now(), t, engine.view()),
-                    None => debug!("touch ignored: no HID link"),
-                },
-                Some(Command::Key(k, press)) => match hid.as_mut() {
-                    Some(h) => h.hid.on_key(clock.now(), k, press),
-                    None => debug!("key ignored: no HID link"),
-                },
-                Some(Command::Kb(kb)) => match hid.as_mut() {
-                    Some(h) => h.hid.on_kb(clock.now(), kb),
-                    None => debug!("kb ignored: no HID link"),
-                },
-                Some(Command::Invalid(why)) => match hid.as_mut() {
-                    Some(h) => h.hid.on_bad_command(clock.now(), &why),
-                    None => debug!("bad command ignored: {why}"),
-                },
+                Some(Command::Touch(t)) => {
+                    if let Some(h) = hid.as_mut() {
+                        h.hid.on_touch(clock.now(), t, engine.view());
+                    } else {
+                        debug!("touch ignored: no HID link");
+                    }
+                }
+                Some(Command::Key(k, press)) => {
+                    if let Some(h) = hid.as_mut() {
+                        h.hid.on_key(clock.now(), k, press);
+                    } else {
+                        debug!("key ignored: no HID link");
+                    }
+                }
+                Some(Command::Kb(kb)) => {
+                    if let Some(h) = hid.as_mut() {
+                        h.hid.on_kb(clock.now(), kb);
+                    } else {
+                        debug!("kb ignored: no HID link");
+                    }
+                }
+                Some(Command::Invalid(why)) => {
+                    if let Some(h) = hid.as_mut() {
+                        h.hid.on_bad_command(clock.now(), &why);
+                    } else {
+                        debug!("bad command ignored: {why}");
+                    }
+                }
             },
             dg = sock.recv() => match dg {
                 Ok(dg) => engine.on_datagram(clock.now(), dg.src_port, &dg.data),
                 Err(e) => break Exit::Failed(format!("the display stream's socket failed: {e}")),
             },
-            _ = sleep => {
+            () = sleep => {
                 let now = clock.now();
                 engine.on_tick(now);
                 if next_poll.is_some_and(|t| now >= t) {
@@ -357,8 +369,8 @@ async fn session_loop<S: DatagramSocket, C: Clock>(
                 query = None;
                 engine.on_display_info(reply);
             },
-            _ = pump_done => {},
-            _ = consumer_gone.notified() => break Exit::Stopped(StopCause::ConsumerGone),
+            () = pump_done => {},
+            () = consumer_gone.notified() => break Exit::Stopped(StopCause::ConsumerGone),
         }
 
         if let Some(msg) = engine.take_fatal() {
@@ -1330,7 +1342,7 @@ mod tests {
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
         match exit {
             Exit::Failed(m) => assert!(m.contains("no RTP media from the device for 15 s"), "{m}"),
-            other => panic!("{other:?}"),
+            other @ Exit::Stopped(_) => panic!("{other:?}"),
         }
         // With the RTP check off, the any-datagram check still ends it, later.
         let mut r = rig(|c| {
@@ -1341,7 +1353,7 @@ mod tests {
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
         match exit {
             Exit::Failed(m) => assert!(m.contains("no data from the device for 30 s"), "{m}"),
-            other => panic!("{other:?}"),
+            other @ Exit::Stopped(_) => panic!("{other:?}"),
         }
     }
 
@@ -1353,7 +1365,7 @@ mod tests {
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
         match exit {
             Exit::Failed(m) => assert!(m.contains("adapter closed"), "{m}"),
-            other => panic!("{other:?}"),
+            other @ Exit::Stopped(_) => panic!("{other:?}"),
         }
     }
 

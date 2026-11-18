@@ -133,6 +133,10 @@ impl Key {
     /// press is held about twice as long or more (a held press, not a repeated one). The App
     /// Switcher is two short Home presses whatever `press` says.
     #[must_use]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "a table of one arm per button and press: each hold time can be changed on its own"
+    )]
     pub fn hold_ms(self, press: Press) -> u64 {
         match (self, press) {
             (Key::AppSwitcher, _) => 80,
@@ -198,8 +202,7 @@ fn parse_touch(args: &[&str]) -> Result<Touch, String> {
 
 fn parse_key(args: &[&str]) -> Result<(Key, Press), String> {
     let (name, press) = match args {
-        [name] => (name, Press::Short),
-        [name, "short"] => (name, Press::Short),
+        [name] | [name, "short"] => (name, Press::Short),
         [name, "long"] => (name, Press::Long),
         [_, other] => return Err(format!("key press {} is not short or long", quoted(other))),
         _ => {
@@ -608,6 +611,7 @@ mod tests {
 
     #[test]
     fn bad_kb_type_input_is_reported() {
+        use base64::Engine as _;
         let bad = |l: &str| match touch(l) {
             Parsed::Bad(why) => why,
             other => panic!("{l:?} parsed as {other:?}"),
@@ -619,7 +623,6 @@ mod tests {
         assert!(bad(&format!("kb type {}", b64(""))).contains("usage"), "an empty string is no text");
         assert!(bad("kb type aGk aGk").contains("usage"), "the text is one word of base64");
         // Valid base64 of bytes that are not UTF-8.
-        use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0x41]);
         assert!(bad(&format!("kb type {raw}")).contains("UTF-8"));
         // Exactly the limit passes; one more is too long.

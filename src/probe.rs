@@ -300,7 +300,7 @@ pub async fn collect<S: DatagramSocket>(
     tokio::pin!(end);
     let outcome = loop {
         tokio::select! {
-            _ = &mut end => break Outcome::Finished,
+            () = &mut end => break Outcome::Finished,
             dg = sock.recv() => match dg {
                 Ok(dg) => {
                     if let Some(out) = raw.as_deref_mut() {
@@ -323,7 +323,7 @@ pub async fn collect<S: DatagramSocket>(
                 Some(Command::Stop) | None => break Outcome::Stopped,
                 Some(_) => {} // nothing else means anything in a probe
             },
-            _ = consumer_gone.notified() => break Outcome::ConsumerGone,
+            () = consumer_gone.notified() => break Outcome::ConsumerGone,
         }
     };
     (report, outcome)

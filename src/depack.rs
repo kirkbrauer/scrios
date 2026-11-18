@@ -186,7 +186,7 @@ impl NalFormat for Hevc {
         if layer_id != 0 || typ >= 41 {
             return NalCheck::Skip; // enhancement layers, reserved and unspecified types
         }
-        if b1 & 7 == 0 {
+        if b1.trailing_zeros() >= 3 {
             return NalCheck::Malformed; // nuh_temporal_id_plus1 is never 0
         }
         NalCheck::Ok(typ)
@@ -363,37 +363,34 @@ impl NalFormat for H264 {
         match crate::avc::nal_type(b0) {
             H264_CONFIG_KIND => {
                 out.push(Item::EndsFragment);
-                match crate::avc::find_avc_config(p) {
-                    Some(cfg) => {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        if !CONFIG_READ_LOGGED.swap(true, Relaxed) {
-                            tracing::info!(
-                                "H.264 configuration packet read: {} SPS and {} PPS (profile {}, level {}), sets cached for the key units",
-                                cfg.sps.len(),
-                                cfg.pps.len(),
-                                cfg.profile_indication,
-                                cfg.level_indication
-                            );
-                        }
-                        let mut sets = Vec::new();
-                        if let Some(sps) = cfg.sps.first() {
-                            sets.push((0, sps.clone()));
-                        }
-                        if let Some(pps) = cfg.pps.first() {
-                            sets.push((1, pps.clone()));
-                        }
-                        out.push(if sets.is_empty() { Item::Ignore } else { Item::Config(sets) });
+                if let Some(cfg) = crate::avc::find_avc_config(p) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if !CONFIG_READ_LOGGED.swap(true, Relaxed) {
+                        tracing::info!(
+                            "H.264 configuration packet read: {} SPS and {} PPS (profile {}, level {}), sets cached for the key units",
+                            cfg.sps.len(),
+                            cfg.pps.len(),
+                            cfg.profile_indication,
+                            cfg.level_indication
+                        );
                     }
-                    None => {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        if !CONFIG_FAILED_LOGGED.swap(true, Relaxed) {
-                            tracing::warn!(
-                                "the H.264 configuration packet ({} bytes, NAL type {H264_CONFIG_KIND}) is not an avc1/avcC box, an avcC record or Annex-B sets: taking SPS and PPS from the stream's own NAL units (use --probe-raw to record the packet)",
-                                p.len()
-                            );
-                        }
-                        out.push(Item::Ignore)
+                    let mut sets = Vec::new();
+                    if let Some(sps) = cfg.sps.first() {
+                        sets.push((0, sps.clone()));
                     }
+                    if let Some(pps) = cfg.pps.first() {
+                        sets.push((1, pps.clone()));
+                    }
+                    out.push(if sets.is_empty() { Item::Ignore } else { Item::Config(sets) });
+                } else {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if !CONFIG_FAILED_LOGGED.swap(true, Relaxed) {
+                        tracing::warn!(
+                            "the H.264 configuration packet ({} bytes, NAL type {H264_CONFIG_KIND}) is not an avc1/avcC box, an avcC record or Annex-B sets: taking SPS and PPS from the stream's own NAL units (use --probe-raw to record the packet)",
+                            p.len()
+                        );
+                    }
+                    out.push(Item::Ignore);
                 }
             }
             1..=23 => {
@@ -893,7 +890,7 @@ impl<F: NalFormat> UnitAssembler<F> {
 
 impl<F: NalFormat> Depacketizer for UnitAssembler<F> {
     fn push(&mut self, meta: PacketMeta, payload: &[u8], out: &mut Vec<Output>) {
-        UnitAssembler::push(self, meta, payload, out)
+        UnitAssembler::push(self, meta, payload, out);
     }
     fn lost(&self) -> u64 {
         self.lost
@@ -911,7 +908,7 @@ impl<F: NalFormat> Depacketizer for UnitAssembler<F> {
         self.b_slices
     }
     fn reset(&mut self) {
-        UnitAssembler::reset(self)
+        UnitAssembler::reset(self);
     }
 }
 
@@ -1003,7 +1000,7 @@ pub mod testutil {
     /// A tiny RTP packet writer for the tests that go through the byte parser.
     #[must_use]
     pub fn rtp_bytes(seq: u16, ts: u32, marker: bool, ssrc: u32, payload: &[u8]) -> Vec<u8> {
-        let mut v = vec![0x80, 100 | if marker { 0x80 } else { 0 }];
+        let mut v = vec![0x80, 0x64 | if marker { 0x80 } else { 0 }];
         v.extend_from_slice(&seq.to_be_bytes());
         v.extend_from_slice(&ts.to_be_bytes());
         v.extend_from_slice(&ssrc.to_be_bytes());
@@ -1042,7 +1039,7 @@ mod tests {
     fn unit(o: &Output) -> &AccessUnit {
         match o {
             Output::Unit(u) => u,
-            other => panic!("expected a unit, got {other:?}"),
+            other @ Output::Dropped { .. } => panic!("expected a unit, got {other:?}"),
         }
     }
 
@@ -1507,7 +1504,7 @@ mod h264_tests {
     fn unit(o: &Output) -> &AccessUnit {
         match o {
             Output::Unit(u) => u,
-            other => panic!("expected a unit, got {other:?}"),
+            other @ Output::Dropped { .. } => panic!("expected a unit, got {other:?}"),
         }
     }
 
@@ -1529,7 +1526,7 @@ mod h264_tests {
     fn sps() -> Vec<u8> {
         match crate::avc::add_bitstream_restriction(&raw_sps()).unwrap() {
             crate::avc::SpsRewrite::Patched(p) => p,
-            other => panic!("{other:?}"),
+            other @ crate::avc::SpsRewrite::AlreadyRestricted(_) => panic!("{other:?}"),
         }
     }
 
@@ -2118,9 +2115,9 @@ mod h264_tests {
             let mut p: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             if let Some(b) = p.first_mut() {
                 match next() % 5 {
-                    0 => *b = (*b & 0xE0) | 24,
+                    0 => *b = (*b & 0xE0) | 0x18,
                     1 => *b = (*b & 0xE0) | NAL_FU_A,
-                    2 => *b = (*b & 0xE0) | 18,
+                    2 => *b = (*b & 0xE0) | 0x12,
                     _ => {}
                 }
             }

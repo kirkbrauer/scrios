@@ -3,6 +3,7 @@
 //! usbmuxd reports a device's UDID and how it is connected, and nothing else: the name and model are behind a
 //! lockdown session, which needs the pair record and a TLS handshake, so they are not listed.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use idevice::usbmuxd::{Connection, UsbmuxdDevice};
@@ -41,7 +42,7 @@ impl From<&UsbmuxdDevice> for Listed {
 /// A message if the address is bad (see [`parse_usbmuxd_addr`]), usbmuxd cannot be
 /// connected to, or it does not answer in time.
 pub async fn list_devices(usbmuxd: Option<&str>) -> Result<Vec<Listed>, String> {
-    let spec = usbmuxd.map(str::to_string).unwrap_or_else(default_usbmuxd_spec);
+    let spec = usbmuxd.map_or_else(default_usbmuxd_spec, str::to_string);
     let addr = parse_usbmuxd_addr(&spec)?;
     let listing = async {
         let mut mux = addr.connect(1).await.map_err(|e| format!("cannot connect to usbmuxd at {spec}: {e:?}"))?;
@@ -61,7 +62,7 @@ pub fn format_table(devices: &[Listed]) -> String {
     let width = devices.iter().map(|d| d.udid.len()).max().unwrap_or(0).max("UDID".len());
     let mut out = format!("{:<width$}  CONNECTION\n", "UDID");
     for d in devices {
-        out.push_str(&format!("{:<width$}  {}\n", d.udid, d.connection));
+        let _ = writeln!(out, "{:<width$}  {}", d.udid, d.connection);
     }
     out
 }

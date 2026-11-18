@@ -400,9 +400,6 @@ mod tests {
 
     #[test]
     fn the_writer_writes_whole_frames_in_order_from_many_producers() {
-        let q = Arc::new(OutQueue::with_limits(10_000, 1 << 28));
-        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
-
         struct Shared(Arc<Mutex<Vec<u8>>>);
         impl Write for Shared {
             fn write(&mut self, b: &[u8]) -> io::Result<usize> {
@@ -413,6 +410,9 @@ mod tests {
                 Ok(())
             }
         }
+
+        let q = Arc::new(OutQueue::with_limits(10_000, 1 << 28));
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
 
         let writer = {
             let q = q.clone();

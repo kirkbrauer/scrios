@@ -452,24 +452,23 @@ fn run_thread(
     let result = catch_unwind(AssertUnwindSafe(|| {
         rt.block_on(run(opts, queue.clone(), gone.clone(), commands, session.clone()))
     }));
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            error!("internal error (a panic); stopping the stream");
-            queue.push_control(Frame::control(&Event::Error { message: "internal error".into() }));
-            let cleanup = catch_unwind(AssertUnwindSafe(|| {
-                rt.block_on(async {
-                    let _ = tokio::time::timeout(PANIC_CLEANUP, async {
-                        Box::pin(session.lock().await.shutdown()).await;
-                    })
-                    .await;
+    let outcome = if let Ok(outcome) = result {
+        outcome
+    } else {
+        error!("internal error (a panic); stopping the stream");
+        queue.push_control(Frame::control(&Event::Error { message: "internal error".into() }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let _ = tokio::time::timeout(PANIC_CLEANUP, async {
+                    Box::pin(session.lock().await.shutdown()).await;
                 })
-            }));
-            if cleanup.is_err() {
-                error!("the cleanup panicked too");
-            }
-            Outcome::Panicked
+                .await;
+            });
+        }));
+        if cleanup.is_err() {
+            error!("the cleanup panicked too");
         }
+        Outcome::Panicked
     };
 
     // What is queued is still read (the access units are stale now: only events are kept).
@@ -598,7 +597,7 @@ async fn run(
     // Start, but a stop (a command, the end of the input, a signal) ends it at once.
     let started = tokio::select! {
         r = sess.start(&dev) => Some(r),
-        _ = wait_for_stop(&mut cmd_rx) => None,
+        () = wait_for_stop(&mut cmd_rx) => None,
     };
     match started {
         None => {
@@ -643,7 +642,7 @@ async fn run(
     if opts.control {
         let connected = tokio::select! {
             h = sess.connect_hid() => Some(h),
-            _ = wait_for_stop(&mut cmd_rx) => None,
+            () = wait_for_stop(&mut cmd_rx) => None,
         };
         let Some(device_hid) = connected else {
             info!("stop requested while connecting HID");
@@ -912,7 +911,7 @@ mod tests {
         let (stream, _queue, commands) = rig();
         let input = stream.input();
         // The queue holds 64 commands; the 65th is refused here instead of waiting.
-        let queued = (0..COMMAND_QUEUE + 1).filter(|_| input.keyframe()).count();
+        let queued = (0..=COMMAND_QUEUE).filter(|_| input.keyframe()).count();
         assert_eq!(queued, COMMAND_QUEUE);
         drop(commands);
     }
@@ -941,7 +940,7 @@ mod tests {
         let items: Vec<Item> = stream.items().collect();
         match items.as_slice() {
             [Item::Event(Event::Error { message })] => {
-                assert!(message.contains("cannot connect to usbmuxd"), "{message}")
+                assert!(message.contains("cannot connect to usbmuxd"), "{message}");
             }
             other => panic!("{other:?}"),
         }

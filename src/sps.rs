@@ -437,7 +437,7 @@ pub mod testutil {
             for _ in 0..self.max_sub_layers_minus1 {
                 w.u(32, 0x1122_3344); // 88 bits of sub-layer profile
                 w.u(32, 0x5566_7788);
-                w.u(24, 0x99AABB);
+                w.u(24, 0x0099_AABB);
                 w.u(8, 90); // sub-layer level
             }
             w.ue(0); // sps_seq_parameter_set_id

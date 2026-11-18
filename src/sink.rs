@@ -70,7 +70,7 @@ impl<W: Write> Sink<W> {
 mod tests {
     use super::*;
     use crate::codec::CodecKind;
-    use crate::frame::{Event, decode_all};
+    use crate::frame::{Event, Stats, decode_all};
     use crate::stream::AccessUnit;
 
     fn unit(pts_us: u64, key: bool, data: &[u8]) -> Item {
@@ -79,7 +79,7 @@ mod tests {
 
     fn items() -> Vec<Item> {
         vec![
-            Item::Event(Event::Stats(Default::default())),
+            Item::Event(Event::Stats(Stats::default())),
             unit(0, true, &[0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3]),
             unit(16_666, false, &[0, 0, 0, 1, 0x41, 4]),
             Item::Event(Event::Stopped),
@@ -111,7 +111,7 @@ mod tests {
         let out = written(Format::Framed, &items());
         // The same bytes as the frames the session queues (what the protocol was before the library existed).
         let expected = [
-            Frame::control(&Event::Stats(Default::default())),
+            Frame::control(&Event::Stats(Stats::default())),
             Frame::unit(0, true, true, vec![0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3]),
             Frame::unit(16_666, false, false, vec![0, 0, 0, 1, 0x41, 4]),
             Frame::control(&Event::Stopped),
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(out, want);
         assert_eq!(decode_all(&out).unwrap(), expected);
         // The header of the first unit: len 18, pts 0, flags KEY|PARAMS.
-        let at = Frame::control(&Event::Stats(Default::default())).encode().unwrap().len();
+        let at = Frame::control(&Event::Stats(Stats::default())).encode().unwrap().len();
         assert_eq!(&out[at..at + 13], &[0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0x03]);
     }
 

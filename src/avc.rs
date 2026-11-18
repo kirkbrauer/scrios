@@ -206,7 +206,7 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     b.skip(1)?; // direct_8x8_inference_flag
     let mut crop = [0u64; 4]; // left, right, top, bottom
     if b.bit()? == 1 {
-        for c in crop.iter_mut() {
+        for c in &mut crop {
             *c = u64::from(b.ue()?);
         }
     }
@@ -225,10 +225,9 @@ pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     }
     // Cropping is in chroma sample units (ChromaArrayType 0 has none).
     let (unit_x, unit_y): (u64, u64) = match chroma_format_idc {
-        0 => (1, field_factor),
         1 => (2, field_factor.saturating_mul(2)),
         2 => (2, field_factor),
-        _ => (1, field_factor),
+        _ => (1, field_factor), // monochrome and 4:4:4
     };
     let width = coded_width.saturating_sub(unit_x.saturating_mul(crop_left.saturating_add(crop_right)));
     let height = coded_height.saturating_sub(unit_y.saturating_mul(crop_top.saturating_add(crop_bottom)));
@@ -803,7 +802,7 @@ pub mod testutil {
     /// FU-A payloads of at most `chunk` fragment bytes for `nal` (header byte included).
     #[must_use]
     pub fn fu_a(nal: &[u8], chunk: usize) -> Vec<Vec<u8>> {
-        let (indicator, typ) = ((nal[0] & 0xE0) | 28, nal[0] & 0x1f);
+        let (indicator, typ) = ((nal[0] & 0xE0) | 0x1C, nal[0] & 0x1f);
         let parts: Vec<&[u8]> = nal[1..].chunks(chunk).collect();
         let n = parts.len();
         parts
@@ -1388,7 +1387,7 @@ mod tests {
     fn patched(nal: &[u8]) -> Vec<u8> {
         match add_bitstream_restriction(nal).unwrap() {
             SpsRewrite::Patched(p) => p,
-            other => panic!("expected a rewrite, got {other:?}"),
+            other @ SpsRewrite::AlreadyRestricted(_) => panic!("expected a rewrite, got {other:?}"),
         }
     }
 

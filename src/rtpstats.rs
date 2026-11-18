@@ -100,10 +100,7 @@ impl RtpStats {
 
     /// Accounts for one received RTP packet (every one, in or out of order).
     pub fn on_packet(&mut self, now: Instant, seq: u16, timestamp: u32) {
-        if !self.started {
-            self.started = true;
-            self.init_seq(seq);
-        } else {
+        if self.started {
             let udelta = seq.wrapping_sub(self.max_seq);
             if udelta < MAX_DROPOUT {
                 if seq < self.max_seq {
@@ -120,6 +117,9 @@ impl RtpStats {
                 }
             }
             // else: a duplicate or reordered packet: counted, the highest sequence stays.
+        } else {
+            self.started = true;
+            self.init_seq(seq);
         }
         self.received = self.received.wrapping_add(1);
 

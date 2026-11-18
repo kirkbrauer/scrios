@@ -201,9 +201,8 @@ fn find_u32(v: &plist::Value, key: &str) -> Option<u32> {
 
 /// The HEVC payload's `rtp_sample_rate` from the negotiation blob in the answer, if it says.
 fn negotiated_clock_hz(answer: &plist::Value) -> Option<u32> {
-    let blob = match find_key(answer, "avcMediaStreamNegotiatorMediaBlob", 0)? {
-        plist::Value::Data(b) => b,
-        _ => return None,
+    let plist::Value::Data(blob) = find_key(answer, "avcMediaStreamNegotiatorMediaBlob", 0)? else {
+        return None;
     };
     // The wire form is zlib-compressed protobuf; take a raw protobuf only if it is not that.
     let parsed = MediaNegotiationBlob::from_negotiator_offer(&blob)
@@ -376,13 +375,12 @@ impl DisplayInfoSource for DisplayInfoClient {
             let Some(client) = guard.as_mut() else {
                 return Err("the device info service is not available".to_string());
             };
-            match Box::pin(tokio::time::timeout(DISPLAY_QUERY_LIMIT, client.get_display_info())).await {
-                Ok(reply) => reply,
-                Err(_) => {
-                    // An unanswered request leaves the connection out of step: do not use it again.
-                    *guard = None;
-                    Err(format!("no answer in {} s", DISPLAY_QUERY_LIMIT.as_secs()))
-                }
+            if let Ok(reply) = Box::pin(tokio::time::timeout(DISPLAY_QUERY_LIMIT, client.get_display_info())).await {
+                reply
+            } else {
+                // An unanswered request leaves the connection out of step: do not use it again.
+                *guard = None;
+                Err(format!("no answer in {} s", DISPLAY_QUERY_LIMIT.as_secs()))
             }
         })
     }
@@ -891,12 +889,11 @@ async fn connect_display_info(adapter: &mut AdapterHandle, handshake: &mut RsdHa
     let source = DisplayInfoClient::new(Some(service));
     let mut query = source.query();
     let mut out = DisplayStart::default();
-    match tokio::time::timeout(DISPLAY_INFO_WAIT, &mut query).await {
-        Ok(reply) => out.first = Some(reply),
-        Err(_) => {
-            warn!("the display info is slow ({} s): going on without it, it will follow", DISPLAY_INFO_WAIT.as_secs());
-            out.pending = Some(query);
-        }
+    if let Ok(reply) = tokio::time::timeout(DISPLAY_INFO_WAIT, &mut query).await {
+        out.first = Some(reply);
+    } else {
+        warn!("the display info is slow ({} s): going on without it, it will follow", DISPLAY_INFO_WAIT.as_secs());
+        out.pending = Some(query);
     }
     out.source = Some(source);
     out

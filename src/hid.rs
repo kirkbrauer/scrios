@@ -2104,7 +2104,7 @@ mod tests {
         [(0.0, ly / 2.0), (lx, ly / 2.0), (lx / 2.0, 0.0), (lx / 2.0, ly), (0.0, 0.0), (lx, 0.0), (0.0, ly), (lx, ly)]
     }
 
-    fn mapped(m: &HidMapping, w: u32, h: u32, rotation: u16, native: Option<u16>) -> [(u16, u16); 8] {
+    fn mapped(m: HidMapping, w: u32, h: u32, rotation: u16, native: Option<u16>) -> [(u16, u16); 8] {
         edge_points(w, h).map(|(x, y)| m.map(x, y, w, h, rotation, native))
     }
 
@@ -2123,7 +2123,7 @@ mod tests {
         for (rotation, want) in expected {
             // The iPad's framebuffer is 2388x1668; upright it is that, or turned a quarter, 1668x2388.
             let (w, h) = if rotation % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
-            assert_eq!(mapped(&panel, w, h, rotation, None), want, "rotation {rotation}");
+            assert_eq!(mapped(panel, w, h, rotation, None), want, "rotation {rotation}");
             assert_eq!(
                 map_touch(0.0, 0.0, w, h, rotation),
                 want[4],
@@ -2140,18 +2140,18 @@ mod tests {
         // becomes (1 - fy, fx); with it turned 90 (the picture portrait, 1668x2388) the two turns
         // cancel and the digitizer's axes are the upright ones.
         assert_eq!(
-            mapped(&auto, 2388, 1668, 0, Some(270)),
+            mapped(auto, 2388, 1668, 0, Some(270)),
             [(mid, 0), (mid, m), (m, mid), (0, mid), (m, 0), (m, m), (0, 0), (0, m)]
         );
         assert_eq!(
-            mapped(&auto, 1668, 2388, 90, Some(270)),
+            mapped(auto, 1668, 2388, 90, Some(270)),
             [(0, mid), (m, mid), (mid, 0), (mid, m), (0, 0), (m, 0), (0, m), (m, m)]
         );
         // Whatever the rotation: an edge is a limit on exactly one axis (the other is the middle), a
         // corner is a limit on both.
         for rotation in [0, 90, 180, 270] {
             let (w, h) = if rotation % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
-            let got = mapped(&auto, w, h, rotation, Some(270));
+            let got = mapped(auto, w, h, rotation, Some(270));
             let limit = |v: u16| v == 0 || v == m;
             for (i, (x, y)) in got.into_iter().enumerate() {
                 if i < 4 {

@@ -524,12 +524,9 @@ fn consume(stream: &Stream, mut outputs: Vec<Output>) {
 /// SIGTERM and SIGINT are a `stop`.
 async fn stop_on_signals(tx: mpsc::Sender<Command>) {
     use tokio::signal::unix::{SignalKind, signal};
-    let (mut term, mut int) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
-        (Ok(t), Ok(i)) => (t, i),
-        _ => {
-            warn!("cannot install the signal handlers");
-            return;
-        }
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        warn!("cannot install the signal handlers");
+        return;
     };
     loop {
         tokio::select! {
@@ -677,7 +674,7 @@ mod tests {
         let argv = std::iter::once("scrios").chain(args.iter().copied());
         match Cli::parse_from(argv).action() {
             Action::Stream(a) => *a,
-            other => panic!("not a stream: {other:?}"),
+            other @ Action::List { .. } => panic!("not a stream: {other:?}"),
         }
     }
 
@@ -732,18 +729,18 @@ mod tests {
                 assert_eq!(a.udid.as_deref(), Some("U"));
                 assert_eq!(a.format(), Format::Framed);
             }
-            other => panic!("{other:?}"),
+            other @ Action::List { .. } => panic!("{other:?}"),
         }
         assert!(matches!(Cli::parse_from(["scrios", "list"]).action(), Action::List { usbmuxd: None }));
         match Cli::parse_from(["scrios", "list", "--usbmuxd", "127.0.0.1:27015"]).action() {
             Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("127.0.0.1:27015")),
-            other => panic!("{other:?}"),
+            other @ Action::Stream(_) => panic!("{other:?}"),
         }
         // --list-devices is `list` (and takes --usbmuxd).
         assert!(matches!(Cli::parse_from(["scrios", "--list-devices"]).action(), Action::List { usbmuxd: None }));
         match Cli::parse_from(["scrios", "--list-devices", "--usbmuxd", "/tmp/mux"]).action() {
             Action::List { usbmuxd } => assert_eq!(usbmuxd.as_deref(), Some("/tmp/mux")),
-            other => panic!("{other:?}"),
+            other @ Action::Stream(_) => panic!("{other:?}"),
         }
         // The stream's options do not mix with a subcommand's position, and a stranger is refused.
         assert!(Cli::try_parse_from(["scrios", "--udid", "U", "list"]).is_err());
