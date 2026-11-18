@@ -1,0 +1,854 @@
+//! The async loop that drives an [`Engine`] from a datagram socket, the command channel and the
+//! clock. The socket and the clock are traits, so the loop runs against fakes in the tests.
+
+use std::future::Future;
+use std::io;
+use std::time::{Duration, Instant};
+
+use tokio::sync::{Notify, mpsc};
+use tracing::{debug, warn};
+
+use crate::commands::Command;
+use crate::displayinfo::{DisplayInfoSource, DisplayQuery};
+use crate::engine::Engine;
+use crate::hid::{self, Hid, HidBackend};
+
+/// One datagram from the device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Datagram {
+    pub src_port: u16,
+    pub data: Vec<u8>,
+}
+
+/// The UDP socket the device streams to, on the tunnel.
+pub trait DatagramSocket {
+    /// The next datagram. Must be cancel-safe (the loop drops the future when another event wins).
+    fn recv(&self) -> impl Future<Output = io::Result<Datagram>> + Send;
+    /// Sends `data` to the device's `port`.
+    fn send_to(&self, port: u16, data: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+/// One RTCP datagram must go out within this, or it is given up on: a stalled tunnel must not
+/// keep a `stop` waiting.
+pub const RTCP_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+
+pub trait Clock {
+    fn now(&self) -> Instant;
+}
+
+/// The runtime's clock (follows tokio's paused time in tests).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokioClock;
+
+impl Clock for TokioClock {
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCause {
+    /// A `stop` command, end of stdin, or a signal.
+    Command,
+    /// Nobody reads stdout any more.
+    ConsumerGone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    Stopped(StopCause),
+    /// The stream is unusable; the message is for the `error` event.
+    Failed(String),
+}
+
+/// How display info reaches the loop: queries are made one at a time, in the background of the
+/// loop, whenever the engine wants one and every `poll_interval` (the orientation changes without
+/// the stream saying so).
+pub struct DisplayLink<'a> {
+    pub source: &'a dyn DisplayInfoSource,
+    pub poll_interval: Option<Duration>,
+    /// A query already in flight, such as the one made at start that was slow to answer.
+    pub pending: Option<DisplayQuery>,
+}
+
+/// Touch and keys: the controller and where its actions go.
+pub struct HidLink<'a> {
+    pub hid: &'a mut Hid,
+    pub backend: &'a mut dyn HidBackend,
+}
+
+/// What the loop is connected to besides the socket.
+#[derive(Default)]
+pub struct Links<'a> {
+    pub display: Option<DisplayLink<'a>>,
+    pub hid: Option<HidLink<'a>>,
+}
+
+/// Performs what the controller has queued, each action within [`hid::SEND_TIMEOUT`].
+async fn perform_hid<C: Clock>(link: &mut HidLink<'_>, clock: &C) {
+    for action in link.hid.take_actions() {
+        let failure = match tokio::time::timeout(hid::SEND_TIMEOUT, link.backend.perform(action)).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => e,
+            Err(_) => format!("the HID service did not answer in {} ms", hid::SEND_TIMEOUT.as_millis()),
+        };
+        link.hid.on_action_failed(clock.now(), &failure);
+    }
+}
+
+/// Runs until a stop, the consumer going away, or a failure. Before it returns, a finger still on
+/// the screen is lifted and held keys are released.
+pub async fn run_session<S: DatagramSocket, C: Clock>(
+    sock: &S,
+    engine: &mut Engine,
+    commands: &mut mpsc::Receiver<Command>,
+    consumer_gone: &Notify,
+    clock: &C,
+    links: Links<'_>,
+) -> Exit {
+    let Links { display, mut hid } = links;
+    let (source, poll_every, mut query) = match display {
+        Some(d) => (Some(d.source), d.poll_interval, d.pending),
+        None => (None, None, None),
+    };
+    let mut query_wanted = false;
+    let mut next_poll = poll_every.map(|d| clock.now() + d);
+    let mut send_errors = 0u64;
+
+    let exit = loop {
+        query_wanted |= engine.take_display_query();
+        if query_wanted && query.is_none() {
+            if let Some(source) = source {
+                query = Some(source.query());
+                query_wanted = false;
+            }
+        }
+        let now = clock.now();
+        let deadline = [
+            engine.next_deadline(),
+            next_poll,
+            hid.as_ref().and_then(|h| h.hid.next_deadline()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(now + Duration::from_secs(3600));
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+
+        tokio::select! {
+            cmd = commands.recv() => match cmd {
+                Some(Command::Keyframe) => engine.on_keyframe_command(clock.now()),
+                Some(Command::Stop) | None => break Exit::Stopped(StopCause::Command),
+                Some(Command::Touch(t)) => match hid.as_mut() {
+                    Some(h) => h.hid.on_touch(clock.now(), t, engine.view()),
+                    None => debug!("touch ignored: no HID link"),
+                },
+                Some(Command::Key(k, press)) => match hid.as_mut() {
+                    Some(h) => h.hid.on_key(clock.now(), k, press),
+                    None => debug!("key ignored: no HID link"),
+                },
+                Some(Command::Invalid(why)) => match hid.as_mut() {
+                    Some(h) => h.hid.on_bad_command(clock.now(), &why),
+                    None => debug!("bad command ignored: {why}"),
+                },
+            },
+            dg = sock.recv() => match dg {
+                Ok(dg) => engine.on_datagram(clock.now(), dg.src_port, &dg.data),
+                Err(e) => break Exit::Failed(format!("the display stream's socket failed: {e}")),
+            },
+            _ = sleep => {
+                let now = clock.now();
+                engine.on_tick(now);
+                if next_poll.is_some_and(|t| now >= t) {
+                    query_wanted = true;
+                    next_poll = poll_every.map(|d| now + d);
+                }
+                if let Some(h) = hid.as_mut() {
+                    h.hid.on_tick(now);
+                }
+            },
+            reply = async { query.as_mut().expect("guarded").await }, if query.is_some() => {
+                query = None;
+                engine.on_display_info(reply);
+            },
+            _ = consumer_gone.notified() => break Exit::Stopped(StopCause::ConsumerGone),
+        }
+
+        if let Some(msg) = engine.take_fatal() {
+            break Exit::Failed(msg);
+        }
+        for pkt in engine.take_rtcp() {
+            let Some(port) = engine.rtcp_port() else { continue };
+            let failure = match tokio::time::timeout(RTCP_SEND_TIMEOUT, sock.send_to(port, pkt)).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => format!("no progress in {} ms", RTCP_SEND_TIMEOUT.as_millis()),
+            };
+            send_errors += 1;
+            if send_errors.is_power_of_two() {
+                warn!("sending RTCP to the device failed ({send_errors} so far): {failure}");
+            }
+        }
+        if let Some(h) = hid.as_mut() {
+            perform_hid(h, clock).await;
+        }
+    };
+
+    if let Some(h) = hid.as_mut() {
+        h.hid.release_all();
+        perform_hid(h, clock).await;
+    }
+    exit
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use super::*;
+    use crate::depack::testutil::*;
+    use crate::engine::EngineConfig;
+    use crate::frame::{FLAG_KEY, Frame};
+    use crate::hid::NoHid;
+    use crate::outqueue::OutQueue;
+    use crate::sps::testutil::SpsSpec;
+
+    const DEV: u32 = 0xD00D_0001;
+    const OUR: u32 = 7;
+    const PORT: u16 = 50001;
+
+    #[derive(Clone)]
+    struct FakeSocket {
+        rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<io::Result<Datagram>>>>,
+        sent: Arc<Mutex<Vec<(u16, Vec<u8>)>>>,
+        /// Sends never complete (a tunnel that has stalled).
+        stall_send: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn fake() -> (FakeSocket, mpsc::UnboundedSender<io::Result<Datagram>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            FakeSocket {
+                rx: Arc::new(AsyncMutex::new(rx)),
+                sent: Arc::default(),
+                stall_send: Arc::default(),
+            },
+            tx,
+        )
+    }
+
+    impl DatagramSocket for FakeSocket {
+        async fn recv(&self) -> io::Result<Datagram> {
+            match self.rx.lock().await.recv().await {
+                Some(r) => r,
+                // Nothing more will come: park (the test ends the session by other means).
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn send_to(&self, port: u16, data: Vec<u8>) -> io::Result<()> {
+            if self.stall_send.load(std::sync::atomic::Ordering::Relaxed) {
+                return std::future::pending().await;
+            }
+            self.sent.lock().unwrap().push((port, data));
+            Ok(())
+        }
+    }
+
+    fn dg(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> io::Result<Datagram> {
+        Ok(Datagram {
+            src_port: PORT,
+            data: rtp_bytes(seq, ts, marker, DEV, payload),
+        })
+    }
+
+    /// The first picture: sets, then the IDR in three fragments (seq 1..=4).
+    fn send_first_idr(tx: &mpsc::UnboundedSender<io::Result<Datagram>>) {
+        let sps = SpsSpec::main_l150(1216, 2656).nal();
+        tx.send(dg(1, 1000, false, &ap(&[&VPS, &sps, &PPS]))).unwrap();
+        let frags = fu(&idr(&[5; 30]), 12);
+        for (i, f) in frags.iter().enumerate() {
+            tx.send(dg(2 + i as u16, 1000, i == frags.len() - 1, f)).unwrap();
+        }
+    }
+
+    struct Rig {
+        engine: Engine,
+        queue: Arc<OutQueue>,
+        commands: mpsc::Sender<Command>,
+        rx: mpsc::Receiver<Command>,
+        gone: Arc<Notify>,
+    }
+
+    fn rig(f: impl FnOnce(&mut EngineConfig)) -> Rig {
+        let mut cfg = EngineConfig::new(OUR);
+        cfg.rtcp_port = Some(PORT);
+        f(&mut cfg);
+        let queue = Arc::new(OutQueue::new());
+        let (commands, rx) = mpsc::channel(16);
+        Rig {
+            engine: Engine::new(cfg, queue.clone(), TokioClock.now()),
+            queue,
+            commands,
+            rx,
+            gone: Arc::new(Notify::new()),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn datagrams_become_frames_and_stop_ends_the_session() {
+        let (sock, tx) = fake();
+        let mut r = rig(|_| {});
+        send_first_idr(&tx);
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cmds.send(Command::Stop).await.unwrap();
+        });
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        let f: Vec<Frame> = r.queue.drain();
+        assert_eq!(f.len(), 2);
+        assert!(f[0].is_control());
+        assert_eq!(f[1].flags & FLAG_KEY, FLAG_KEY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_command_channel_closing_is_a_stop() {
+        let (sock, _tx) = fake();
+        let r = rig(|_| {});
+        let Rig { mut engine, mut rx, gone, commands, .. } = r;
+        drop(commands);
+        let exit = run_session(&sock, &mut engine, &mut rx, &gone, &TokioClock, Links::default()).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_reports_and_stats_follow_the_clock() {
+        let (sock, tx) = fake();
+        let mut r = rig(|c| {
+            c.rtcp_interval = Some(Duration::from_millis(5000));
+            c.stats_interval = Some(Duration::from_millis(5000));
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = None;
+        });
+        send_first_idr(&tx);
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(12_000)).await;
+            cmds.send(Command::Stop).await.unwrap();
+        });
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+
+        // Two receiver reports (5 s and 10 s), to the device's RTP source port, from our SSRC.
+        let sent = sock.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        for (port, bytes) in &sent {
+            assert_eq!(*port, PORT);
+            assert_eq!(&bytes[..2], &[0x81, 201]);
+            assert_eq!(&bytes[4..8], &OUR.to_be_bytes());
+        }
+        // Two stats events among the frames.
+        let stats = r
+            .queue
+            .drain()
+            .iter()
+            .filter(|f| f.is_control() && f.payload.starts_with(br#"{"event":"stats""#))
+            .count();
+        assert_eq!(stats, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keyframe_command_sends_the_request_and_a_second_one_waits_for_the_window() {
+        let (sock, tx) = fake();
+        let mut r = rig(|c| {
+            c.rtcp_interval = None;
+            c.stats_interval = None;
+            c.keyframe_min_interval = Duration::from_millis(2000);
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = None;
+        });
+        send_first_idr(&tx);
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cmds.send(Command::Keyframe).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cmds.send(Command::Keyframe).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cmds.send(Command::Keyframe).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            // At 1.3 s only the first went out.
+            cmds.send(Command::Stop).await.unwrap();
+        });
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        assert_eq!(sock.sent.lock().unwrap().len(), 1);
+        assert_eq!(r.engine.stats().plis, 1);
+
+        // Now let the window run out: the held request goes out by itself.
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            cmds.send(Command::Stop).await.unwrap();
+        });
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        assert_eq!(sock.sent.lock().unwrap().len(), 2);
+        assert_eq!(r.engine.stats().plis, 2);
+        // Both are the keyframe-request form (RR, SDES, PLI, FIR), to the device's port.
+        for (port, bytes) in sock.sent.lock().unwrap().iter() {
+            assert_eq!(*port, PORT);
+            assert_eq!(bytes[1], 201);
+            assert!(bytes.windows(2).any(|w| w == [0x81, 206]), "PLI present");
+            assert!(bytes.windows(2).any(|w| w == [0x84, 206]), "FIR present");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_send_cannot_block_a_stop() {
+        let (sock, tx) = fake();
+        let mut r = rig(|c| {
+            c.rtcp_interval = None;
+            c.stats_interval = None;
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = None;
+        });
+        send_first_idr(&tx);
+        sock.stall_send.store(true, std::sync::atomic::Ordering::Relaxed);
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cmds.send(Command::Keyframe).await.unwrap(); // its PLI never leaves
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cmds.send(Command::Stop).await.unwrap();
+        });
+        let exit = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()),
+        )
+        .await
+        .expect("the session ended instead of waiting for the stalled send");
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        assert!(sock.sent.lock().unwrap().is_empty());
+    }
+
+    // ---- display info -----------------------------------------------------------------------
+
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::commands::{Key, Press, Touch, TouchPhase};
+    use crate::displayinfo::DisplayInfo;
+    use crate::hid::{Action, HidMapping};
+
+    fn info(w: u32, h: u32, current: &str) -> DisplayInfo {
+        DisplayInfo {
+            display_id: Some(1),
+            name: "LCD".into(),
+            primary: true,
+            external: false,
+            native_size: (w, h),
+            point_scale: Some(2.0),
+            current_orientation: Some(current.into()),
+            native_orientation: Some("rot0".into()),
+        }
+    }
+
+    /// Answers queries from a list (the last answer repeats), each after `delay`.
+    struct FakeDisplay {
+        replies: Arc<Mutex<VecDeque<Result<Vec<DisplayInfo>, String>>>>,
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl FakeDisplay {
+        fn new(replies: Vec<Result<Vec<DisplayInfo>, String>>, delay: Duration) -> Self {
+            FakeDisplay {
+                replies: Arc::new(Mutex::new(replies.into())),
+                calls: Arc::default(),
+                delay,
+            }
+        }
+    }
+
+    impl DisplayInfoSource for FakeDisplay {
+        fn query(&self) -> DisplayQuery {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let replies = self.replies.clone();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                let mut q = replies.lock().unwrap();
+                if q.len() > 1 {
+                    q.pop_front().unwrap()
+                } else {
+                    q.front().cloned().unwrap_or_else(|| Err("no reply".into()))
+                }
+            })
+        }
+    }
+
+    /// The `config` events among the frames, as JSON.
+    fn configs(frames: &[Frame]) -> Vec<serde_json::Value> {
+        frames
+            .iter()
+            .filter(|f| f.is_control())
+            .map(|f| serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap())
+            .filter(|v| v["event"] == "config")
+            .collect()
+    }
+
+    fn sizes(configs: &[serde_json::Value]) -> Vec<(u64, u64)> {
+        configs
+            .iter()
+            .map(|c| (c["width"].as_u64().unwrap(), c["height"].as_u64().unwrap()))
+            .collect()
+    }
+
+    fn display_rig() -> Rig {
+        rig(|c| {
+            c.display_info = true;
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = None;
+        })
+    }
+
+    async fn stop_after(r: &Rig, ms: u64) {
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            cmds.send(Command::Stop).await.unwrap();
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_first_display_answer_adds_a_second_config() {
+        let (sock, tx) = fake();
+        let mut r = display_rig();
+        let src = FakeDisplay::new(vec![Ok(vec![info(1206, 2622, "rot0")])], Duration::from_secs(4));
+        let pending = src.query(); // made at start, still waiting
+        send_first_idr(&tx);
+        stop_after(&r, 5000).await;
+        let links = Links {
+            display: Some(DisplayLink { source: &src, poll_interval: None, pending: Some(pending) }),
+            hid: None,
+        };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        let c = configs(&r.queue.drain());
+        // The stream did not wait: first the SPS size, then, when the answer came, the display's.
+        assert_eq!(sizes(&c), vec![(1216, 2656), (1206, 2622)]);
+        assert_eq!(c[1]["rotation"], 0);
+        assert_eq!(c[1]["point_scale"], 2.0);
+        assert_eq!(c[1]["current_orientation"], "rot0");
+        assert_eq!(c[1]["coded_width"], 1216, "the coded size is the SPS's");
+        assert_eq!(src.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_orientation_is_polled_and_each_real_change_makes_one_config() {
+        let (sock, tx) = fake();
+        let mut r = display_rig();
+        let portrait = Ok(vec![info(1206, 2622, "rot0")]);
+        let landscape = Ok(vec![info(2622, 1206, "rot90")]);
+        let src = FakeDisplay::new(
+            vec![portrait.clone(), landscape.clone(), landscape, portrait],
+            Duration::from_millis(10),
+        );
+        send_first_idr(&tx);
+        stop_after(&r, 5500).await;
+        let links = Links {
+            display: Some(DisplayLink { source: &src, poll_interval: Some(Duration::from_secs(1)), pending: None }),
+            hid: None,
+        };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        let c = configs(&r.queue.drain());
+        // The SPS size, then portrait, landscape, portrait: the repeated answers (the 3rd, 5th poll)
+        // made no event.
+        assert_eq!(
+            sizes(&c),
+            vec![(1216, 2656), (1206, 2622), (2622, 1206), (1206, 2622)]
+        );
+        assert_eq!(
+            c.iter().map(|c| c["rotation"].as_u64()).collect::<Vec<_>>(),
+            vec![None, Some(0), Some(90), Some(0)]
+        );
+        assert_eq!(src.calls.load(Ordering::Relaxed), 5, "a poll a second for 5.5 s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_sps_change_asks_for_the_display_at_once_not_at_the_next_poll() {
+        let (sock, tx) = fake();
+        let mut r = display_rig();
+        let src = FakeDisplay::new(vec![Ok(vec![info(2622, 1206, "rot90")])], Duration::from_millis(50));
+        send_first_idr(&tx);
+        let rotated = SpsSpec::main_l150(2656, 1216).nal();
+        tx.send(dg(5, 2000, false, &ap(&[&VPS, &rotated, &PPS]))).unwrap();
+        tx.send(dg(6, 2000, true, &idr(&[6; 8]))).unwrap();
+        stop_after(&r, 500).await;
+        let links = Links {
+            display: Some(DisplayLink { source: &src, poll_interval: None, pending: None }),
+            hid: None,
+        };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        let c = configs(&r.queue.drain());
+        assert_eq!(sizes(&c), vec![(1216, 2656), (2656, 1216), (2622, 1206)]);
+        assert_eq!(src.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_display_query_changes_nothing() {
+        let (sock, tx) = fake();
+        let mut r = display_rig();
+        let src = FakeDisplay::new(vec![Err("the service is gone".into())], Duration::from_millis(10));
+        send_first_idr(&tx);
+        stop_after(&r, 3500).await;
+        let links = Links {
+            display: Some(DisplayLink { source: &src, poll_interval: Some(Duration::from_secs(1)), pending: None }),
+            hid: None,
+        };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(sizes(&configs(&r.queue.drain())), vec![(1216, 2656)]);
+    }
+
+    // ---- touch and keys ---------------------------------------------------------------------
+
+    /// Records what it is asked to do.
+    struct FakeHid {
+        done: Arc<Mutex<Vec<Action>>>,
+        stall: bool,
+    }
+
+    impl HidBackend for FakeHid {
+        fn perform(&mut self, action: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
+            let done = self.done.clone();
+            let stall = self.stall;
+            Box::pin(async move {
+                if stall {
+                    return std::future::pending().await;
+                }
+                done.lock().unwrap().push(action);
+                Ok(())
+            })
+        }
+    }
+
+    fn touch(phase: TouchPhase, x: f64, y: f64) -> Command {
+        Command::Touch(Touch { phase, x, y, id: 0 })
+    }
+
+    async fn send_later(r: &Rig, at_ms: u64, cmd: Command) {
+        let cmds = r.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(at_ms)).await;
+            cmds.send(cmd).await.unwrap();
+        });
+    }
+
+    fn hid_rig() -> Rig {
+        rig(|c| {
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = None;
+            c.rtcp_interval = None;
+            c.stats_interval = None;
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn touches_and_keys_go_through_the_loop_and_a_finger_is_lifted_at_stop() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx); // config 1216x2656, no display info: rotation 0
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = FakeHid { done: done.clone(), stall: false };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        send_later(&r, 100, touch(TouchPhase::Down, 608.0, 1328.0)).await;
+        send_later(&r, 150, Command::Key(Key::Home, Press::Short)).await;
+        send_later(&r, 250, Command::Key(Key::VolumeUp, Press::Long)).await;
+        send_later(&r, 200, touch(TouchPhase::Move, 1216.0, 0.0)).await;
+        send_later(&r, 300, Command::Stop).await; // the finger is still down
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        assert_eq!(
+            *done.lock().unwrap(),
+            vec![
+                Action::Touch { down: true, x: 32768, y: 32768 },
+                Action::Button { page: 0x0C, code: 0x40, down: true },
+                Action::Touch { down: true, x: 65535, y: 0 },
+                Action::Button { page: 0x0C, code: 0x40, down: false }, // 80 ms after the press
+                Action::Button { page: 0x0C, code: 0xE9, down: true },  // the long volume press starts
+                Action::Touch { down: false, x: 65535, y: 0 },          // the stop lifts the finger ...
+                Action::Button { page: 0x0C, code: 0xE9, down: false }, // ... and lets go of the key
+            ]
+        );
+    }
+
+    /// Records when each action was performed (on the paused clock).
+    struct TimedHid {
+        done: Arc<Mutex<Vec<(Action, tokio::time::Instant)>>>,
+    }
+
+    impl HidBackend for TimedHid {
+        fn perform(&mut self, action: Action) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
+            let done = self.done.clone();
+            Box::pin(async move {
+                done.lock().unwrap().push((action, tokio::time::Instant::now()));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_and_long_presses_are_held_for_their_times_through_the_loop() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = TimedHid { done: done.clone() };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        let t0 = tokio::time::Instant::now();
+        send_later(&r, 100, Command::Key(Key::Home, Press::Long)).await; // 600 ms
+        send_later(&r, 100, Command::Key(Key::Siri, Press::Short)).await; // 1200 ms
+        send_later(&r, 100, Command::Key(Key::Power, Press::Long)).await; // 1200 ms
+        send_later(&r, 100, Command::Key(Key::Mute, Press::Short)).await; // 80 ms
+        send_later(&r, 4000, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        let ups: Vec<(u64, u64)> = done
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(a, at)| match a {
+                Action::Button { code, down: false, .. } => Some((*code, (*at - t0).as_millis() as u64)),
+                _ => None,
+            })
+            .collect();
+        // Each button is released at its press (100 ms) plus its hold time, in that order.
+        assert_eq!(ups, vec![(0xE2, 180), (0x40, 700), (0xCF, 1300), (0x30, 1300)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finger_down_when_stdin_ends_is_lifted() {
+        // End of input is a Stop through the same channel.
+        let (sock, tx) = fake();
+        let r = hid_rig();
+        send_first_idr(&tx);
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = FakeHid { done: done.clone(), stall: false };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        send_later(&r, 100, touch(TouchPhase::Down, 0.0, 0.0)).await;
+        let Rig { mut engine, mut rx, gone, commands, .. } = r;
+        // Close the command channel instead of sending a stop (its sender is dropped: end of input).
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(commands);
+        });
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = run_session(&sock, &mut engine, &mut rx, &gone, &TokioClock, links).await;
+        closer.await.unwrap();
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        let done = done.lock().unwrap();
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[1], Action::Touch { down: false, x: 0, y: 0 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_hid_service_cannot_block_a_stop_and_is_reported() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let mut backend = FakeHid { done: Arc::default(), stall: true };
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0)).await;
+        send_later(&r, 200, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        let exit = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links),
+        )
+        .await
+        .expect("the session ended instead of waiting for the stalled service");
+        assert_eq!(exit, Exit::Stopped(StopCause::Command));
+        let frames = r.queue.drain();
+        let failure = frames
+            .iter()
+            .filter(|f| f.is_control())
+            .map(|f| serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap())
+            .find(|v| v["event"] == "hid")
+            .expect("a hid failure was reported");
+        assert_eq!(failure["ok"], false);
+        assert!(failure["message"].as_str().unwrap().contains("did not answer"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_hid_a_touch_is_answered_with_why_not() {
+        let (sock, tx) = fake();
+        let mut r = hid_rig();
+        send_first_idr(&tx);
+        let mut backend = NoHid;
+        let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
+        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0)).await;
+        send_later(&r, 120, Command::Invalid("usage: key <name>".into())).await;
+        send_later(&r, 200, Command::Stop).await;
+        let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
+        run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
+        let messages: Vec<String> = r
+            .queue
+            .drain()
+            .iter()
+            .filter(|f| f.is_control())
+            .map(|f| serde_json::from_slice::<serde_json::Value>(&f.payload).unwrap())
+            .filter(|v| v["event"] == "hid")
+            .map(|v| v["message"].as_str().unwrap().to_string())
+            .collect();
+        assert!(messages[0].contains("not enabled"), "{messages:?}");
+        // The next failure inside the same second is held back (one reply a second).
+        assert_eq!(messages.len(), 1, "{messages:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_fails_the_session() {
+        let (sock, _tx) = fake();
+        let mut r = rig(|_| {});
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        match exit {
+            Exit::Failed(m) => assert!(m.contains("no RTP media from the device for 15 s"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // With the RTP check off, the any-datagram check still ends it, later.
+        let mut r = rig(|c| {
+            c.rtp_stall_keyframe = None;
+            c.rtp_stall_timeout = None;
+            c.no_data_timeout = Duration::from_secs(30);
+        });
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        match exit {
+            Exit::Failed(m) => assert!(m.contains("no data from the device for 30 s"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_error_fails_the_session() {
+        let (sock, tx) = fake();
+        let mut r = rig(|_| {});
+        tx.send(Err(io::Error::new(io::ErrorKind::BrokenPipe, "adapter closed"))).unwrap();
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        match exit {
+            Exit::Failed(m) => assert!(m.contains("adapter closed"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gone_consumer_stops_the_session_even_if_the_notification_came_first() {
+        let (sock, _tx) = fake();
+        let mut r = rig(|_| {});
+        r.gone.notify_one(); // the writer noticed before the loop started waiting
+        let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, Links::default()).await;
+        assert_eq!(exit, Exit::Stopped(StopCause::ConsumerGone));
+    }
+}

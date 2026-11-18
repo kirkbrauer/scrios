@@ -1,0 +1,38 @@
+[package]
+name = "jumpstarter-ios-display"
+version = "0.1.0"
+edition = "2024"
+description = "Streams an iPhone's screen (HEVC over RTP, CoreDevice displayservice) to stdout as length-framed Annex-B access units."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# The CoreDevice display service, tunnel and usbmuxd client. Pinned by commit; see BUILD.md for
+# building against a local checkout when GitHub is not reachable.
+idevice = { git = "https://github.com/jkcoxson/idevice", rev = "2dca9a58a9a1dd02ec7d6213fcfd8fe861e74132", default-features = false, features = [
+  "aws-lc",
+  "display_stream",
+  "core_device_proxy",
+  "tunnel_tcp_stack",
+  "usbmuxd",
+  "rsd",
+  "xpc",
+] }
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+libc = "0.2"
+plist = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
