@@ -41,7 +41,7 @@ pub struct OddPacket {
     pub ssrc: u32,
     /// The whole datagram's length.
     pub datagram_len: usize,
-    /// The payload's length and its first [`ODD_BYTES`] bytes.
+    /// The payload's length and its first `ODD_BYTES` (400) bytes.
     pub payload_len: usize,
     pub payload_head: Vec<u8>,
 }

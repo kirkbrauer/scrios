@@ -226,7 +226,7 @@ impl HidSide<'_> {
 /// the screen is lifted and held keys are released.
 ///
 /// What the controller asks of the HID service is performed beside the loop, by a pump in this same
-/// task (see [`hid_pump`] and [`ActionQueue`]): the loop never awaits the service, so a service that
+/// task (see `hid_pump` and [`ActionQueue`]): the loop never awaits the service, so a service that
 /// has stalled holds up neither the video nor the commands.
 pub async fn run_session<S: DatagramSocket, C: Clock>(
     sock: &S,
