@@ -21,11 +21,12 @@ name = "scrios"
 path = "src/main.rs"
 
 [dependencies]
-# The CoreDevice display service, tunnel and usbmuxd client (MIT). Pinned EXACTLY (`=`): its API changes between
+# The CoreDevice display service, tunnel and usbmuxd client (MIT). TLS through rustls on `ring`, not idevice's
+# default aws-lc: the same backend on every platform, with no CMake or NASM (Windows). Pinned EXACTLY (`=`): its API changes between
 # releases, so `cargo update` and downstream resolution must not move it. Bumping it is a deliberate change: update
 # the version here and in the README's "Compatibility" line, run the tests, and smoke-test against a real device.
 idevice = { version = "=0.1.68", default-features = false, features = [
-  "aws-lc",
+  "ring",
   "display_stream",
   "core_device_proxy",
   "tunnel_tcp_stack",

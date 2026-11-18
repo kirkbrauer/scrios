@@ -61,8 +61,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
-      # Static musl binaries are cross-built with zig as the C compiler and linker: aws-lc-sys (the TLS backend)
-      # compiles its C sources with `cc` (no CMake, no bindgen for these targets).
+      # Static musl binaries are cross-built with zig as the C compiler and linker: ring (the TLS backend)
+      # compiles its C and assembly with `cc` (no CMake, no bindgen).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: matrix.zig
         with:

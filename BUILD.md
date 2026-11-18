@@ -1,7 +1,8 @@
 # Building
 
-scrios builds with a plain Rust toolchain (1.87 or newer, edition 2024) and a C compiler: `aws-lc-sys`, the TLS
-backend `idevice` uses, compiles its C sources with `cc`. CMake and bindgen are not needed for the targets below.
+scrios builds with a plain Rust toolchain (1.87 or newer, edition 2024) and a C compiler: `ring`, the TLS backend
+scrios selects in `idevice`, compiles a little C and assembly with `cc`. No CMake, NASM or bindgen is needed, on Linux,
+macOS or Windows.
 
 ```
 cargo build --release --locked     # -> target/release/scrios
@@ -39,7 +40,7 @@ works, since source replacement does not change the lock. A CA bundle for a TLS-
 `idevice` (the CoreDevice, RemoteXPC, usbmuxd and lockdown client) is pinned **exactly**, `version = "=0.1.68"`,
 because its API changes between releases. A bump is deliberate: change it in `Cargo.toml` and in the README's
 "Compatibility" line, run the tests, and smoke-test against a real device. Only the features scrios uses are on:
-`aws-lc` (TLS for the lockdown session), `display_stream` (the display service client, offers, RTP/RTCP helpers),
+`ring` (rustls on ring: TLS for the lockdown session; idevice's default, aws-lc, needs CMake/NASM on Windows), `display_stream` (the display service client, offers, RTP/RTCP helpers),
 `core_device_proxy` and `tunnel_tcp_stack` (the CoreDevice tunnel with its userspace TCP/UDP stack), `usbmuxd`,
 `rsd` and `xpc`.
 
