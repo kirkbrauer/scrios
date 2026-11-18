@@ -56,7 +56,7 @@ Host: Linux (x86_64, aarch64) and macOS (Apple silicon); Unix only.
 Release binaries (from the GitHub releases of this repository): `scrios-x86_64-linux-musl` and
 `scrios-aarch64-linux-musl` (static, any Linux distribution) and `scrios-aarch64-apple-darwin`, with `SHA256SUMS`.
 
-From source, with Rust 1.87 or newer and a C compiler (for `ring`, the TLS backend):
+From source, with Rust 1.89 or newer and a C compiler (for `ring`, the TLS backend):
 
 ```
 cargo build --release --locked      # -> target/release/scrios

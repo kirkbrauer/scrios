@@ -1,6 +1,6 @@
 # Building
 
-scrios builds with a plain Rust toolchain (1.87 or newer, edition 2024) and a C compiler: `ring`, the TLS backend
+scrios builds with a plain Rust toolchain (1.89 or newer, edition 2024) and a C compiler: `ring`, the TLS backend
 scrios selects in `idevice`, compiles a little C and assembly with `cc`. No CMake, NASM or bindgen is needed, on Linux,
 macOS or Windows.
 

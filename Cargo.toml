@@ -2,7 +2,7 @@
 name = "scrios"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.89"
 description = "The screen of an iOS device as an H.264 or HEVC stream, with touch and keys, over Apple's CoreDevice display and HID services"
 license = "Apache-2.0"
 repository = "https://github.com/kirkbrauer/scrios"
