@@ -111,9 +111,9 @@ pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
         let wire = match key & 7 {
             0 => Wire::Varint(read_varint(buf, &mut pos)?),
             1 => {
-                let b = buf.get(pos..pos + 8).ok_or("truncated fixed64")?;
+                let b = buf.get(pos..).and_then(<[u8]>::first_chunk::<8>).ok_or("truncated fixed64")?;
                 pos += 8;
-                Wire::Fixed64(b.try_into().expect("8 bytes"))
+                Wire::Fixed64(*b)
             }
             2 => {
                 let len = usize::try_from(read_varint(buf, &mut pos)?).map_err(|_| "length")?;
@@ -123,9 +123,9 @@ pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
                 Wire::Len(b.to_vec())
             }
             5 => {
-                let b = buf.get(pos..pos + 4).ok_or("truncated fixed32")?;
+                let b = buf.get(pos..).and_then(<[u8]>::first_chunk::<4>).ok_or("truncated fixed32")?;
                 pos += 4;
-                Wire::Fixed32(b.try_into().expect("4 bytes"))
+                Wire::Fixed32(*b)
             }
             t => return Err(format!("unsupported wire type {t}")),
         };

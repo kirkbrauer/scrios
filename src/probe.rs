@@ -215,15 +215,14 @@ impl ProbeReport {
     /// Did the device send H.264? `Ok` carries a one-line summary, `Err` the reason it did not.
     pub fn verdict(&self) -> Result<String, String> {
         let total = self.total_rtp();
-        if total == 0 {
+        let Some((&pt, &n)) = self.rtp_by_pt.iter().max_by_key(|(_, n)| **n).filter(|_| total > 0) else {
             return Err(format!(
                 "no RTP packets arrived in {} s ({} RTCP, {} other datagrams)",
                 self.window.as_secs(),
                 self.rtcp_packets,
                 self.junk
             ));
-        }
-        let (&pt, &n) = self.rtp_by_pt.iter().max_by_key(|(_, n)| **n).expect("there are packets");
+        };
         let looks_h264 = self.nal_types.contains_key(&avc::NAL_SPS) || self.nal_types.contains_key(&avc::NAL_IDR);
         match pt {
             H264_PAYLOAD_TYPE => {

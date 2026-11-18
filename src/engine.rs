@@ -246,14 +246,11 @@ fn clock_correction(current: u32, measured: f64) -> Option<u32> {
     if (measured - cur).abs() / cur <= 0.10 {
         return None;
     }
-    let nearest = CLOCK_CANDIDATES
-        .into_iter()
-        .min_by(|a, b| {
-            let (da, db) =
-                ((measured - f64::from(*a)).abs() / f64::from(*a), (measured - f64::from(*b)).abs() / f64::from(*b));
-            da.total_cmp(&db)
-        })
-        .expect("two candidates");
+    let nearest = CLOCK_CANDIDATES.into_iter().min_by(|a, b| {
+        let (da, db) =
+            ((measured - f64::from(*a)).abs() / f64::from(*a), (measured - f64::from(*b)).abs() / f64::from(*b));
+        da.total_cmp(&db)
+    })?; // two candidates, so there is one nearest
     (nearest != current).then_some(nearest)
 }
 

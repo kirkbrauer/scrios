@@ -759,8 +759,8 @@ impl Hid {
                 self.typing.iter_mut().for_each(|s| s.at += lag);
             }
         }
-        while self.typing.front().is_some_and(|s| s.at <= now) {
-            let step = self.typing.pop_front().expect("checked");
+        while let Some(step) = self.typing.front().filter(|s| s.at <= now).copied() {
+            self.typing.pop_front();
             self.kb_last = Some(now);
             match step.op {
                 TypeOp::ShiftDown => {
@@ -944,7 +944,7 @@ impl Hid {
             self.actions.push(Action::Button { page: step.page, code: step.code, down: step.down });
         }
         while let Some(i) = self.keys_down.iter().position(|k| k.at <= now) {
-            let k = self.keys_down.remove(i).expect("position is in range");
+            let Some(k) = self.keys_down.remove(i) else { break }; // `i` is a position, so in range
             self.actions.push(Action::Button { page: k.page, code: k.code, down: false });
         }
     }

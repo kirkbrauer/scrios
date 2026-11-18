@@ -348,7 +348,12 @@ async fn session_loop<S: DatagramSocket, C: Clock>(
                     h.hid.on_tick(now);
                 }
             },
-            reply = async { query.as_mut().expect("guarded").await }, if query.is_some() => {
+            reply = async {
+                match query.as_mut() {
+                    Some(q) => q.await,
+                    None => std::future::pending().await, // not reached: the guard is `query.is_some()`
+                }
+            }, if query.is_some() => {
                 query = None;
                 engine.on_display_info(reply);
             },

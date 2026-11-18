@@ -24,16 +24,14 @@ pub struct SenderReportInfo {
 /// The first sender report in a (compound) RTCP datagram.
 #[must_use]
 pub fn parse_sender_report(buf: &[u8]) -> Option<SenderReportInfo> {
-    let mut off = 0;
-    while off + 4 <= buf.len() {
-        let words = usize::from(u16::from_be_bytes([buf[off + 2], buf[off + 3]]));
-        let len = (words + 1) * 4;
-        if off + len > buf.len() {
-            return None;
-        }
-        if buf[off + 1] == PT_SR && len >= 20 {
-            let w = |i: usize| u32::from_be_bytes(buf[off + i..off + i + 4].try_into().expect("4 bytes"));
-            let (ssrc, msw, lsw, rtp_timestamp) = (w(4), w(8), w(12), w(16));
+    let mut rest = buf;
+    // Each packet: V/P/RC, the packet type, its length in words less one.
+    while let Some(&[_, packet_type, len_hi, len_lo]) = rest.first_chunk::<4>() {
+        let len = (usize::from(u16::from_be_bytes([len_hi, len_lo])) + 1) * 4;
+        let packet = rest.get(..len)?;
+        if packet_type == PT_SR && len >= 20 {
+            let w = |i: usize| packet.get(i..)?.first_chunk::<4>().map(|b| u32::from_be_bytes(*b));
+            let (ssrc, msw, lsw, rtp_timestamp) = (w(4)?, w(8)?, w(12)?, w(16)?);
             return Some(SenderReportInfo {
                 ssrc,
                 ntp_secs: f64::from(msw) + f64::from(lsw) / 4_294_967_296.0,
@@ -41,7 +39,7 @@ pub fn parse_sender_report(buf: &[u8]) -> Option<SenderReportInfo> {
                 rtp_timestamp,
             });
         }
-        off += len;
+        rest = rest.get(len..)?;
     }
     None
 }
