@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use idevice::usbmuxd::RawPacket;
@@ -33,6 +35,7 @@ pub(crate) struct FakeMux {
     at: Where,
 }
 
+#[cfg(unix)]
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl FakeMux {

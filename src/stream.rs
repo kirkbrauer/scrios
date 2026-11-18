@@ -936,17 +936,17 @@ mod tests {
         assert_eq!(queue.push_unit(Frame::unit(2, false, false, vec![1])), crate::outqueue::Pushed::Closed);
     }
 
-    /// A path for a socket that does not exist yet.
-    fn socket_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("scrios-{name}-{}.sock", std::process::id()))
+    /// The address of a usbmuxd that is not there: a TCP port of 127.0.0.1 that was free a moment ago. TCP, not a
+    /// unix socket, so that these tests are the same on every platform (`mux` tests the unix socket).
+    fn unreachable_usbmuxd() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
     }
 
     #[test]
     fn a_start_that_fails_is_an_error_event_then_the_end_and_an_outcome() {
-        let path = socket_path("missing");
         let stream =
-            Stream::start(StreamOptions { usbmuxd: Some(path.display().to_string()), ..StreamOptions::default() })
-                .unwrap();
+            Stream::start(StreamOptions { usbmuxd: Some(unreachable_usbmuxd()), ..StreamOptions::default() }).unwrap();
         let items: Vec<Item> = stream.items().collect();
         match items.as_slice() {
             [Item::Event(Event::Error { message })] => {
@@ -966,7 +966,7 @@ mod tests {
         let stream = Stream::start(StreamOptions {
             codec: CodecKind::Hevc,
             probe: Some(Probe { window: Duration::from_secs(1), raw_dump: None }),
-            usbmuxd: Some(socket_path("never-used").display().to_string()),
+            usbmuxd: Some(unreachable_usbmuxd()),
             ..StreamOptions::default()
         })
         .unwrap();
@@ -979,7 +979,7 @@ mod tests {
     fn a_probe_that_cannot_write_its_dump_fails_the_start() {
         let stream = Stream::start(StreamOptions {
             probe: Some(Probe { window: Duration::from_secs(1), raw_dump: Some("/nonexistent-dir/x.raw".into()) }),
-            usbmuxd: Some(socket_path("never-used").display().to_string()),
+            usbmuxd: Some(unreachable_usbmuxd()),
             ..StreamOptions::default()
         })
         .unwrap();
@@ -993,18 +993,14 @@ mod tests {
     #[test]
     fn a_stop_while_connecting_ends_the_start_cleanly() {
         // A usbmuxd that accepts and never answers: the start waits for it.
-        let path = socket_path("silent");
-        let _ = std::fs::remove_file(&path);
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let stream =
-            Stream::start(StreamOptions { usbmuxd: Some(path.display().to_string()), ..StreamOptions::default() })
-                .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let usbmuxd = listener.local_addr().unwrap().to_string();
+        let stream = Stream::start(StreamOptions { usbmuxd: Some(usbmuxd), ..StreamOptions::default() }).unwrap();
         let (_held, _) = listener.accept().unwrap();
         assert!(stream.input().stop());
         let items: Vec<Item> = stream.items().collect();
         assert_eq!(items, vec![Item::Event(Event::Stopped)]);
         assert_eq!(stream.wait(), Outcome::Stopped);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
