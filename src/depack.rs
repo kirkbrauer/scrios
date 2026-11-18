@@ -224,12 +224,22 @@ impl NalFormat for Hevc {
                     out.push(Item::Malformed);
                     return;
                 }
+                // The NAL header the unit is rebuilt with is judged as a whole NAL unit's is: reserved and
+                // unspecified types are left out, a zero temporal id is malformed.
+                let header = [(p[0] & 0x81) | (fu_type << 1), p[1]];
+                match Self::check_nal(&header) {
+                    NalCheck::Ok(_) => {}
+                    NalCheck::Skip => {
+                        out.push(Item::Ignore);
+                        return;
+                    }
+                    NalCheck::Malformed => {
+                        out.push(Item::Malformed);
+                        return;
+                    }
+                }
                 out.push(Item::Fragment {
-                    start: start.then_some(FragmentStart {
-                        header: [(p[0] & 0x81) | (fu_type << 1), p[1]],
-                        header_len: 2,
-                        typ: fu_type,
-                    }),
+                    start: start.then_some(FragmentStart { header, header_len: 2, typ: fu_type }),
                     fragment: &p[3..],
                     end,
                 });
@@ -389,12 +399,22 @@ impl NalFormat for H264 {
                     out.push(Item::Malformed);
                     return;
                 }
+                // The NAL header the unit is rebuilt with is judged as a whole NAL unit's is: the types that
+                // are not part of the base stream (prefix, extension and reserved ones) are left out.
+                let header = [(b0 & 0xE0) | fu_type, 0];
+                match Self::check_nal(&header[..1]) {
+                    NalCheck::Ok(_) => {}
+                    NalCheck::Skip => {
+                        out.push(Item::Ignore);
+                        return;
+                    }
+                    NalCheck::Malformed => {
+                        out.push(Item::Malformed);
+                        return;
+                    }
+                }
                 out.push(Item::Fragment {
-                    start: start.then_some(FragmentStart {
-                        header: [(b0 & 0xE0) | fu_type, 0],
-                        header_len: 1,
-                        typ: fu_type,
-                    }),
+                    start: start.then_some(FragmentStart { header, header_len: 1, typ: fu_type }),
                     fragment: &p[2..],
                     end,
                 });
@@ -1190,6 +1210,36 @@ mod tests {
     }
 
     #[test]
+    fn a_fragmented_nal_unit_is_judged_by_its_rebuilt_header_like_a_whole_one() {
+        let mut a = Assembler::new();
+        let base = trail(&[1; 4]);
+        // A reserved type (45), fragmented: every fragment is left out, as the whole unit would be.
+        let reserved = vec![45 << 1, 0x01, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE];
+        let frags = fu(&reserved, 3);
+        assert!(frags.len() > 1);
+        let mut out = Vec::new();
+        for (i, f) in frags.iter().enumerate() {
+            out.extend(feed(&mut a, 1 + i as u16, 100, false, f));
+        }
+        let mut seq = 1 + frags.len() as u16;
+        out.extend(feed(&mut a, seq, 100, true, &base));
+        assert_eq!(out.len(), 1);
+        assert_eq!(unit(&out[0]).payload, annexb(&[&base]));
+        seq += 1;
+
+        // A temporal id plus 1 of 0 is never valid: the unit is dropped, as with a whole NAL unit of it.
+        let bad = vec![1 << 1, 0x00, 1, 2, 3, 4, 5, 6];
+        let frags = fu(&bad, 3);
+        let mut out = Vec::new();
+        for (i, f) in frags.iter().enumerate() {
+            out.extend(feed(&mut a, seq + i as u16, 200, i == frags.len() - 1, f));
+        }
+        assert_eq!(out, vec![Output::Dropped { timestamp: 200, reason: DropReason::Malformed }]);
+        let whole = feed(&mut a, seq + frags.len() as u16, 300, true, &bad);
+        assert!(matches!(whole[0], Output::Dropped { reason: DropReason::Malformed, .. }));
+    }
+
+    #[test]
     fn an_oversized_unit_is_dropped_and_memory_stays_bounded() {
         let mut a = Assembler::with_max_unit_bytes(1000);
         let big = trail(&[1; 1500]);
@@ -1605,6 +1655,26 @@ mod h264_tests {
         let mut out = feed(&mut a, 1, 100, false, &[0x0E, 1, 2]); // type 14 (prefix NAL unit)
         out.extend(feed(&mut a, 2, 100, false, &[0x1E, 1, 2])); // payload type 30: reserved
         out.extend(feed(&mut a, 3, 100, true, &base));
+        assert_eq!(unit(&out[0]).payload, annexb(&[&base]));
+    }
+
+    #[test]
+    fn fragmented_extension_and_prefix_nal_units_are_left_out_like_whole_ones() {
+        let mut a = H264Assembler::new();
+        let base = slice(&[1; 4]);
+        let mut out = Vec::new();
+        let mut seq = 1;
+        // A prefix NAL unit (14) and a slice extension (20), each in three FU-A fragments.
+        for typ in [14u8, 20] {
+            let frags = fu_a(&[0x60 | typ, 1, 2, 3, 4, 5, 6, 7], 3);
+            assert!(frags.len() > 1);
+            for f in &frags {
+                out.extend(feed(&mut a, seq, 100, false, f));
+                seq += 1;
+            }
+        }
+        out.extend(feed(&mut a, seq, 100, true, &base));
+        assert_eq!(out.len(), 1);
         assert_eq!(unit(&out[0]).payload, annexb(&[&base]));
     }
 
