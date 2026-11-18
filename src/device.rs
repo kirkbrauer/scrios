@@ -310,7 +310,7 @@ pub fn answer_summary(answer: &plist::Value) -> Vec<String> {
 }
 
 impl StreamInfo {
-    fn fill_from(&mut self, other: StreamInfo) {
+    fn fill_from(&mut self, other: &StreamInfo) {
         self.source_port = self.source_port.or(other.source_port);
         self.device_ssrc = self.device_ssrc.or(other.device_ssrc);
         self.fps = self.fps.or(other.fps);
@@ -393,8 +393,10 @@ impl DisplayInfoSource for DisplayInfoClient {
 pub struct VideoSocket(UdpSocketHandle);
 
 impl DatagramSocket for VideoSocket {
-    // The trait asks for a `Send` future; spelled out so that the bound is checked here.
-    #[allow(clippy::manual_async_fn)]
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the trait asks for a `Send` future, spelled out here so that the bound is checked at this impl"
+    )]
     fn recv(&self) -> impl Future<Output = io::Result<Datagram>> + Send {
         async move {
             let dg = self.0.recv().await?;
@@ -487,6 +489,10 @@ impl Session {
     /// A message that says which step failed or timed out: connecting to usbmuxd, picking the device, opening the tunnel,
     /// the RSD handshake, connecting the display service, or starting the audio or video stream. Whatever was
     /// started is stopped by [`Session::shutdown`], which the caller calls after a failure too.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the connection sequence, one step after the other, each with its own error message: it reads top to bottom"
+    )]
     pub async fn start(&mut self, opts: &DeviceOptions) -> Result<(), String> {
         let spec = opts.usbmuxd.clone().unwrap_or_else(default_usbmuxd_spec);
         let addr = parse_usbmuxd_addr(&spec)?;
@@ -615,7 +621,7 @@ impl Session {
                             info!("server status says: {line}");
                         }
                     }
-                    info_from.fill_from(answer_info(&status));
+                    info_from.fill_from(&answer_info(&status));
                 }
                 Ok(Err(e)) => debug!("server status unavailable: {e:?}"),
                 Err(e) => debug!("{e}"),
@@ -903,10 +909,10 @@ async fn connect_display_info(adapter: &mut AdapterHandle, handshake: &mut RsdHa
 fn fresh_ssrc() -> u32 {
     loop {
         // The low 32 bits of a random UUID.
-        let [.., a, b, c, d] = *uuid::Uuid::new_v4().as_bytes();
-        let s = u32::from_be_bytes([a, b, c, d]);
-        if s != 0 {
-            return s;
+        let [.., b0, b1, b2, b3] = *uuid::Uuid::new_v4().as_bytes();
+        let ssrc = u32::from_be_bytes([b0, b1, b2, b3]);
+        if ssrc != 0 {
+            return ssrc;
         }
     }
 }
@@ -1053,7 +1059,7 @@ mod tests {
     #[test]
     fn fill_from_keeps_what_is_already_known() {
         let mut a = StreamInfo { source_port: Some(1), ..Default::default() };
-        a.fill_from(StreamInfo { source_port: Some(2), device_ssrc: Some(9), ..Default::default() });
+        a.fill_from(&StreamInfo { source_port: Some(2), device_ssrc: Some(9), ..Default::default() });
         assert_eq!((a.source_port, a.device_ssrc), (Some(1), Some(9)));
     }
 

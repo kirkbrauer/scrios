@@ -271,6 +271,10 @@ pub async fn run_session<S: DatagramSocket, C: Clock>(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one `select!` over the socket, the commands, the clock, the display query and the HID pump: the arms are short, and splitting them from the loop that owns their state would not make them clearer"
+)]
 async fn session_loop<S: DatagramSocket, C: Clock>(
     sock: &S,
     engine: &mut Engine,
@@ -423,7 +427,7 @@ mod tests {
     const PORT: u16 = 50001;
 
     #[derive(Clone)]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "a test fake: shared receivers and logs spelled out in the fields")]
     struct FakeSocket {
         rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<io::Result<Datagram>>>>,
         sent: Arc<Mutex<Vec<(u16, Vec<u8>)>>>,
@@ -454,6 +458,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the fake socket's channel carries what the real `recv` returns: an io::Result"
+    )]
     fn dg(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> io::Result<Datagram> {
         Ok(Datagram { src_port: PORT, data: rtp_bytes(seq, ts, marker, DEV, payload) })
     }
@@ -648,7 +656,7 @@ mod tests {
     }
 
     /// Answers queries from a list (the last answer repeats), each after `delay`.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "a test fake: the queue of replies spelled out in the field")]
     struct FakeDisplay {
         replies: Arc<Mutex<VecDeque<Result<Vec<DisplayInfo>, String>>>>,
         calls: Arc<AtomicUsize>,
@@ -700,7 +708,7 @@ mod tests {
         })
     }
 
-    async fn stop_after(r: &Rig, ms: u64) {
+    fn stop_after(r: &Rig, ms: u64) {
         let cmds = r.commands.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -715,7 +723,7 @@ mod tests {
         let src = FakeDisplay::new(vec![Ok(vec![info(1206, 2622, "rot0")])], Duration::from_secs(4));
         let pending = src.query(); // made at start, still waiting
         send_first_idr(&tx);
-        stop_after(&r, 5000).await;
+        stop_after(&r, 5000);
         let links = Links {
             display: Some(DisplayLink { source: &src, poll_interval: None, pending: Some(pending) }),
             hid: None,
@@ -740,7 +748,7 @@ mod tests {
         let src =
             FakeDisplay::new(vec![portrait.clone(), landscape.clone(), landscape, portrait], Duration::from_millis(10));
         send_first_idr(&tx);
-        stop_after(&r, 5500).await;
+        stop_after(&r, 5500);
         let links = Links {
             display: Some(DisplayLink { source: &src, poll_interval: Some(Duration::from_secs(1)), pending: None }),
             hid: None,
@@ -766,7 +774,7 @@ mod tests {
         let rotated = SpsSpec::main_l150(2656, 1216).nal();
         tx.send(dg(5, 2000, false, &ap(&[&VPS, &rotated, &PPS]))).unwrap();
         tx.send(dg(6, 2000, true, &idr(&[6; 8]))).unwrap();
-        stop_after(&r, 500).await;
+        stop_after(&r, 500);
         let links =
             Links { display: Some(DisplayLink { source: &src, poll_interval: None, pending: None }), hid: None };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
@@ -781,7 +789,7 @@ mod tests {
         let mut r = display_rig();
         let src = FakeDisplay::new(vec![Err("the service is gone".into())], Duration::from_millis(10));
         send_first_idr(&tx);
-        stop_after(&r, 3500).await;
+        stop_after(&r, 3500);
         let links = Links {
             display: Some(DisplayLink { source: &src, poll_interval: Some(Duration::from_secs(1)), pending: None }),
             hid: None,
@@ -816,7 +824,7 @@ mod tests {
         Command::Touch(Touch { phase, x, y, id: 0 })
     }
 
-    async fn send_later(r: &Rig, at_ms: u64, cmd: Command) {
+    fn send_later(r: &Rig, at_ms: u64, cmd: Command) {
         let cmds = r.commands.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(at_ms)).await;
@@ -842,11 +850,11 @@ mod tests {
         let done = Arc::new(Mutex::new(Vec::new()));
         let mut backend = FakeHid { done: done.clone(), stall: false };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
-        send_later(&r, 100, touch(TouchPhase::Down, 607.5, 1327.5)).await;
-        send_later(&r, 150, Command::Key(Key::Home, Press::Short)).await;
-        send_later(&r, 250, Command::Key(Key::VolumeUp, Press::Long)).await;
-        send_later(&r, 200, touch(TouchPhase::Move, 1216.0, 0.0)).await;
-        send_later(&r, 300, Command::Stop).await; // the finger is still down
+        send_later(&r, 100, touch(TouchPhase::Down, 607.5, 1327.5));
+        send_later(&r, 150, Command::Key(Key::Home, Press::Short));
+        send_later(&r, 250, Command::Key(Key::VolumeUp, Press::Long));
+        send_later(&r, 200, touch(TouchPhase::Move, 1216.0, 0.0));
+        send_later(&r, 300, Command::Stop); // the finger is still down
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -889,11 +897,11 @@ mod tests {
         let mut backend = TimedHid { done: done.clone() };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
         let t0 = tokio::time::Instant::now();
-        send_later(&r, 100, Command::Key(Key::Home, Press::Long)).await; // 600 ms
-        send_later(&r, 100, Command::Key(Key::Siri, Press::Short)).await; // 1200 ms
-        send_later(&r, 100, Command::Key(Key::Power, Press::Long)).await; // 1200 ms
-        send_later(&r, 100, Command::Key(Key::Mute, Press::Short)).await; // 80 ms
-        send_later(&r, 4000, Command::Stop).await;
+        send_later(&r, 100, Command::Key(Key::Home, Press::Long)); // 600 ms
+        send_later(&r, 100, Command::Key(Key::Siri, Press::Short)); // 1200 ms
+        send_later(&r, 100, Command::Key(Key::Power, Press::Long)); // 1200 ms
+        send_later(&r, 100, Command::Key(Key::Mute, Press::Short)); // 80 ms
+        send_later(&r, 4000, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         let ups: Vec<(u64, u64)> = done
@@ -918,10 +926,10 @@ mod tests {
         let mut backend = TimedHid { done: done.clone() };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
         let t0 = tokio::time::Instant::now();
-        send_later(&r, 100, Command::Key(Key::AppSwitcher, Press::Short)).await;
+        send_later(&r, 100, Command::Key(Key::AppSwitcher, Press::Short));
         // A touch in the gap (the first press is up at 180, the second goes down at 300) is performed when it comes.
-        send_later(&r, 230, touch(TouchPhase::Down, 607.5, 1327.5)).await;
-        send_later(&r, 1000, Command::Stop).await;
+        send_later(&r, 230, touch(TouchPhase::Down, 607.5, 1327.5));
+        send_later(&r, 1000, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -951,8 +959,8 @@ mod tests {
         let mut backend = TimedHid { done: done.clone() };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
         let t0 = tokio::time::Instant::now();
-        send_later(&r, 100, Command::Key(Key::AppSwitcher, Press::Long)).await; // long is ignored
-        send_later(&r, 130, Command::Stop).await; // the first press is still down (80 ms: until 180)
+        send_later(&r, 100, Command::Key(Key::AppSwitcher, Press::Long)); // long is ignored
+        send_later(&r, 130, Command::Stop); // the first press is still down (80 ms: until 180)
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -971,7 +979,7 @@ mod tests {
         let done = Arc::new(Mutex::new(Vec::new()));
         let mut backend = FakeHid { done: done.clone(), stall: false };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
-        send_later(&r, 100, touch(TouchPhase::Down, 0.0, 0.0)).await;
+        send_later(&r, 100, touch(TouchPhase::Down, 0.0, 0.0));
         let Rig { mut engine, mut rx, gone, commands, .. } = r;
         // Close the command channel instead of sending a stop (its sender is dropped: end of input).
         let closer = tokio::spawn(async move {
@@ -1001,10 +1009,10 @@ mod tests {
         let mut backend = TimedHid { done: done.clone() };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
         let t0 = tokio::time::Instant::now();
-        send_later(&r, 100, Command::Kb(Kb::Type("a".repeat(200)))).await;
+        send_later(&r, 100, Command::Kb(Kb::Type("a".repeat(200))));
         // A touch in the middle of the typing is performed when it arrives, not after the string.
-        send_later(&r, 130, touch(TouchPhase::Down, 607.5, 1327.5)).await;
-        send_later(&r, 186, Command::Stop).await;
+        send_later(&r, 130, touch(TouchPhase::Down, 607.5, 1327.5));
+        send_later(&r, 186, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -1064,8 +1072,8 @@ mod tests {
         let done = Arc::new(Mutex::new(Vec::new()));
         let mut backend = BrokenKeyboard { done: done.clone() };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
-        send_later(&r, 100, Command::Kb(Kb::Down(0xE1))).await;
-        send_later(&r, 200, Command::Stop).await;
+        send_later(&r, 100, Command::Kb(Kb::Down(0xE1)));
+        send_later(&r, 200, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         // The failure released the keyboard at once; at the stop there was nothing left to release.
@@ -1091,9 +1099,9 @@ mod tests {
         let mut backend = TimedHid { done: done.clone() };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
         let t0 = tokio::time::Instant::now();
-        send_later(&r, 100, Command::Kb(Kb::Down(0xE1))).await;
-        send_later(&r, 100, Command::Kb(Kb::Down(0x04))).await;
-        send_later(&r, 45_000, Command::Stop).await;
+        send_later(&r, 100, Command::Kb(Kb::Down(0xE1)));
+        send_later(&r, 100, Command::Kb(Kb::Down(0x04)));
+        send_later(&r, 45_000, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         let done = done.lock().unwrap();
@@ -1112,8 +1120,8 @@ mod tests {
         send_first_idr(&tx);
         let mut backend = FakeHid { done: Arc::default(), stall: true };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
-        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0)).await;
-        send_later(&r, 200, Command::Stop).await;
+        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0));
+        send_later(&r, 200, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = tokio::time::timeout(
             Duration::from_secs(60),
@@ -1196,13 +1204,13 @@ mod tests {
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
         let t0 = tokio::time::Instant::now();
         // At 100 ms a touch goes to the service, which never answers: it is given up on at 600 ms.
-        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0)).await;
+        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0));
         // Meanwhile the picture goes on, and a keyframe is asked for.
         for (at, seq) in [(150, 5), (250, 6), (350, 7), (450, 8)] {
             send_p_frame_later(&tx, at, seq);
         }
-        send_later(&r, 200, Command::Keyframe).await;
-        send_later(&r, 500, Command::Stop).await;
+        send_later(&r, 200, Command::Keyframe);
+        send_later(&r, 500, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -1245,14 +1253,14 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         // A drag: down at 100 ms, a move every 10 ms (the service takes 30 ms for each report), the lift at
         // 300 ms, then the Home button, then the stop.
-        send_later(&r, 100, touch(TouchPhase::Down, 100.0, 1000.0)).await;
+        send_later(&r, 100, touch(TouchPhase::Down, 100.0, 1000.0));
         for i in 1..=19u64 {
-            send_later(&r, 100 + 10 * i, touch(TouchPhase::Move, 100.0 + 10.0 * i as f64, 1000.0)).await;
+            send_later(&r, 100 + 10 * i, touch(TouchPhase::Move, 100.0 + 10.0 * i as f64, 1000.0));
         }
-        send_later(&r, 300, touch(TouchPhase::Up, 300.0, 1000.0)).await;
-        send_later(&r, 310, Command::Key(Key::Home, Press::Short)).await;
+        send_later(&r, 300, touch(TouchPhase::Up, 300.0, 1000.0));
+        send_later(&r, 310, Command::Key(Key::Home, Press::Short));
         send_p_frame_later(&tx, 200, 5);
-        send_later(&r, 700, Command::Stop).await;
+        send_later(&r, 700, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -1294,9 +1302,9 @@ mod tests {
         // 90 distinct keys go down at 100 ms: the first is being performed (it never finishes), the queue
         // takes 64, and the others are turned away and said so.
         for usage in 4..94u8 {
-            send_later(&r, 100, Command::Kb(Kb::Down(usage))).await;
+            send_later(&r, 100, Command::Kb(Kb::Down(usage)));
         }
-        send_later(&r, 1000, Command::Stop).await;
+        send_later(&r, 1000, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         assert_eq!(exit, Exit::Stopped(StopCause::Command));
@@ -1316,9 +1324,9 @@ mod tests {
         send_first_idr(&tx);
         let mut backend = NoHid;
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
-        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0)).await;
-        send_later(&r, 120, Command::Invalid("usage: key <name>".into())).await;
-        send_later(&r, 200, Command::Stop).await;
+        send_later(&r, 100, touch(TouchPhase::Down, 5.0, 5.0));
+        send_later(&r, 120, Command::Invalid("usage: key <name>".into()));
+        send_later(&r, 200, Command::Stop);
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;
         let messages: Vec<String> = r

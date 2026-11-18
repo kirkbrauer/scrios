@@ -222,6 +222,10 @@ struct StreamArgs {
 }
 
 #[derive(Args, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "command-line switches: each flag is its own option, and they do not form a state"
+)]
 struct AdvancedArgs {
     /// Override of the picture's visible size, e.g. 1206x2622 (default: the primary display's size from
     /// the device, else the conformance window of the SPS, else its size)
@@ -671,8 +675,8 @@ mod tests {
     use scrios::offer::{Codec, OfferFlags};
 
     fn stream_args(args: &[&str]) -> StreamArgs {
-        let argv = std::iter::once("scrios").chain(args.iter().copied());
-        match Cli::parse_from(argv).action() {
+        let command_line = std::iter::once("scrios").chain(args.iter().copied());
+        match Cli::parse_from(command_line).action() {
             Action::Stream(a) => *a,
             other @ Action::List { .. } => panic!("not a stream: {other:?}"),
         }

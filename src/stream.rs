@@ -75,6 +75,10 @@ const PANIC_CLEANUP: Duration = Duration::from_secs(8);
 /// What a stream is started with. [`Default`] is what the `scrios` binary does without options: the only device
 /// usbmuxd lists, its built-in display, H.264, touch and keys on, the intervals of the protocol.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent switches of the offer and the session (RTCP feedback, long-term references, control, display info): not a state, and a flags type would only hide them"
+)]
 pub struct StreamOptions {
     /// UDID of the device (default: the only device usbmuxd lists).
     pub udid: Option<String>,
@@ -276,7 +280,7 @@ impl Stream {
             let (queue, gone) = (queue.clone(), gone.clone());
             std::thread::Builder::new()
                 .name("scrios-stream".into())
-                .spawn(move || run_thread(opts, queue, gone, commands))?
+                .spawn(move || run_thread(opts, &queue, &gone, commands))?
         };
         Ok(Stream {
             shared: Arc::new(Shared {
@@ -431,14 +435,14 @@ fn item_of(frame: Frame, codec: CodecKind) -> Option<Item> {
 /// so a reader of the stream sees it end.
 fn run_thread(
     opts: StreamOptions,
-    queue: Arc<OutQueue>,
-    gone: Arc<Notify>,
+    queue: &Arc<OutQueue>,
+    gone: &Arc<Notify>,
     commands: mpsc::Receiver<Command>,
 ) -> Outcome {
     let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            let outcome = start_failed(&queue, format!("cannot build the async runtime: {e}"));
+            let outcome = start_failed(queue, format!("cannot build the async runtime: {e}"));
             queue.close_discarding_units();
             return outcome;
         }
@@ -446,8 +450,10 @@ fn run_thread(
 
     // The session lives out here, so that a panic inside `run` cannot take with it the means to
     // stop the stream on the device.
-    // Shared only between this thread and the runtime's tasks it blocks on, never sent to another thread.
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "shared only between this thread and the runtime's tasks it blocks on, never sent to another thread"
+    )]
     let session = Arc::new(tokio::sync::Mutex::new(Session::default()));
     let result = catch_unwind(AssertUnwindSafe(|| {
         rt.block_on(run(opts, queue.clone(), gone.clone(), commands, session.clone()))
@@ -552,6 +558,10 @@ async fn wait_for_stop(commands: &mut mpsc::Receiver<Command>) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the life of a stream, in order: start, probe, connect HID, loop, shut down; each step ends the function early its own way, so they cannot be moved out one by one without passing the whole state around"
+)]
 async fn run(
     opts: StreamOptions,
     queue: Arc<OutQueue>,

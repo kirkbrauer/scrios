@@ -174,7 +174,7 @@ mod tests {
         plist::Value::Dictionary(d)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "a test builder: one argument per key of the display's dictionary")]
     fn display(
         id: i64,
         name: &str,

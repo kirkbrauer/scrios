@@ -275,6 +275,10 @@ enum SourceCheck {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the engine's state machine: each flag is its own fact (confirmed SSRC, clock checked, a key awaited, a query wanted) and they change independently"
+)]
 pub struct Engine {
     cfg: EngineConfig,
     queue: Arc<OutQueue>,
@@ -2090,16 +2094,16 @@ mod tests {
         fn b_slices_are_counted_in_the_stats_and_the_stream_goes_on_unchanged() {
             let mut r = H264Rig::new();
             r.idr(0, true);
-            let b = typed_slice(1);
-            let p = typed_slice(0);
-            r.pkt(10, true, &p);
+            let b_slice = typed_slice(1);
+            let p_slice = typed_slice(0);
+            r.pkt(10, true, &p_slice);
             r.ts += 3000;
             assert_eq!(r.eng.stats().b_slices, 0);
-            r.pkt(20, true, &b);
+            r.pkt(20, true, &b_slice);
             r.ts += 3000;
             r.pkt(30, true, &typed_slice(6));
             r.ts += 3000;
-            r.pkt(40, true, &p);
+            r.pkt(40, true, &p_slice);
             let f = r.q.drain();
             let s = r.eng.stats();
             assert_eq!(s.b_slices, 2);
@@ -2107,7 +2111,7 @@ mod tests {
             assert_eq!((s.access_units, s.keyframes, s.dropped_units), (5, 1, 0));
             let units: Vec<_> = f.iter().filter(|f| !f.is_control_frame()).collect();
             assert_eq!(units.len(), 5);
-            assert_eq!(units[2].payload, [&[0u8, 0, 0, 1][..], &b[..]].concat());
+            assert_eq!(units[2].payload, [&[0u8, 0, 0, 1][..], &b_slice[..]].concat());
             assert!(units.windows(2).all(|w| w[0].pts_us <= w[1].pts_us));
             // And the stats line carries the count.
             let line = crate::frame::Frame::control(&crate::frame::Event::Stats(s));

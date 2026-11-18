@@ -366,6 +366,10 @@ impl Copier<'_> {
 /// Walks the SPS up to its `bitstream_restriction_flag`. With `write`, the bits are copied to a writer, and an
 /// SPS with no VUI gets one that holds nothing but flags that are off. Returns the number of reference
 /// frames, the restriction if the SPS has one, and the writer (positioned at the restriction flag).
+#[expect(
+    clippy::too_many_lines,
+    reason = "a straight walk down the SPS syntax of H.264 7.3.2.1.1 and Annex E, one element after the other: it is checked against the standard line by line"
+)]
 fn walk_sps(nal: &[u8], write: bool) -> Result<(u32, Option<Restriction>, Option<BitWriter>), SpsError> {
     let (_, payload) = split_sps_nal(nal)?;
     let rbsp = unescape_rbsp(payload);
@@ -581,6 +585,7 @@ pub struct AvcConfig {
 ///
 /// A message that says what is wrong: the record is under 7 bytes or is not version 1, a list is cut short, or an
 /// entry is not an SPS (or PPS) NAL unit.
+#[expect(clippy::similar_names, reason = "`sps` and `pps` are the standard's names, one letter apart")]
 pub fn parse_avcc(rec: &[u8]) -> Result<AvcConfig, String> {
     let [version, profile_indication, profile_compatibility, level_indication, length, num_sps, _, ..] = rec else {
         return Err("avcC record too short".into());
@@ -883,7 +888,7 @@ pub mod testutil {
     }
 
     /// The VUI of an SPS, field by field.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "a test builder: the optional fields hold their sub-fields as tuples")]
     #[derive(Debug, Clone, Default)]
     pub struct VuiSpec {
         /// `aspect_ratio_idc`, and the SAR for 255.
@@ -1727,11 +1732,11 @@ mod tests {
         let avcc = make_box(b"avcC", &avcc_content);
         assert_eq!(avcc.len(), 44);
         // The avc1 box: 8 + 78 + 44 = 130, and 4 more bytes make the 134 of the capture.
-        let mut avc1 = avc1_box(2400, 1680, &[avcc, vec![0, 0, 0, 0]]);
-        assert_eq!(avc1.len(), 134);
-        assert_eq!(&avc1[..8], &[0, 0, 0, 0x86, b'a', b'v', b'c', b'1']);
+        let mut sample_entry = avc1_box(2400, 1680, &[avcc, vec![0, 0, 0, 0]]);
+        assert_eq!(sample_entry.len(), 134);
+        assert_eq!(&sample_entry[..8], &[0, 0, 0, 0x86, b'a', b'v', b'c', b'1']);
         let mut packet = vec![0x92, 0xE6, 0xC0, 0xA3];
-        packet.append(&mut avc1);
+        packet.append(&mut sample_entry);
         packet
     }
 
