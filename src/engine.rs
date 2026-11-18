@@ -152,7 +152,7 @@ impl DisplayFacts {
 }
 
 /// Microseconds since the first access unit, from the RTP timestamp. The origin can be moved
-/// (a new source, a corrected clock rate) without the times jumping.
+/// (a new source, a corrected clock rate) without the times jumping, and the times never go back.
 #[derive(Debug)]
 struct PtsClock {
     hz: u64,
@@ -180,6 +180,10 @@ impl PtsClock {
         }
         self.last = timestamp;
         let pts = self.anchor_us + (self.ticks.max(0) as u128 * 1_000_000 / u128::from(self.hz)) as u64;
+        // A unit whose timestamp is behind the one before (a reordered or restarted sender) gets the previous
+        // time, never an earlier one: a decoder or a player must not see presentation times go backwards.
+        // The ticks go on from where the timestamps are, so the times follow them again once they pass.
+        let pts = pts.max(self.last_pts);
         self.last_pts = pts;
         pts
     }
@@ -1884,6 +1888,45 @@ mod tests {
         // And from there on in step with the new timestamps (500 ticks = 20 833 us).
         r.eng.on_datagram(r.at(60), PORT, &rtp_bytes(7003, 507, true, 0xBEEF, &trail(&[1; 4])));
         assert_eq!(r.frames()[0].pts_us, 1_000_000 + 16_666 + 20_833);
+    }
+
+    #[test]
+    fn pts_never_goes_back_when_a_timestamp_does() {
+        let mut p = PtsClock::new(24_000);
+        assert_eq!(p.pts_us(1000), 0);
+        assert_eq!(p.pts_us(1000 + 24_000), 1_000_000);
+        // A unit that is half a second behind: the previous time again, not 500 000.
+        assert_eq!(p.pts_us(1000 + 12_000), 1_000_000);
+        // The same timestamp twice is fine (equal, not lower).
+        assert_eq!(p.pts_us(1000 + 12_000), 1_000_000);
+        // Going forward from the late one follows the timestamps again: 2400 ticks past it is 100 ms, but that
+        // is still behind the 1 s already given, so the time waits for them to catch up ...
+        assert_eq!(p.pts_us(1000 + 14_400), 1_000_000);
+        // ... and goes on from there once they have: 24 000 + 2 400 ticks is 1.1 s.
+        assert_eq!(p.pts_us(1000 + 26_400), 1_100_000);
+        // A timestamp from before the very first one is the first time.
+        let mut p = PtsClock::new(24_000);
+        assert_eq!(p.pts_us(50_000), 0);
+        assert_eq!(p.pts_us(49_000), 0);
+    }
+
+    #[test]
+    fn the_pts_of_the_units_written_never_goes_back() {
+        let mut r = Rig::with(no_stall);
+        r.idr(0, true);
+        r.delta(10);
+        r.delta(20);
+        // A delta unit with an earlier timestamp (reordered by the sender): written, with the time before.
+        r.ts -= 2000;
+        r.delta(30);
+        r.ts += 2000 + 500;
+        r.delta(40);
+        r.delta(50);
+        let pts: Vec<u64> = r.frames().iter().filter(|f| !f.is_control()).map(|f| f.pts_us).collect();
+        assert_eq!(pts.len(), 6);
+        assert!(pts.windows(2).all(|w| w[0] <= w[1]), "{pts:?}");
+        assert_eq!(pts[3], pts[2], "the late unit gets the time of the one before it");
+        assert!(pts[5] > pts[3], "{pts:?}");
     }
 
     #[test]
