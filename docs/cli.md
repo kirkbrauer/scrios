@@ -247,11 +247,21 @@ has the overview; the details:
   band a little lighter than the bars. A press that starts in the band is **on the device's edge**: in the bottom band it
   is the last row of the upright picture (the digitizer's own edge, 65535), in the top band row 0, in the side bands
   column 0 or the last column, with the other coordinate as aimed (a corner is the device's corner). The moves after the
-  press map as usual and stay on the picture. So an upward drag from the bottom band is a true edge swipe (Home, unlock), a
-  downward one from the top band is the top-edge swipe (Control Center, Notification Center), and the window's own resize
-  border, outside the band, is not what the drag grabs. While the pointer is in the bottom band a short bar is drawn in it.
-  The first window is the picture's size plus the band, and `--window-width`/`--window-height` are for the whole window.
-  The band is never more than a sixth of the window's shorter side.
+  press map as usual and stay on the picture. So a drag from the top band is a top-edge swipe, and the window's own resize
+  border, outside the band, is not what a drag from the picture's edge grabs. While the pointer is in the bottom band a
+  short bar is drawn in it. The first window is the picture's size plus the band, and `--window-width`/`--window-height`
+  are for the whole window. The band is never more than a sixth of the window's shorter side.
+* **The bottom swipe** (`--bottom-swipe keys|touch`, default `keys`). iOS ignores the swipe up from the home indicator as
+  injected touch, even at the exact edge, so with `keys` a press that starts in the bottom band or in the picture's lowest 3%
+  is **held back**: nothing is sent for it until it is decided.
+  * It rose by more than 8% of the upright height and went no further sideways than up, and the pointer then stopped for
+    300 ms at some point before the button was released: **App Switcher** (`key app-switcher`); without that pause:
+    **Home** (`key home`). No touch is ever sent for it. The title says "Home" or "App Switcher" for a moment.
+  * It went sideways (further across than 8% of the height and than it rose): at once it is a touch from where it began
+    (`touch down` at the edge, then `move`), followed live, up on release.
+  * It ended without being either (a tap, a short drag): it is played as the touch it was, `touch down` at its start (the
+    edge, for a press in the band) and `up` at its end after as long as the press lasted (at least 60 ms, at most 400).
+  Presses elsewhere are touch at once. `touch` sends the bottom drag as touch like any other.
 * **Keyboard.** A key goes down and up on the device (`kb down|up`, HID usage by the key's position) as it does on the
   host. Auto-repeat of the host is not forwarded. Losing the focus lifts every key.
 * **Shortcuts** with `MOD` = **Cmd** on macOS, **Alt** elsewhere; not sent to the device, and neither is the modifier or a
@@ -262,7 +272,7 @@ has the overview; the details:
   | `MOD+H` | `key home` |
   | `MOD+S` | `key app-switcher` |
   | `MOD+Up`, `MOD+Down` | `key volume-up`, `key volume-down` (repeat while held) |
-  | `MOD+G` | the swipe up from the bottom edge: `touch down` on the last row in the middle, a straight run up by 30% of the height in about 150 ms, `touch up` (the gesture that goes Home or unlocks); not made while a finger is down |
+  | `MOD+G` | the bottom swipe, made for you: `key home` (as `MOD+H`) with `--bottom-swipe keys`; with `touch`, `touch down` on the last row in the middle, a straight run up by 30% of the height in about 150 ms, `touch up`. Not made while a finger is down |
   | `MOD+W` | close the window |
   | `MOD+P` | `key lock`, only with `--lock-shortcut` |
 
@@ -343,7 +353,7 @@ needs an SSH server there).
 | `--no-preflight` | do not check Developer Mode and the developer disk image first, and never mount one |
 | `--ddi-dir DIR` | the developer disk image folder to mount from (see [the developer disk image](#the-developer-disk-image)) |
 | `--ddi-download-url URL`, `--ddi-sha256 HEX` | download the image (a `.tar.gz` of the folder, checked against the hash) when no folder is found; no default URL |
-| `--decoder auto\|platform\|software`, `--window-title`, `--window-width`, `--window-height`, `--edge-margin`, `--show-stats`, `--lock-shortcut` | the viewer's (see above); `scrios` without a subcommand only |
+| `--decoder auto\|platform\|software`, `--window-title`, `--window-width`, `--window-height`, `--edge-margin`, `--bottom-swipe`, `--show-stats`, `--lock-shortcut` | the viewer's (see above); `scrios` without a subcommand only |
 | `--list-devices` | the same as `scrios list` |
 
 Under **Advanced** in `--help`: `--visible-size`, the RTCP and stall intervals, `--display-poll-ms`, the touch mapping

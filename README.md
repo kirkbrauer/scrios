@@ -212,11 +212,18 @@ and `up` at the matching point of the device's screen. A drag that leaves the pi
 
 **The edge margin.** The picture is inset from the window's edges by a band, 24 logical pixels wide, a little lighter than
 the black bars (`--edge-margin PIXELS`; 0 turns it off). A press that starts **in the band is on the device's edge**: in the
-bottom band it is the very bottom row of the screen, in the top band the very top row, and likewise at the sides, with the
-position along the edge as you aimed. So an upward drag that starts in the bottom band is a true bottom-edge swipe (Home, or
-unlocking), and the window's own resize border, which is at the window's edge, is outside the band: the drag no longer
-resizes the window. A short bar like iOS's home indicator shows in the bottom band while the pointer is in it. The band does
-not cost the picture any size: the first window is as large as before, plus the band.
+top band it is the very top row of the screen, at the sides the very first or last column, with the position along the edge
+as you aimed (the Control Center swipe from the top right corner, for one). The window's own resize border, which is at the
+window's edge, is outside the band, so a drag from the picture's edge no longer resizes the window. The band does not cost
+the picture any size: the first window is as large as before, plus the band.
+
+**The bottom swipe is the Home button.** iOS ignores the swipe up from the home indicator when it is injected as touch,
+even at the exact edge. So a drag that starts in the bottom band (or the lowest 3% of the picture) and goes up by more than
+8% of the screen's height is not sent as touch: when you let go, the device gets the **Home** button, or the **App Switcher**
+if you paused (about 300 ms) before letting go, as a swipe up and hold does on the phone. The window says which in its title
+("Home", "App Switcher") for a moment. A drag that is not that swipe (a tap near the bottom, a short or sideways drag) is sent
+as the touch it was. A short bar like iOS's home indicator shows in the bottom band while the pointer is in it.
+`--bottom-swipe touch` sends the bottom drag as touch like any other, for an iOS that accepts it.
 
 **Keyboard.** Keys are sent to the device as a hardware keyboard by their position (letters, digits, arrows, function
 keys, modifiers), so the device interprets them with its own layout (US). A key is down on the device while it is down
@@ -231,7 +238,7 @@ with the modifier held.
 | `MOD+H` | Home |
 | `MOD+S` | App Switcher |
 | `MOD+Up`, `MOD+Down` | Volume up, down (repeat while held) |
-| `MOD+G` | the swipe up from the bottom edge, made for you (the gesture that goes Home or unlocks) |
+| `MOD+G` | the bottom swipe, made for you: the Home button (the same as `MOD+H`), or with `--bottom-swipe touch` the touch swipe up from the bottom edge |
 | `MOD+W` | close the window |
 | `MOD+P` | lock the device, **only with `--lock-shortcut`** |
 
@@ -257,6 +264,7 @@ NV12 planes.
 | `--window-title TITLE` | the window's title (default `scrios`) |
 | `--window-width PIXELS`, `--window-height PIXELS` | the first window is at most this wide / high (logical pixels) |
 | `--edge-margin PIXELS` | the margin round the picture, in which a press is on the device's edge (default 24; 0: none) |
+| `--bottom-swipe keys\|touch` | a drag up from the bottom edge is the Home button / App Switcher (`keys`, the default) or touch |
 | `--show-stats` | frame rate and delay in the title |
 | `--lock-shortcut` | `MOD+P` locks the device |
 | `--decoder auto\|platform\|software` | the H.264 decoder |

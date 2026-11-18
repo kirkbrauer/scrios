@@ -13,13 +13,13 @@ use winit::keyboard::ModifiersState;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};
 
-use crate::commands::Command;
+use crate::commands::{Command, Key as HwKey, Press};
 use crate::frame::Event;
 use crate::stream::{EXIT_FAILED, EXIT_START_FAILED};
 use crate::viewer::geometry::{
     Fitter, Layout, PictureGeometry, Refit, Rotation, fit_size, refit_size, scaled_pixels, whole_pixels,
 };
-use crate::viewer::input::{Action, KeyPress, Keyboard, Pointer, ShortcutModifier, swipe_up};
+use crate::viewer::input::{Action, BottomSwipe, KeyPress, Keyboard, Mouse, ShortcutModifier, swipe_up};
 use crate::viewer::pipeline::{Control, Feed, FrameSlot, Wake};
 use crate::viewer::render::Renderer;
 use crate::viewer::stats::{Meter, Status, stats_line, title};
@@ -34,6 +34,9 @@ const SCREEN_SHARE: (f64, f64) = (0.9, 0.85);
 /// A screen whose size is not known.
 const FALLBACK_SCREEN: (f64, f64) = (1280.0, 720.0);
 
+/// How long what a gesture did ("Home") stays in the title.
+const FLASH: Duration = Duration::from_millis(1500);
+
 /// What the window is told to do, from the command line.
 #[derive(Debug, Clone)]
 pub struct WindowOptions {
@@ -46,6 +49,8 @@ pub struct WindowOptions {
     pub lock_shortcut: bool,
     /// The margin around the picture, in logical pixels (0: none).
     pub edge_margin: u32,
+    /// What a drag up from the bottom edge is sent as.
+    pub bottom_swipe: BottomSwipe,
     /// How the decoder is named in the log (it is on another thread).
     pub decoder: &'static str,
 }
@@ -80,7 +85,11 @@ struct App {
     /// What the window was sized for.
     fitter: Fitter,
     keyboard: Keyboard,
-    pointer: Pointer,
+    mouse: Mouse,
+    /// What a gesture or a shortcut just did, and until when the title says so.
+    flash: Option<(&'static str, Instant)>,
+    /// The clock the mouse's times are read from.
+    started: Instant,
     modifiers: ModifiersState,
     /// The pointer's last position in the window, physical pixels.
     cursor: PhysicalPosition<f64>,
@@ -103,6 +112,7 @@ struct App {
 impl App {
     fn new(options: WindowOptions, feed: Arc<dyn Feed>, slot: Arc<FrameSlot>, control: Control) -> App {
         let note = (!options.control).then(|| "view only".to_owned());
+        let options_bottom_swipe = options.bottom_swipe;
         let keyboard = Keyboard::new(ShortcutModifier::host_default(), options.lock_shortcut);
         App {
             options,
@@ -114,7 +124,9 @@ impl App {
             geometry: None,
             fitter: Fitter::default(),
             keyboard,
-            pointer: Pointer::default(),
+            mouse: Mouse::new(options_bottom_swipe),
+            flash: None,
+            started: Instant::now(),
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             hint: false,
@@ -132,7 +144,10 @@ impl App {
     fn set_title(&self) {
         if let Some(window) = &self.window {
             let status = match &self.status {
-                Status::Live { .. } => Status::Live { stats: self.stats.clone(), note: self.note.clone() },
+                Status::Live { .. } => Status::Live {
+                    stats: self.stats.clone(),
+                    note: self.flash.map(|(label, _)| label.to_owned()).or_else(|| self.note.clone()),
+                },
                 other => other.clone(),
             };
             window.set_title(&title(&self.options.title, &status));
@@ -153,8 +168,8 @@ impl App {
 
     /// Shows the hint while the pointer is in the margin below the picture and no finger is down.
     fn update_hint(&mut self) {
-        let hint = !self.pointer.is_down()
-            && self.layout().is_some_and(|l| l.in_bottom_margin((self.cursor.x, self.cursor.y)));
+        let hint =
+            !self.mouse.is_down() && self.layout().is_some_and(|l| l.in_bottom_margin((self.cursor.x, self.cursor.y)));
         if hint != self.hint {
             self.hint = hint;
             if let Some(window) = &self.window {
@@ -163,30 +178,70 @@ impl App {
         }
     }
 
-    /// Sends the actions a key made.
-    fn act(&mut self, event_loop: &ActiveEventLoop, actions: Vec<Action>) {
+    /// Says what a gesture or a shortcut just did, in the title, for a moment (when commands are on: with them off it did
+    /// nothing).
+    fn flash(&mut self, label: &'static str) {
+        if self.control.enabled() {
+            self.flash = Some((label, Instant::now() + FLASH));
+            self.set_title();
+        }
+    }
+
+    /// Does what the actions say, except closing the window.
+    fn perform(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Send(command) => self.control.send(command),
-                Action::Close => self.close(event_loop),
-                Action::SwipeUp => {
-                    // Not over a finger that is down, nor over another gesture; with no picture there is no edge.
-                    if let Some(g) = self.geometry
-                        && !self.pointer.is_down()
+                Action::Send(command) => {
+                    if let Command::Key(key, _) = &command
+                        && let Some(label) = key_label(*key)
                     {
-                        // Best effort: not started if one is playing already.
-                        let _ = self.control.gesture(swipe_up(g.upright()));
+                        self.flash(label);
                     }
+                    self.control.send(command);
                 }
+                // A touch with its own timing (a tap held back and played): best effort, not started over a gesture.
+                Action::Play(plan) => {
+                    let _ = self.control.gesture(plan);
+                }
+                Action::Note(label) => self.flash(label),
+                Action::SwipeUp => self.swipe_up(),
+                Action::Close => {}
             }
+        }
+    }
+
+    /// The bottom swipe from the keyboard: the Home button, or the touch of it, as `--bottom-swipe` says. Not over a
+    /// finger that is down; with no picture there is no edge.
+    fn swipe_up(&mut self) {
+        let Some(g) = self.geometry else { return };
+        if self.mouse.is_down() {
+            return;
+        }
+        match self.options.bottom_swipe {
+            BottomSwipe::Keys => {
+                self.control.send(Command::Key(HwKey::Home, Press::Short));
+                self.flash("Home");
+            }
+            BottomSwipe::Touch => {
+                // Best effort: not started if one is playing already.
+                let _ = self.control.gesture(swipe_up(g.upright()));
+            }
+        }
+    }
+
+    /// Does what the actions a key made say, and closes the window if one says so.
+    fn act(&mut self, event_loop: &ActiveEventLoop, actions: Vec<Action>) {
+        let close = actions.contains(&Action::Close);
+        self.perform(actions);
+        if close {
+            self.close(event_loop);
         }
     }
 
     /// Lifts the finger and every key that is down on the device.
     fn release_inputs(&mut self) {
-        if let Some(command) = self.pointer.cancel() {
-            self.control.send(command);
-        }
+        let lift = self.mouse.cancel();
+        self.perform(lift);
         for action in self.keyboard.release_all() {
             if let Action::Send(command) = action {
                 self.control.send(command);
@@ -242,9 +297,8 @@ impl App {
         let upright = geometry.upright();
         if self.geometry.map(|g| g.upright()) != Some(upright) {
             // The same point of the window is another point of the picture now.
-            if let Some(command) = self.pointer.cancel() {
-                self.control.send(command);
-            }
+            let lift = self.mouse.cancel();
+            self.perform(lift);
         }
         self.geometry = Some(geometry);
         // The window is sized by the config, not by a picture that came first (which only shows what it is). Without a
@@ -355,18 +409,17 @@ impl App {
         self.act(event_loop, actions);
     }
 
-    fn mouse(&mut self, state: ElementState) {
+    fn on_mouse_button(&mut self, state: ElementState) {
         let Some(layout) = self.layout() else { return };
         let at = (self.cursor.x, self.cursor.y);
-        let command = match state {
-            // A gesture of the keyboard is being played: the mouse waits for it.
-            ElementState::Pressed if self.control.gesture_active() => None,
-            ElementState::Pressed => self.pointer.pressed(layout, at),
-            ElementState::Released => self.pointer.released(layout, at),
+        let now = self.started.elapsed();
+        let actions = match state {
+            // A gesture is being played: the mouse waits for it.
+            ElementState::Pressed if self.control.gesture_active() => Vec::new(),
+            ElementState::Pressed => self.mouse.pressed(layout, at, now),
+            ElementState::Released => self.mouse.released(layout, at, now),
         };
-        if let Some(command) = command {
-            self.control.send(command);
-        }
+        self.perform(actions);
         self.update_hint();
     }
 }
@@ -444,10 +497,9 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::Focused(false) => self.release_inputs(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
-                if let Some(layout) = self.layout()
-                    && let Some(command) = self.pointer.moved(layout, (position.x, position.y))
-                {
-                    self.control.send(command);
+                if let Some(layout) = self.layout() {
+                    let actions = self.mouse.moved(layout, (position.x, position.y), self.started.elapsed());
+                    self.perform(actions);
                 }
                 self.update_hint();
             }
@@ -456,10 +508,23 @@ impl ApplicationHandler<Wake> for App {
                 self.cursor = PhysicalPosition::new(-1.0, -1.0);
                 self.update_hint();
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.mouse(state),
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.on_mouse_button(state),
             // Keys the window held when it got the focus are not presses of its own.
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(event_loop, &event),
             _ => {}
+        }
+    }
+
+    /// What a gesture did stays in the title for a moment: wake up to take it out.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.flash {
+            Some((_, until)) if Instant::now() >= until => {
+                self.flash = None;
+                self.set_title();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some((_, until)) => event_loop.set_control_flow(ControlFlow::WaitUntil(until)),
+            None => {}
         }
     }
 
@@ -467,5 +532,17 @@ impl ApplicationHandler<Wake> for App {
     /// on the device before the process goes.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.finish();
+    }
+}
+
+/// What a button press made from the window is called in the title.
+fn key_label(key: HwKey) -> Option<&'static str> {
+    match key {
+        HwKey::Home => Some("Home"),
+        HwKey::AppSwitcher => Some("App Switcher"),
+        HwKey::VolumeUp => Some("Volume up"),
+        HwKey::VolumeDown => Some("Volume down"),
+        HwKey::Lock => Some("Lock"),
+        _ => None,
     }
 }

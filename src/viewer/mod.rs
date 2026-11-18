@@ -33,6 +33,7 @@ pub mod render;
 pub mod stats;
 
 pub use decode::DecoderChoice;
+pub use input::BottomSwipe;
 pub use pipeline::{Feed, Recorder};
 
 use pipeline::{Control, FrameSlot, Wake, decode_loop};
@@ -59,6 +60,9 @@ pub struct ViewerOptions {
     /// The margin around the picture, in logical pixels (0: none). A press in it is on the device's edge, so that an edge
     /// swipe can start there, away from the window's own border.
     pub edge_margin: u32,
+    /// What a drag up from the bottom edge is sent as: the Home button (the App Switcher if held), which iOS accepts, or
+    /// touch, which it ignores at the bottom edge today.
+    pub bottom_swipe: BottomSwipe,
     /// Record the stream, as it comes, to this file (raw Annex-B).
     pub record: Option<PathBuf>,
 }
@@ -75,6 +79,7 @@ impl Default for ViewerOptions {
             show_stats: false,
             lock_shortcut: false,
             edge_margin: DEFAULT_EDGE_MARGIN,
+            bottom_swipe: BottomSwipe::Keys,
             record: None,
         }
     }
@@ -174,6 +179,7 @@ impl Setup {
             control: options.control,
             lock_shortcut: options.lock_shortcut,
             edge_margin: options.edge_margin,
+            bottom_swipe: options.bottom_swipe,
             decoder: decoder_name,
         };
         app::run(window, feed, slot, control, events)

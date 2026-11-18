@@ -14,7 +14,11 @@
 //!   gesture that goes Home or unlocks), `MOD+W` closes the window. `MOD+P` locks the device only when the user asked for
 //!   it (`--lock-shortcut`): a lock from the keyboard while the screen is the only way in is a way to lock oneself out.
 //! * The **margin** around the picture (see [`Layout`]) makes the device's edges easy to start a drag at: a press in it is
-//!   on the device's edge, so an upward drag from the bottom margin is the edge swipe that goes Home.
+//!   on the device's edge, which is what the side and top edge swipes need.
+//! * The **bottom swipe** is different: iOS ignores the home-indicator swipe when it is injected as touch, even at the
+//!   exact edge. So (`--bottom-swipe keys`, the default) a drag that starts in the bottom margin or the picture's lowest
+//!   strip and goes up is not sent as touch: when it ends it is the Home button, or the App Switcher if it paused before
+//!   it ended, and a drag that is not that swipe is sent as the touch it was ([`Mouse`]).
 
 use std::time::Duration;
 
@@ -71,8 +75,13 @@ pub enum Action {
     Send(Command),
     /// Close the window (and with it stop the stream).
     Close,
-    /// Swipe up from the device's bottom edge (what [`swipe_up`] plays).
+    /// The bottom swipe, from the keyboard (what `--bottom-swipe` says it is: the Home button, or the touch of
+    /// [`swipe_up`]).
     SwipeUp,
+    /// Commands to send, each after its wait, from a thread of their own (a touch replayed with its timing).
+    Play(Vec<(Duration, Command)>),
+    /// What was just done, to say in the window ("Home").
+    Note(&'static str),
 }
 
 /// A key event, as much of a winit `KeyEvent` as the rules need (a `KeyEvent` cannot be built outside winit, so the
@@ -317,9 +326,170 @@ impl Pointer {
         Some(touch(TouchPhase::Up, last))
     }
 
+    /// The finger is down at `at` already (its `down` was sent by the caller).
+    fn adopt(&mut self, at: (f64, f64)) {
+        self.finger = Some(at);
+    }
+
     #[must_use]
     pub fn is_down(&self) -> bool {
         self.finger.is_some()
+    }
+}
+
+/// What a drag from the bottom edge is sent as (`--bottom-swipe`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BottomSwipe {
+    /// The Home button (or, held, the App Switcher): what iOS accepts.
+    #[default]
+    Keys,
+    /// Touch, as any other drag: iOS ignores it at the bottom edge today.
+    Touch,
+}
+
+/// The lowest part of the picture, as a fraction of its height, where a press can be the start of a bottom swipe.
+pub const BOTTOM_STRIP: f64 = 0.03;
+/// How far a drag must rise to be a swipe, as a fraction of the picture's height (and how far sideways one must go to be
+/// a drag that is not).
+const SWIPE_THRESHOLD: f64 = 0.08;
+/// A pause this long, while the drag is risen, makes the swipe the App Switcher's.
+pub const HOLD: Duration = Duration::from_millis(300);
+/// The press of a tap that is replayed is at least this long, and at most the next.
+const REPLAY_MIN: Duration = Duration::from_millis(60);
+const REPLAY_MAX: Duration = Duration::from_millis(400);
+
+/// What a drag from the bottom edge is, from where it started to where it ended: `Some(button)` if it is a swipe up (it
+/// rose by 8% of the height and went no further sideways than up), else `None`. `paused` says the
+/// pointer stayed still, risen, for [`HOLD`]: the App Switcher; otherwise Home.
+#[must_use]
+pub fn bottom_swipe(start: (f64, f64), end: (f64, f64), paused: bool, upright: (u32, u32)) -> Option<HwKey> {
+    let rise = start.1 - end.1;
+    let run = (end.0 - start.0).abs();
+    if rise < f64::from(upright.1) * SWIPE_THRESHOLD || run > rise {
+        return None;
+    }
+    Some(if paused { HwKey::AppSwitcher } else { HwKey::Home })
+}
+
+/// Whether a drag from the bottom edge has gone sideways for good: further across than the threshold and than it rose, so
+/// it is no swipe up and is sent as the touch it is.
+fn sideways(start: (f64, f64), end: (f64, f64), upright: (u32, u32)) -> bool {
+    let run = (end.0 - start.0).abs();
+    run > f64::from(upright.1) * SWIPE_THRESHOLD && run > start.1 - end.1
+}
+
+/// A press at the bottom edge that has not been decided yet: nothing was sent for it.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    start: (f64, f64),
+    pressed_at: Duration,
+    last: (f64, f64),
+    moved_at: Duration,
+    /// The pointer stayed still, risen, for [`HOLD`] at some point.
+    paused: bool,
+    /// The pointer moved at all since the press.
+    moved: bool,
+}
+
+/// The mouse: the finger ([`Pointer`]) and, with `--bottom-swipe keys`, the bottom swipe that is made into buttons.
+///
+/// A press that starts where a bottom swipe starts is held back: nothing is sent for it until it is decided. If it rises
+/// far enough without going sideways, it is that swipe and, when the button is released, it is **Home** (a pause before the
+/// release makes it the **App Switcher**) and no touch was ever sent. If it goes sideways it is a touch from its start,
+/// sent at once and followed live. If it ends without being either (a tap, a short drag) it is replayed as the touch it was.
+/// Every other press is the finger's, as it was. Time is given by the caller (a monotonic clock) so that this is testable.
+#[derive(Debug, Default)]
+pub struct Mouse {
+    mode: BottomSwipe,
+    finger: Pointer,
+    pending: Option<Pending>,
+}
+
+impl Mouse {
+    #[must_use]
+    pub fn new(mode: BottomSwipe) -> Mouse {
+        Mouse { mode, finger: Pointer::default(), pending: None }
+    }
+
+    /// The left button went down at `at`, at time `now`.
+    pub fn pressed(&mut self, layout: Layout, at: (f64, f64), now: Duration) -> Vec<Action> {
+        if self.pending.is_some() {
+            return Vec::new();
+        }
+        if self.mode == BottomSwipe::Keys
+            && !self.finger.is_down()
+            && layout.starts_bottom_swipe(at, BOTTOM_STRIP)
+            && let Some(start) = layout.press(at)
+        {
+            self.pending =
+                Some(Pending { start, pressed_at: now, last: start, moved_at: now, paused: false, moved: false });
+            return Vec::new();
+        }
+        self.finger.pressed(layout, at).map(|c| vec![Action::Send(c)]).unwrap_or_default()
+    }
+
+    /// The pointer moved to `at`, at time `now`.
+    pub fn moved(&mut self, layout: Layout, at: (f64, f64), now: Duration) -> Vec<Action> {
+        let Some(mut pending) = self.pending else {
+            return self.finger.moved(layout, at).map(|c| vec![Action::Send(c)]).unwrap_or_default();
+        };
+        let Some(point) = layout.follow(at) else { return Vec::new() };
+        // A pause while risen: the pointer was still for HOLD before this move.
+        let risen = pending.start.1 - pending.last.1 >= f64::from(layout.upright.1) * SWIPE_THRESHOLD;
+        if risen && now.saturating_sub(pending.moved_at) >= HOLD {
+            pending.paused = true;
+        }
+        pending.last = point;
+        pending.moved_at = now;
+        pending.moved = true;
+        if sideways(pending.start, point, layout.upright) {
+            // Not a swipe up: the touch it is, from where it started, and the finger follows from here.
+            self.pending = None;
+            let down = touch(TouchPhase::Down, pending.start);
+            let to = touch(TouchPhase::Move, point);
+            self.finger.adopt(point);
+            return vec![Action::Send(down), Action::Send(to)];
+        }
+        self.pending = Some(pending);
+        Vec::new()
+    }
+
+    /// The left button went up at `at`, at time `now`.
+    pub fn released(&mut self, layout: Layout, at: (f64, f64), now: Duration) -> Vec<Action> {
+        let Some(pending) = self.pending.take() else {
+            return self.finger.released(layout, at).map(|c| vec![Action::Send(c)]).unwrap_or_default();
+        };
+        // A press that never moved ends where it began (its position is the edge's, not the pointer's).
+        let end = if pending.moved { layout.follow(at).unwrap_or(pending.last) } else { pending.start };
+        let risen = pending.start.1 - pending.last.1 >= f64::from(layout.upright.1) * SWIPE_THRESHOLD;
+        let paused = pending.paused || (risen && now.saturating_sub(pending.moved_at) >= HOLD);
+        if let Some(button) = bottom_swipe(pending.start, end, paused, layout.upright) {
+            let name = if button == HwKey::AppSwitcher { "App Switcher" } else { "Home" };
+            return vec![Action::Send(Command::Key(button, Press::Short)), Action::Note(name)];
+        }
+        // Not a swipe: the touch it was, sent now, as long as the press was (so that a tap is a tap).
+        let held = now.saturating_sub(pending.pressed_at).clamp(REPLAY_MIN, REPLAY_MAX);
+        let mut plan = vec![(Duration::ZERO, touch(TouchPhase::Down, pending.start))];
+        if end == pending.start {
+            plan.push((held, touch(TouchPhase::Up, end)));
+        } else {
+            plan.push((held / 2, touch(TouchPhase::Move, end)));
+            plan.push((held / 2, touch(TouchPhase::Up, end)));
+        }
+        vec![Action::Play(plan)]
+    }
+
+    /// The finger lifts where it is, or the press that was held back is dropped (nothing was sent for it): the pointer or the
+    /// focus was lost, or the picture turned under it.
+    pub fn cancel(&mut self) -> Vec<Action> {
+        self.pending = None;
+        self.finger.cancel().map(|c| vec![Action::Send(c)]).unwrap_or_default()
+    }
+
+    /// Whether a button is down: a finger on the device, or a press that is not decided yet.
+    #[must_use]
+    pub fn is_down(&self) -> bool {
+        self.pending.is_some() || self.finger.is_down()
     }
 }
 
@@ -372,7 +542,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 Action::Send(c) => Some(c.clone()),
-                Action::Close | Action::SwipeUp => None,
+                Action::Close | Action::SwipeUp | Action::Play(_) | Action::Note(_) => None,
             })
             .collect()
     }
@@ -888,5 +1058,233 @@ mod tests {
         // A press in the bars beyond the margin, at the window's own edge, is nothing.
         assert_eq!(p.pressed(margined(), (3.0, 500.0)), None);
         assert_eq!(p.pressed(margined(), (497.0, 500.0)), None);
+    }
+
+    // ---- the bottom swipe ---------------------------------------------------------------------------------------
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    const UP: (u32, u32) = (1206, 2622);
+
+    #[test]
+    fn a_quick_swipe_up_from_the_bottom_is_home_and_a_paused_one_is_the_app_switcher() {
+        let start = (603.0, 2621.0);
+        // Up by 10% of the height, straight: Home; paused first: the App Switcher.
+        assert_eq!(bottom_swipe(start, (603.0, 2359.0), false, UP), Some(HwKey::Home));
+        assert_eq!(bottom_swipe(start, (603.0, 2359.0), true, UP), Some(HwKey::AppSwitcher));
+        // A long way up, a little aslant (less across than up) is still the swipe.
+        assert_eq!(bottom_swipe(start, (803.0, 1500.0), false, UP), Some(HwKey::Home));
+        assert_eq!(bottom_swipe(start, (403.0, 1500.0), false, UP), Some(HwKey::Home));
+    }
+
+    #[test]
+    fn a_drag_that_is_too_short_or_sideways_or_downwards_is_no_swipe() {
+        let start = (603.0, 2621.0);
+        // The threshold is 8% of 2622: 209.76 pixels of rise.
+        assert_eq!(bottom_swipe(start, (603.0, 2621.0 - 209.0), false, UP), None, "just short of it");
+        assert!(bottom_swipe(start, (603.0, 2621.0 - 210.0), false, UP).is_some(), "just past it");
+        assert_eq!(bottom_swipe(start, start, false, UP), None, "a tap");
+        assert_eq!(bottom_swipe(start, (603.0, 2621.0 - 50.0), true, UP), None, "short, and paused: still short");
+        // Sideways: across further than up.
+        assert_eq!(bottom_swipe(start, (1100.0, 2621.0 - 300.0), false, UP), None);
+        assert_eq!(bottom_swipe(start, (100.0, 2621.0 - 300.0), false, UP), None);
+        // Downwards (a drag that left the picture below).
+        assert_eq!(bottom_swipe((603.0, 2000.0), (603.0, 2621.0), false, UP), None);
+        // The same rise on a landscape picture (its height is 1206): 8% of that.
+        assert!(bottom_swipe((1311.0, 1205.0), (1311.0, 1205.0 - 100.0), false, (2622, 1206)).is_some());
+        assert_eq!(bottom_swipe((1311.0, 1205.0), (1311.0, 1205.0 - 90.0), false, (2622, 1206)), None);
+    }
+
+    fn keys() -> Mouse {
+        Mouse::new(BottomSwipe::Keys)
+    }
+
+    /// The commands that went to the device, whether sent at once or played.
+    fn commands(actions: &[Action]) -> Vec<Command> {
+        let mut out = Vec::new();
+        for a in actions {
+            match a {
+                Action::Send(c) => out.push(c.clone()),
+                Action::Play(plan) => out.extend(plan.iter().map(|(_, c)| c.clone())),
+                Action::Close | Action::SwipeUp | Action::Note(_) => {}
+            }
+        }
+        out
+    }
+
+    fn notes(actions: &[Action]) -> Vec<&'static str> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Note(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_quick_swipe_from_the_bottom_margin_is_home_and_no_touch_is_ever_sent() {
+        let mut m = keys();
+        // The press, in the bottom margin: held back.
+        assert!(m.pressed(margined(), (250.0, 990.0), ms(0)).is_empty());
+        assert!(m.is_down());
+        // The drag up: nothing sent while it goes.
+        for (t, y) in [(10, 940.0), (20, 900.0), (30, 850.0), (40, 800.0)] {
+            assert!(m.moved(margined(), (250.0, y), ms(t)).is_empty(), "y {y}");
+        }
+        // The release: the Home button, said in the title.
+        let end = m.released(margined(), (250.0, 800.0), ms(50));
+        assert_eq!(commands(&end), vec![Command::Key(HwKey::Home, Press::Short)]);
+        assert_eq!(notes(&end), vec!["Home"]);
+        assert!(!m.is_down());
+    }
+
+    #[test]
+    fn a_swipe_that_stops_before_it_ends_is_the_app_switcher() {
+        // Up, and still for 400 ms at the end, then released.
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 990.0), ms(0));
+        m.moved(margined(), (250.0, 850.0), ms(60));
+        m.moved(margined(), (250.0, 760.0), ms(120));
+        let end = m.released(margined(), (250.0, 760.0), ms(520));
+        assert_eq!(commands(&end), vec![Command::Key(HwKey::AppSwitcher, Press::Short)]);
+        assert_eq!(notes(&end), vec!["App Switcher"]);
+        // A pause on the way up counts too, even if it moves on and lets go at once.
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 990.0), ms(0));
+        m.moved(margined(), (250.0, 850.0), ms(60));
+        m.moved(margined(), (250.0, 760.0), ms(500));
+        let end = m.released(margined(), (250.0, 760.0), ms(510));
+        assert_eq!(commands(&end), vec![Command::Key(HwKey::AppSwitcher, Press::Short)]);
+        // A swipe that does not stop is Home even when it is slow overall.
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 990.0), ms(0));
+        for i in 1..=20 {
+            m.moved(margined(), (250.0, 990.0 - 12.0 * f64::from(i)), ms(i64_to_u64(i) * 100));
+        }
+        let end = m.released(margined(), (250.0, 750.0), ms(2050));
+        assert_eq!(commands(&end), vec![Command::Key(HwKey::Home, Press::Short)]);
+    }
+
+    fn i64_to_u64(i: i32) -> u64 {
+        u64::try_from(i).expect("positive")
+    }
+
+    #[test]
+    fn a_pause_at_the_very_start_is_not_a_hold() {
+        // Pressed, still for a second (not risen yet), then a quick swipe: Home.
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 990.0), ms(0));
+        m.moved(margined(), (250.0, 850.0), ms(1000));
+        m.moved(margined(), (250.0, 760.0), ms(1030));
+        let end = m.released(margined(), (250.0, 760.0), ms(1040));
+        assert_eq!(commands(&end), vec![Command::Key(HwKey::Home, Press::Short)]);
+    }
+
+    #[test]
+    fn a_swipe_from_the_pictures_lowest_strip_is_the_same() {
+        // Inside the picture, 10 window pixels above its bottom edge (976): the lowest 3% (947 and below).
+        let mut m = keys();
+        assert!(m.pressed(margined(), (250.0, 966.0), ms(0)).is_empty());
+        m.moved(margined(), (250.0, 800.0), ms(40));
+        let end = m.released(margined(), (250.0, 800.0), ms(60));
+        assert_eq!(commands(&end), vec![Command::Key(HwKey::Home, Press::Short)]);
+        // Higher up, a press is a touch at once, and a swipe there is a drag (the app's own scrolling).
+        let mut m = keys();
+        let down = m.pressed(margined(), (250.0, 900.0), ms(0));
+        assert!(matches!(commands(&down).as_slice(), [Command::Touch(Touch { phase: TouchPhase::Down, .. })]));
+        let up = m.released(margined(), (250.0, 600.0), ms(100));
+        assert!(matches!(commands(&up).as_slice(), [Command::Touch(Touch { phase: TouchPhase::Up, .. })]));
+    }
+
+    #[test]
+    fn a_tap_near_the_bottom_still_taps() {
+        let mut m = keys();
+        assert!(m.pressed(margined(), (250.0, 966.0), ms(0)).is_empty(), "held back, not lost");
+        let end = m.released(margined(), (250.0, 966.0), ms(90));
+        assert!(notes(&end).is_empty());
+        // Played, as long as the press was: down, then up at the same point.
+        let [Action::Play(plan)] = end.as_slice() else { panic!("{end:?}") };
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, Duration::ZERO);
+        assert_eq!(plan[1].0, ms(90));
+        let (Command::Touch(down), Command::Touch(up)) = (&plan[0].1, &plan[1].1) else { panic!("{plan:?}") };
+        assert_eq!((down.phase, up.phase), (TouchPhase::Down, TouchPhase::Up));
+        assert!((down.x - up.x).abs() < 1e-9 && (down.y - up.y).abs() < 1e-9);
+        // The tap in the margin is on the device's very bottom edge.
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 990.0), ms(0));
+        let end = m.released(margined(), (250.0, 990.0), ms(10));
+        let [Action::Play(plan)] = end.as_slice() else { panic!("{end:?}") };
+        let Command::Touch(down) = &plan[0].1 else { panic!("{plan:?}") };
+        assert!((down.y - 2621.0).abs() < 1e-9, "{}", down.y);
+        // A press that is very short is replayed for long enough to be one.
+        assert!(plan[1].0 >= ms(60));
+    }
+
+    #[test]
+    fn a_short_drag_from_the_bottom_is_replayed_as_the_touch_it_was() {
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 966.0), ms(0));
+        m.moved(margined(), (250.0, 935.0), ms(30));
+        let end = m.released(margined(), (250.0, 935.0), ms(200));
+        let cmds = commands(&end);
+        assert_eq!(cmds.len(), 3, "{cmds:?}");
+        assert!(matches!(cmds[0], Command::Touch(Touch { phase: TouchPhase::Down, .. })));
+        assert!(matches!(cmds[1], Command::Touch(Touch { phase: TouchPhase::Move, .. })));
+        assert!(matches!(cmds[2], Command::Touch(Touch { phase: TouchPhase::Up, .. })));
+        assert!(notes(&end).is_empty());
+    }
+
+    #[test]
+    fn a_drag_that_goes_sideways_is_a_touch_from_its_start_and_is_followed_live() {
+        let mut m = keys();
+        assert!(m.pressed(margined(), (60.0, 990.0), ms(0)).is_empty());
+        // Across by 300 window pixels (about 830 device pixels, far past the threshold) and hardly up.
+        let first = m.moved(margined(), (360.0, 985.0), ms(30));
+        let cmds = commands(&first);
+        assert_eq!(cmds.len(), 2, "{cmds:?}");
+        let Command::Touch(down) = &cmds[0] else { panic!() };
+        assert_eq!(down.phase, TouchPhase::Down);
+        assert!((down.y - 2621.0).abs() < 1e-9, "from the very start: the bottom edge");
+        assert!(matches!(cmds[1], Command::Touch(Touch { phase: TouchPhase::Move, .. })));
+        // Then live: a move is a move, the release is the touch's up, and no key was pressed.
+        let more = m.moved(margined(), (400.0, 985.0), ms(50));
+        assert!(matches!(commands(&more).as_slice(), [Command::Touch(Touch { phase: TouchPhase::Move, .. })]));
+        let end = m.released(margined(), (400.0, 985.0), ms(70));
+        assert!(matches!(commands(&end).as_slice(), [Command::Touch(Touch { phase: TouchPhase::Up, .. })]));
+        assert!(!m.is_down());
+    }
+
+    #[test]
+    fn touch_mode_sends_the_bottom_drag_as_touch_from_the_first_press() {
+        let mut m = Mouse::new(BottomSwipe::Touch);
+        let down = m.pressed(margined(), (250.0, 990.0), ms(0));
+        let Some(Command::Touch(t)) = commands(&down).into_iter().next() else { panic!("{down:?}") };
+        assert_eq!(t.phase, TouchPhase::Down);
+        assert!((t.y - 2621.0).abs() < 1e-9, "on the edge");
+        assert!(m.is_down());
+        assert!(!commands(&m.moved(margined(), (250.0, 800.0), ms(40))).is_empty());
+        assert!(matches!(
+            commands(&m.released(margined(), (250.0, 800.0), ms(80))).as_slice(),
+            [Command::Touch(Touch { phase: TouchPhase::Up, .. })]
+        ));
+    }
+
+    #[test]
+    fn a_press_held_back_is_dropped_by_a_cancel_and_a_second_press_is_ignored() {
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 990.0), ms(0));
+        assert!(m.pressed(margined(), (250.0, 500.0), ms(5)).is_empty(), "no second finger");
+        assert!(m.cancel().is_empty(), "nothing had been sent: nothing to lift");
+        assert!(!m.is_down());
+        // The release that follows a cancel is nothing.
+        assert!(m.released(margined(), (250.0, 990.0), ms(40)).is_empty());
+        // A finger that is down is lifted by a cancel.
+        let mut m = keys();
+        m.pressed(margined(), (250.0, 500.0), ms(0));
+        assert!(matches!(commands(&m.cancel()).as_slice(), [Command::Touch(Touch { phase: TouchPhase::Up, .. })]));
     }
 }

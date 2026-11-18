@@ -226,6 +226,14 @@ impl Layout {
         }
     }
 
+    /// Whether a press at `at` is where a swipe up from the bottom edge starts: in the margin below the picture, or in the
+    /// picture's lowest `fraction` (the home indicator's own strip).
+    #[must_use]
+    pub fn starts_bottom_swipe(&self, at: (f64, f64), fraction: f64) -> bool {
+        let Some(p) = self.picture() else { return false };
+        self.in_bottom_margin(at) || (p.contains(at.0, at.1) && at.1 >= p.y + p.h * (1.0 - fraction))
+    }
+
     /// The hint that shows while the pointer is in the bottom margin: a short bar, like iOS's home indicator, in the
     /// middle of the band. `None` when the margin is too thin for it.
     #[must_use]
@@ -733,6 +741,23 @@ mod tests {
         assert_eq!(tiny.margin(), 0);
         assert!(tiny.picture().is_some());
         assert_eq!(Layout { window: (0, 600), ..tiny }.picture(), None);
+    }
+
+    #[test]
+    fn a_bottom_swipe_starts_in_the_bottom_margin_or_the_pictures_lowest_strip() {
+        let l = margined();
+        // The picture is 952 high from y = 24: its lowest 3% starts at 976 - 28.56.
+        assert!(l.starts_bottom_swipe((250.0, 990.0), 0.03), "the margin below it");
+        assert!(l.starts_bottom_swipe((250.0, 960.0), 0.03), "the strip");
+        assert!(!l.starts_bottom_swipe((250.0, 940.0), 0.03), "above the strip");
+        assert!(!l.starts_bottom_swipe((250.0, 500.0), 0.03), "the middle");
+        assert!(!l.starts_bottom_swipe((250.0, 10.0), 0.03), "the top margin");
+        assert!(!l.starts_bottom_swipe((3.0, 990.0), 0.03), "the bar beyond the margin");
+        // With no margin there is only the strip.
+        let none = Layout { margin: 0, ..l };
+        assert!(!none.starts_bottom_swipe((250.0, 500.0), 0.03));
+        assert!(none.starts_bottom_swipe((250.0, 995.0), 0.03));
+        assert!(!Layout { window: (0, 0), ..l }.starts_bottom_swipe((1.0, 1.0), 0.03));
     }
 
     #[test]

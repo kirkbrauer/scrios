@@ -29,7 +29,7 @@ use scrios::preflight::PreflightOptions;
 use scrios::sink::{Format, Sink};
 use scrios::stream::{EXIT_START_FAILED, Input, Item, Probe, Stream, StreamOptions};
 #[cfg(feature = "viewer")]
-use scrios::viewer::{DEFAULT_EDGE_MARGIN, DecoderChoice, Setup, ViewerOptions};
+use scrios::viewer::{BottomSwipe, DEFAULT_EDGE_MARGIN, DecoderChoice, Setup, ViewerOptions};
 
 /// The longest interval accepted for the millisecond options (a day); longer ones are clamped.
 const MAX_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -272,6 +272,26 @@ impl DecoderArg {
     }
 }
 
+/// What a drag up from the bottom edge is sent as (see `--bottom-swipe`).
+#[cfg(feature = "viewer")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BottomSwipeArg {
+    /// The Home button (the App Switcher if the drag pauses before it ends): iOS ignores the swipe as touch.
+    Keys,
+    /// Touch, as any other drag: for an iOS that accepts it.
+    Touch,
+}
+
+#[cfg(feature = "viewer")]
+impl BottomSwipeArg {
+    fn mode(self) -> BottomSwipe {
+        match self {
+            BottomSwipeArg::Keys => BottomSwipe::Keys,
+            BottomSwipeArg::Touch => BottomSwipe::Touch,
+        }
+    }
+}
+
 /// The options of the window (`scrios` without a subcommand). The stream's own options (`--udid`, `--record`,
 /// `--no-control`, ...) are the same as for `scrios stream`.
 #[cfg(feature = "viewer")]
@@ -299,8 +319,8 @@ struct ViewerArgs {
     show_stats: bool,
 
     /// The margin round the picture, in logical pixels (0: none): a lighter band in which a press is on the device's edge,
-    /// so that a swipe from the bottom edge (Home) or the top (Control Center) can start there, away from the window's
-    /// resize border. Cmd+G (Alt+G elsewhere) makes the swipe up from the bottom edge
+    /// so that an edge swipe (the top one, say) can start there, away from the window's resize border. Cmd+G (Alt+G
+    /// elsewhere) makes the bottom swipe
     #[arg(
         long,
         value_name = "PIXELS",
@@ -308,6 +328,12 @@ struct ViewerArgs {
         value_parser = clap::value_parser!(u32).range(0..=200)
     )]
     edge_margin: u32,
+
+    /// What a drag up from the bottom edge is sent as. keys: the Home button, or the App Switcher if the drag pauses before
+    /// it ends, and no touch (iOS ignores the home-indicator swipe as injected touch, even at the exact edge); a drag
+    /// from the bottom that is not that swipe is sent as the touch it was. touch: as any drag, for an iOS that accepts it
+    #[arg(long, value_enum, value_name = "MODE", default_value_t = BottomSwipeArg::Keys)]
+    bottom_swipe: BottomSwipeArg,
 
     /// Let Cmd+P (Alt+P elsewhere) lock the device. Off by default: with the screen as the only way in, a lock from the
     /// keyboard is a way to lock oneself out
@@ -914,6 +940,7 @@ fn run_view(args: &StreamArgs, viewer: &ViewerArgs) -> i32 {
         show_stats: viewer.show_stats,
         lock_shortcut: viewer.lock_shortcut,
         edge_margin: viewer.edge_margin,
+        bottom_swipe: viewer.bottom_swipe.mode(),
         record: args.record.clone(),
     };
     // The decoder and the recording come first: a failure there should not cost a run on the device.
@@ -1402,6 +1429,8 @@ mod tests {
         assert_eq!((viewer.window_width, viewer.window_height), (None, None));
         assert!(!viewer.show_stats && !viewer.lock_shortcut, "no lock shortcut, no overlay, unless asked for");
         assert_eq!(viewer.edge_margin, 24, "an edge margin of 24 logical pixels");
+        assert_eq!(viewer.bottom_swipe, BottomSwipeArg::Keys, "the bottom swipe is the Home button by default");
+        assert_eq!(viewer.bottom_swipe.mode(), BottomSwipe::Keys);
         assert!(stream.control(), "touch and keys are on");
         assert_eq!(stream.check_viewer(), Ok(()));
         assert_eq!(stream.check(), Ok(()));
@@ -1439,6 +1468,9 @@ mod tests {
         assert_eq!((viewer.window_width, viewer.window_height), (Some(900), Some(700)));
         assert!(viewer.show_stats && viewer.lock_shortcut);
         assert_eq!(viewer.edge_margin, 40);
+        assert_eq!(view_args(&["--bottom-swipe", "touch"]).1.bottom_swipe.mode(), BottomSwipe::Touch);
+        assert_eq!(view_args(&["--bottom-swipe", "keys"]).1.bottom_swipe.mode(), BottomSwipe::Keys);
+        assert!(Cli::try_parse_from(["scrios", "--bottom-swipe", "mouse"]).is_err());
         assert_eq!(view_args(&["--edge-margin", "0"]).1.edge_margin, 0, "0 turns the margin off");
         assert!(Cli::try_parse_from(["scrios", "--edge-margin", "500"]).is_err());
         assert!(Cli::try_parse_from(["scrios", "--edge-margin", "-1"]).is_err());
