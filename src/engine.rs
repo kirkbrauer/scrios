@@ -490,6 +490,7 @@ impl Engine {
             bytes: w.bytes,
             keyframes: w.keyframes,
             b_slices: self.asm.b_slices(),
+            edge_downs: self.queue.edge_downs(),
             ..self.counters
         }
     }

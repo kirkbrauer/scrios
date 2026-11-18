@@ -112,12 +112,13 @@ unit sent) and when the clock rate is corrected.
     nearer of 24 and 90 kHz was taken; checked once, from two sender reports at least a second apart), or
     `default` (24 kHz assumed).
   - `ssrc` is ours (the one the offer declares and every RTCP packet carries), `device_ssrc` the device's.
-- `{"event":"stats","packets":..,"access_units":..,"bytes":..,"lost":..,"dropped_units":..,"keyframes":..,"plis":..,"rtcp":..,"b_slices":..}`
+- `{"event":"stats","packets":..,"access_units":..,"bytes":..,"lost":..,"dropped_units":..,"keyframes":..,"plis":..,"rtcp":..,"b_slices":..,"edge_downs":..}`
   every `--stats-interval-ms`, counts since start: RTP packets accepted; access units **written to stdout**; their
   payload bytes; RTP packets declared lost (sequence gaps); access units not written (incomplete,
   withheld until a keyframe, or dropped because stdout could not keep up); KEY units written; keyframe
   requests (PLI + FIR) sent; RTCP datagrams sent (receiver reports, keyframe requests, and Device Hub
-  feedback when enabled); `b_slices` the H.264 B slices seen (always 0 for HEVC; see "The SPS gets a bitstream restriction").
+  feedback when enabled); `b_slices` the H.264 B slices seen (always 0 for HEVC; see "The SPS gets a bitstream restriction");
+  `edge_downs` the touch downs that landed on the very edge of the digitizer (see "The touch mapping").
 - `{"event":"hid","ready":true,"keyboard":true,"mapping":"auto",...}` or `{"event":"hid","ready":false,"message":"..."}` once, after `--hid` asked
   for the HID services (`ready` is true when touch works; `keyboard` is true once the virtual keyboard was created and `kb` commands can be used, false with
   the reason in `message` otherwise: touch and keys keep working; a `message` may also say that the buttons did not connect); later `{"event":"hid","ok":false,"message":"..."}` for a command that failed (nothing for a
@@ -176,6 +177,14 @@ Three steps: the upright picture position is turned back by the config's `rotati
 overrides are applied. The first step is `map_touch(x, y, upright_w, upright_h, rotation)`: for a landscape framebuffer turned
 90 degrees (a portrait picture) the upright top-left corner is the framebuffer's bottom-left, the upright top-right is its
 top-left, and so on.
+
+**The outermost pixels are the digitizer's limits.** A position along an axis of `size` pixels is `p / (size - 1)` of the way, so pixel 0 is
+exactly 0.0 and the last pixel, `size - 1`, exactly 1.0: HID 0 and 65535 on that axis once the rotation and the axes are applied (a position at or beyond
+the size is 1.0 too, one before the first pixel is 0.0). iPadOS's edge recognisers (the home bar's swipe up, the side swipes) want the first contact on the
+very edge; the earlier `p / size` put the last pixel row at 2387/2388, HID 65508, 27 units short. This is a slight rescale of every position: a touch moves by
+`p / (size * (size - 1))` of the axis, nothing at pixel 0, about half a pixel (14 units on the iPad's 2388-pixel axis) in the middle and one pixel (27 units)
+at the last pixel. A touch `down` whose mapped x or y is 0 or 65535 is logged at INFO (`edge touch down at HID (x, y) from upright pixel (px, py), edge: left|right|top|bottom`;
+a corner names both sides, such as `right+bottom`; the side is the picture's, whatever the mapping does to the axes) and counted in the `stats` event as `edge_downs`.
 
 The second step is the default, `--hid-space auto`. The model: the digitizer's axes are the **panel's native axes**, and the
 display stream's framebuffer is the display raster in `nativeSize`. So the framebuffer point is rotated clockwise by

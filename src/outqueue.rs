@@ -73,6 +73,8 @@ pub struct OutQueue {
     written_units: AtomicU64,
     written_bytes: AtomicU64,
     written_keyframes: AtomicU64,
+    /// Touch downs on the very edge of the digitizer (the HID side counts them here for the `stats` event).
+    edge_downs: AtomicU64,
 }
 
 impl Default for OutQueue {
@@ -95,6 +97,7 @@ impl OutQueue {
             written_units: AtomicU64::new(0),
             written_bytes: AtomicU64::new(0),
             written_keyframes: AtomicU64::new(0),
+            edge_downs: AtomicU64::new(0),
         }
     }
 
@@ -109,6 +112,16 @@ impl OutQueue {
         if frame.flags & crate::frame::FLAG_KEY != 0 {
             self.written_keyframes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Counts a touch down that landed on the very edge of the digitizer.
+    pub fn count_edge_down(&self) {
+        self.edge_downs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Touch downs on the very edge of the digitizer so far.
+    pub fn edge_downs(&self) -> u64 {
+        self.edge_downs.load(Ordering::Relaxed)
     }
 
     /// Access units, payload bytes and keyframes written so far.

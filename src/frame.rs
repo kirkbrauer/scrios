@@ -201,6 +201,9 @@ pub struct Stats {
     /// B slices seen in an H.264 stream. The SPS is rewritten to say there is no reordering, so a B slice is
     /// a surprise (pictures may then come out of order); nothing is done about it but to count it.
     pub b_slices: u64,
+    /// Touch downs whose position on the digitizer was at its limit on an axis (0 or 65535): the
+    /// swipes that start at the very edge of the screen.
+    pub edge_downs: u64,
 }
 
 /// Decodes one frame from the front of `buf` (tests and tools): the frame and the bytes used.
@@ -351,10 +354,11 @@ mod tests {
             plis: 7,
             rtcp: 8,
             b_slices: 9,
+            edge_downs: 10,
         });
         assert_eq!(
             String::from_utf8(Frame::control(&s).payload).unwrap(),
-            r#"{"event":"stats","packets":1,"access_units":2,"bytes":3,"lost":4,"dropped_units":5,"keyframes":6,"plis":7,"rtcp":8,"b_slices":9}"#
+            r#"{"event":"stats","packets":1,"access_units":2,"bytes":3,"lost":4,"dropped_units":5,"keyframes":6,"plis":7,"rtcp":8,"b_slices":9,"edge_downs":10}"#
         );
         let e = Event::Error {
             message: "boom \"x\"".into(),

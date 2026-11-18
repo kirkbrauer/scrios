@@ -678,7 +678,7 @@ mod tests {
         let done = Arc::new(Mutex::new(Vec::new()));
         let mut backend = FakeHid { done: done.clone(), stall: false };
         let mut hid = Hid::new(HidMapping::default(), r.queue.clone());
-        send_later(&r, 100, touch(TouchPhase::Down, 608.0, 1328.0)).await;
+        send_later(&r, 100, touch(TouchPhase::Down, 607.5, 1327.5)).await;
         send_later(&r, 150, Command::Key(Key::Home, Press::Short)).await;
         send_later(&r, 250, Command::Key(Key::VolumeUp, Press::Long)).await;
         send_later(&r, 200, touch(TouchPhase::Move, 1216.0, 0.0)).await;
@@ -786,7 +786,7 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         send_later(&r, 100, Command::Kb(Kb::Type("a".repeat(200)))).await;
         // A touch in the middle of the typing is performed when it arrives, not after the string.
-        send_later(&r, 130, touch(TouchPhase::Down, 608.0, 1328.0)).await;
+        send_later(&r, 130, touch(TouchPhase::Down, 607.5, 1327.5)).await;
         send_later(&r, 186, Command::Stop).await;
         let links = Links { display: None, hid: Some(HidLink { hid: &mut hid, backend: &mut backend }) };
         let exit = run_session(&sock, &mut r.engine, &mut r.rx, &r.gone, &TokioClock, links).await;

@@ -6,7 +6,8 @@
 //!
 //! Touch coordinates arrive in pixels of the *upright* picture, the one the viewer shows after the
 //! framebuffer has been turned by the `config` event's `rotation`. [`map_touch`] undoes that turn and
-//! normalizes to the digitizer's 0..=65535 space.
+//! normalizes to the digitizer's 0..=65535 space: pixel 0 of an axis is 0 and its last pixel (size - 1)
+//! is 65535, so that a touch on the picture's outermost row or column is on the digitizer's very edge.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
@@ -14,7 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::commands::{Kb, Key, MAX_TYPE_CHARS, Press, Touch, TouchPhase};
 use crate::frame::{Event, Frame, HidEvent};
@@ -152,13 +153,29 @@ pub struct Effective {
     pub axes: Axes,
 }
 
+/// The fraction (0.0..=1.0) of the way along an axis of `size` pixels that pixel position `p` is:
+/// `p / (size - 1)`, so pixel 0 is exactly 0.0 and the last pixel, `size - 1`, exactly 1.0 (the edge
+/// recognisers of iPadOS want the first contact at the very edge of the digitizer, which a row
+/// of pixels `size - 1` of `size` would stop short of by one pixel's worth, 27 units on a 2388-pixel
+/// axis). A position at or beyond the last pixel is 1.0, and one before the first is 0.0. This is a
+/// slight rescale of the earlier `p / size`: a touch moves by `p / (size * (size - 1))` of the axis,
+/// which is nothing at pixel 0, half a pixel mid-picture and one pixel at the far edge.
+/// A picture one pixel wide has no span: 0.0 for pixel 0 and before, 1.0 beyond.
+fn axis_fraction(p: f64, size: u32) -> f64 {
+    let span = f64::from(size.max(1) - 1);
+    if span == 0.0 {
+        return if p > 0.0 { 1.0 } else { 0.0 };
+    }
+    p.clamp(0.0, span) / span
+}
+
 /// The normalized position (0.0..=1.0 on both axes) of an upright picture position in the
 /// framebuffer's own axes. `rotation` is the clockwise angle (0, 90, 180, 270) the framebuffer is
-/// turned to be upright; `upright_w` x `upright_h` is the upright picture. Positions outside the
-/// picture are clamped to its edge; a rotation that is not a right angle counts as 0.
+/// turned to be upright; `upright_w` x `upright_h` is the upright picture. The first pixel of an
+/// axis is 0.0 and the last (size - 1) is 1.0; positions outside the picture are clamped to its edge;
+/// a rotation that is not a right angle counts as 0.
 pub fn panel_position(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: u16) -> (f64, f64) {
-    let (w, h) = (f64::from(upright_w.max(1)), f64::from(upright_h.max(1)));
-    let (ux, uy) = (x.clamp(0.0, w) / w, y.clamp(0.0, h) / h);
+    let (ux, uy) = (axis_fraction(x, upright_w), axis_fraction(y, upright_h));
     // Turning the framebuffer clockwise by r gives the upright picture; this is the inverse.
     match rotation % 360 {
         90 => (uy, 1.0 - ux),
@@ -170,6 +187,35 @@ pub fn panel_position(x: f64, y: f64, upright_w: u32, upright_h: u32, rotation: 
 
 fn to_axis(f: f64) -> u16 {
     (f * AXIS_MAX).round().clamp(0.0, AXIS_MAX) as u16
+}
+
+/// The sides of the upright picture that an upright position touches (its outermost column or
+/// row, or beyond), such as `left`, `bottom` or `right+bottom`; `None` for a position inside.
+fn picture_edges(px: f64, py: f64, upright_w: u32, upright_h: u32) -> Option<String> {
+    let mut sides = Vec::new();
+    if px <= 0.0 {
+        sides.push("left");
+    } else if px >= f64::from(upright_w.max(1) - 1) {
+        sides.push("right");
+    }
+    if py <= 0.0 {
+        sides.push("top");
+    } else if py >= f64::from(upright_h.max(1) - 1) {
+        sides.push("bottom");
+    }
+    (!sides.is_empty()).then(|| sides.join("+"))
+}
+
+/// The log line for a touch `down` that lands on the very edge of the digitizer (its mapped x or y
+/// is 0 or 65535), or `None` for a touch that does not. `px` and `py` are the upright picture
+/// position as it came; the edge named is the picture's own (a corner names both sides).
+pub fn edge_down_message(x: u16, y: u16, px: f64, py: f64, upright_w: u32, upright_h: u32) -> Option<String> {
+    let at_limit = |v: u16| v == 0 || f64::from(v) == AXIS_MAX;
+    if !at_limit(x) && !at_limit(y) {
+        return None;
+    }
+    let edge = picture_edges(px, py, upright_w, upright_h).unwrap_or_else(|| "?".into());
+    Some(format!("edge touch down at HID ({x}, {y}) from upright pixel ({px}, {py}), edge: {edge}"))
 }
 
 /// Maps an upright picture position (pixels) to the digitizer's normalized 0..=65535 space, in the
@@ -703,6 +749,10 @@ impl Hid {
                     return self.fail(now, "too many commands: touch down dropped");
                 }
                 self.pending_move = None;
+                if let Some(line) = edge_down_message(x, y, touch.x, touch.y, w, h) {
+                    self.queue.count_edge_down();
+                    info!("{line}");
+                }
                 self.send_touch(now, true, x, y);
             }
             TouchPhase::Move => {
@@ -835,15 +885,21 @@ mod tests {
     const FB_W: u32 = 2388;
     const FB_H: u32 = 1668;
 
-    /// All four corners and the centre of an upright picture, as (x, y) -> (digitizer x, digitizer y).
+    /// The pixel at fraction `f` of the way from the first to the last pixel of an axis of `size`.
+    fn along(f: f64, size: u32) -> f64 {
+        f * f64::from(size - 1)
+    }
+
+    /// All four corners (the first and the last pixel of each axis) and the centre of an upright
+    /// picture, as (x, y) -> (digitizer x, digitizer y).
     fn corners(w: u32, h: u32, rotation: u16) -> [(u16, u16); 5] {
-        let (w, h) = (f64::from(w), f64::from(h));
+        let (lx, ly) = (f64::from(w - 1), f64::from(h - 1));
         [
-            map_touch(0.0, 0.0, w as u32, h as u32, rotation),
-            map_touch(w, 0.0, w as u32, h as u32, rotation),
-            map_touch(0.0, h, w as u32, h as u32, rotation),
-            map_touch(w, h, w as u32, h as u32, rotation),
-            map_touch(w / 2.0, h / 2.0, w as u32, h as u32, rotation),
+            map_touch(0.0, 0.0, w, h, rotation),
+            map_touch(lx, 0.0, w, h, rotation),
+            map_touch(0.0, ly, w, h, rotation),
+            map_touch(lx, ly, w, h, rotation),
+            map_touch(lx / 2.0, ly / 2.0, w, h, rotation),
         ]
     }
 
@@ -894,15 +950,15 @@ mod tests {
     #[test]
     fn a_point_off_centre_follows_the_turn() {
         // A quarter of the way along the top of a 1000x2000 upright picture, framebuffer turned 90.
-        let (x, y) = map_touch(250.0, 0.0, 1000, 2000, 90);
+        let (x, y) = map_touch(250.0, 0.0, 1001, 2001, 90);
         assert_eq!((x, y), (0, to_axis(0.75)));
         // Halfway down the left edge, turned 270.
-        let (x, y) = map_touch(0.0, 1000.0, 1000, 2000, 270);
+        let (x, y) = map_touch(0.0, 1000.0, 1001, 2001, 270);
         assert_eq!((x, y), (to_axis(0.5), 0));
         // Turning the picture by r and mapping back by r is the identity for every angle.
         for r in [0u16, 90, 180, 270] {
             let (uw, uh) = if r % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
-            let (x, y) = (uw as f64 * 0.3, uh as f64 * 0.8);
+            let (x, y) = (along(0.3, uw), along(0.8, uh));
             let (fx, fy) = panel_position(x, y, uw, uh, r);
             // Forward: framebuffer position -> upright, by turning clockwise by r.
             let (ux, uy) = match r {
@@ -919,10 +975,17 @@ mod tests {
     fn positions_outside_the_picture_are_clamped_and_odd_input_is_safe() {
         assert_eq!(map_touch(-50.0, -1.0, 100, 200, 0), (0, 0));
         assert_eq!(map_touch(500.0, 900.0, 100, 200, 0), (65535, 65535));
+        // At the size itself (one past the last pixel) and at the last pixel: the far limit.
+        assert_eq!(map_touch(100.0, 200.0, 100, 200, 0), (65535, 65535));
+        assert_eq!(map_touch(99.0, 199.0, 100, 200, 0), (65535, 65535));
         // A rotation that is not a right angle counts as 0; a zero-sized picture does not divide by zero.
-        assert_eq!(map_touch(50.0, 100.0, 100, 200, 45), (32768, 32768));
+        assert_eq!(map_touch(50.0, 100.0, 101, 201, 45), (32768, 32768));
         assert_eq!(map_touch(5.0, 5.0, 0, 0, 0), (65535, 65535));
-        assert_eq!(map_touch(f64::NAN, 1.0, 10, 10, 0).1, to_axis(0.1));
+        assert_eq!(map_touch(0.0, 0.0, 0, 0, 0), (0, 0));
+        // A picture one pixel across has no span: its pixel is 0, anything beyond is the far limit.
+        assert_eq!(map_touch(0.0, 0.0, 1, 1, 0), (0, 0));
+        assert_eq!(map_touch(1.0, 0.5, 1, 1, 0), (65535, 65535));
+        assert_eq!(map_touch(f64::NAN, 1.0, 10, 10, 0).1, to_axis(1.0 / 9.0));
         assert_eq!(map_touch(1.0, 1.0, 10, 10, 360), map_touch(1.0, 1.0, 10, 10, 0));
     }
 
@@ -932,16 +995,16 @@ mod tests {
             space: HidSpace::Ui,
             ..HidMapping::default()
         };
-        assert_eq!(ui.map(250.0, 500.0, 1000, 2000, 90, None), (to_axis(0.25), to_axis(0.25)));
-        assert_eq!(ui.map(250.0, 500.0, 1000, 2000, 270, None), ui.map(250.0, 500.0, 1000, 2000, 0, None));
+        assert_eq!(ui.map(250.0, 500.0, 1001, 2001, 90, None), (to_axis(0.25), to_axis(0.25)));
+        assert_eq!(ui.map(250.0, 500.0, 1001, 2001, 270, None), ui.map(250.0, 500.0, 1001, 2001, 0, None));
         // Panel space is map_touch, whatever the native orientation.
         let panel = HidMapping { space: HidSpace::Panel, ..HidMapping::default() };
-        assert_eq!(panel.map(250.0, 500.0, 1000, 2000, 90, None), map_touch(250.0, 500.0, 1000, 2000, 90));
-        assert_eq!(panel.map(250.0, 500.0, 1000, 2000, 90, Some(270)), map_touch(250.0, 500.0, 1000, 2000, 90));
+        assert_eq!(panel.map(250.0, 500.0, 1001, 2001, 90, None), map_touch(250.0, 500.0, 1001, 2001, 90));
+        assert_eq!(panel.map(250.0, 500.0, 1001, 2001, 90, Some(270)), map_touch(250.0, 500.0, 1001, 2001, 90));
 
         // x = 0.25, y = 0.5 of the picture, upright (rotation 0).
         let base = |flip_x, flip_y, swap_xy| {
-            HidMapping { space: HidSpace::Panel, flip_x, flip_y, swap_xy }.map(250.0, 1000.0, 1000, 2000, 0, None)
+            HidMapping { space: HidSpace::Panel, flip_x, flip_y, swap_xy }.map(250.0, 1000.0, 1001, 2001, 0, None)
         };
         assert_eq!(base(false, false, false), (to_axis(0.25), to_axis(0.5)));
         assert_eq!(base(true, false, false), (to_axis(0.75), to_axis(0.5)));
@@ -955,10 +1018,10 @@ mod tests {
 
     const MAX: u16 = 65535;
 
-    /// The framebuffer-normalized point (fx, fy) as an upright position of a 1000x2000 picture at
-    /// rotation 0 (where the upright picture is the framebuffer), mapped with `native`.
+    /// The framebuffer-normalized point (fx, fy) as an upright position of a 1001x2001 picture (1000 and
+    /// 2000 pixels between the first and the last) at rotation 0 (where the upright picture is the framebuffer), mapped with `native`.
     fn auto(native: Option<u16>, fx: f64, fy: f64) -> (u16, u16) {
-        HidMapping::default().map(fx * 1000.0, fy * 2000.0, 1000, 2000, 0, native)
+        HidMapping::default().map(fx * 1000.0, fy * 2000.0, 1001, 2001, 0, native)
     }
 
     #[test]
@@ -982,7 +1045,7 @@ mod tests {
         assert_eq!(at(0.25, 0.5), (to_axis(0.5), to_axis(0.25)));
         // That is "swap, then flip the first coordinate": what landed on the device as flags.
         let flags = HidMapping { space: HidSpace::Panel, swap_xy: true, flip_x: true, flip_y: false };
-        assert_eq!(at(0.25, 0.2), flags.map(250.0, 400.0, 1000, 2000, 0, Some(270)));
+        assert_eq!(at(0.25, 0.2), flags.map(250.0, 400.0, 1001, 2001, 0, Some(270)));
     }
 
     #[test]
@@ -1009,10 +1072,10 @@ mod tests {
     #[test]
     fn the_ipad_case_native_270_with_the_framebuffer_upright_or_turned() {
         let m = HidMapping::default();
-        // Rotation 0: the picture is the framebuffer, 2388x1668. Upright (597, 834) is (0.25, 0.5);
+        // Rotation 0: the picture is the framebuffer, 2388x1668. Upright (0.25, 0.5) of the way is pixel (596.75, 833.5);
         // the digitizer point is (1 - 0.5, 0.25).
         assert_eq!(
-            m.map(597.0, 834.0, 2388, 1668, 0, Some(270)),
+            m.map(along(0.25, 2388), along(0.5, 1668), 2388, 1668, 0, Some(270)),
             (to_axis(0.5), to_axis(0.25))
         );
         // The same as the flags that landed on the device.
@@ -1020,19 +1083,19 @@ mod tests {
         for (x, y) in [(0.0, 0.0), (597.0, 834.0), (2388.0, 1668.0), (1000.0, 100.0), (5.0, 1600.0)] {
             assert_eq!(m.map(x, y, 2388, 1668, 0, Some(270)), landed.map(x, y, 2388, 1668, 0, None), "({x}, {y})");
         }
-        // Rotation 90: the upright picture is portrait, 1668x2388. Upright (417, 1194) is (0.25, 0.5);
+        // Rotation 90: the upright picture is portrait, 1668x2388. Upright (0.25, 0.5) of the way is pixel (416.75, 1193.5);
         // undoing the rotation gives the framebuffer point (fx, fy) = (0.5, 0.75); the digitizer point
         // is (1 - 0.75, 0.5).
         assert_eq!(
-            m.map(417.0, 1194.0, 1668, 2388, 90, Some(270)),
+            m.map(along(0.25, 1668), along(0.5, 2388), 1668, 2388, 90, Some(270)),
             (to_axis(0.25), to_axis(0.5))
         );
         // Corners of the portrait picture: upright top-left is the framebuffer's bottom-left (0, 1),
         // which the digitizer sees as (1 - 1, 0) = (0, 0).
         assert_eq!(m.map(0.0, 0.0, 1668, 2388, 90, Some(270)), (0, 0));
-        assert_eq!(m.map(1668.0, 0.0, 1668, 2388, 90, Some(270)), (MAX, 0)); // fb (0,0) -> (1, 0)
-        assert_eq!(m.map(0.0, 2388.0, 1668, 2388, 90, Some(270)), (0, MAX)); // fb (1,1) -> (0, 1)
-        assert_eq!(m.map(1668.0, 2388.0, 1668, 2388, 90, Some(270)), (MAX, MAX)); // fb (1,0) -> (1, 1)
+        assert_eq!(m.map(1667.0, 0.0, 1668, 2388, 90, Some(270)), (MAX, 0)); // fb (0,0) -> (1, 0)
+        assert_eq!(m.map(0.0, 2387.0, 1668, 2388, 90, Some(270)), (0, MAX)); // fb (1,1) -> (0, 1)
+        assert_eq!(m.map(1667.0, 2387.0, 1668, 2388, 90, Some(270)), (MAX, MAX)); // fb (1,0) -> (1, 1)
     }
 
     #[test]
@@ -1041,8 +1104,8 @@ mod tests {
         let eff = m.effective(None);
         assert_eq!(eff.label, "identity (no display info)");
         assert_eq!(eff.axes, Axes::default());
-        assert_eq!(m.map(250.0, 500.0, 1000, 2000, 0, None), map_touch(250.0, 500.0, 1000, 2000, 0));
-        assert_eq!(m.map(250.0, 500.0, 1000, 2000, 90, None), map_touch(250.0, 500.0, 1000, 2000, 90));
+        assert_eq!(m.map(250.0, 500.0, 1001, 2001, 0, None), map_touch(250.0, 500.0, 1001, 2001, 0));
+        assert_eq!(m.map(250.0, 500.0, 1001, 2001, 90, None), map_touch(250.0, 500.0, 1001, 2001, 90));
         // A native orientation that is not a right angle is no information either.
         assert_eq!(m.effective(Some(45)).label, "identity (no display info)");
         // The overrides still apply in the fallback.
@@ -1050,7 +1113,7 @@ mod tests {
         let eff = flipped.effective(None);
         assert_eq!(eff.label, "identity (no display info)");
         assert_eq!(eff.axes, Axes { flip_x: true, ..Axes::default() });
-        assert_eq!(flipped.map(250.0, 500.0, 1000, 2000, 0, None), (to_axis(0.75), to_axis(0.25)));
+        assert_eq!(flipped.map(250.0, 500.0, 1001, 2001, 0, None), (to_axis(0.75), to_axis(0.25)));
     }
 
     #[test]
@@ -1067,13 +1130,13 @@ mod tests {
         let ui = HidMapping { space: HidSpace::Ui, ..auto };
         assert_eq!(ui.effective(Some(270)).label, "ui");
         // The ui space does not undo the rotation either.
-        assert_eq!(ui.map(250.0, 500.0, 1000, 2000, 90, Some(270)), (to_axis(0.25), to_axis(0.25)));
+        assert_eq!(ui.map(250.0, 500.0, 1001, 2001, 90, Some(270)), (to_axis(0.25), to_axis(0.25)));
     }
 
     #[test]
     fn the_overrides_apply_after_the_automatic_mapping() {
         // The iPad's point: fx = 0.25, fy = 0.2, native 270: automatic gives (0.8, 0.25).
-        let at = |m: HidMapping| m.map(250.0, 400.0, 1000, 2000, 0, Some(270));
+        let at = |m: HidMapping| m.map(250.0, 400.0, 1001, 2001, 0, Some(270));
         let with = |swap_xy, flip_x, flip_y| HidMapping { space: HidSpace::Auto, flip_x, flip_y, swap_xy };
         assert_eq!(at(with(false, false, false)), (to_axis(0.8), to_axis(0.25)));
         assert_eq!(at(with(false, true, false)), (to_axis(0.2), to_axis(0.25)));
@@ -1102,7 +1165,7 @@ mod tests {
                     let net = eff.axes.apply((fx, fy));
                     assert!((stepwise.0 - net.0).abs() < 1e-12 && (stepwise.1 - net.1).abs() < 1e-12,
                         "native {native:?} overrides {bits:03b} at ({fx}, {fy})");
-                    let digitizer = m.map(fx * 1000.0, fy * 2000.0, 1000, 2000, 0, native);
+                    let digitizer = m.map(fx * 1000.0, fy * 2000.0, 1001, 2001, 0, native);
                     assert_eq!(digitizer, (to_axis(net.0), to_axis(net.1)));
                 }
             }
@@ -1115,8 +1178,8 @@ mod tests {
         // The ready event said "identity (no display info)".
         h.announce(HidMapping::default().effective(None));
         let ipad = |rotation| Some(View { width: 2388, height: 1668, rotation, native: Some(270) });
-        h.on_touch(t0, touch(TouchPhase::Down, 597.0, 834.0), ipad(0));
-        h.on_touch(ms(t0, 20), touch(TouchPhase::Up, 597.0, 834.0), ipad(0));
+        h.on_touch(t0, touch(TouchPhase::Down, 596.75, 833.5), ipad(0));
+        h.on_touch(ms(t0, 20), touch(TouchPhase::Up, 596.75, 833.5), ipad(0));
         assert_eq!(
             h.take_actions(),
             vec![
@@ -1133,7 +1196,7 @@ mod tests {
         assert!(c[0].get("ready").is_none());
         // The picture turned (rotation 90): the same upright point is another digitizer point, and
         // the mapping did not change, so nothing is announced.
-        h.on_touch(ms(t0, 40), touch(TouchPhase::Down, 417.0, 1194.0), ipad(90));
+        h.on_touch(ms(t0, 40), touch(TouchPhase::Down, 416.75, 1193.5), ipad(90));
         assert_eq!(
             h.take_actions(),
             vec![Action::Touch { down: true, x: to_axis(0.25), y: to_axis(0.5) }]
@@ -1165,8 +1228,8 @@ mod tests {
     }
 
     const VIEW: Option<View> = Some(View {
-        width: 1000,
-        height: 2000,
+        width: 1001,
+        height: 2001,
         rotation: 0,
         native: None,
     });
@@ -1826,5 +1889,235 @@ mod tests {
             ready.payload,
             br#"{"event":"hid","ready":true,"message":"no buttons","mapping":"identity (no display info)","swap_xy":false,"flip_x":false,"flip_y":false}"#
         );
+    }
+
+    // ---- the very edge of the screen ---------------------------------------------------------
+
+    const MID: u16 = 32768;
+
+    /// The middle of the left, right, top and bottom edges, then the top-left, top-right, bottom-left
+    /// and bottom-right corners of an upright `w` x `h` picture, at its outermost columns and rows.
+    fn edge_points(w: u32, h: u32) -> [(f64, f64); 8] {
+        let (lx, ly) = (f64::from(w - 1), f64::from(h - 1));
+        [
+            (0.0, ly / 2.0),
+            (lx, ly / 2.0),
+            (lx / 2.0, 0.0),
+            (lx / 2.0, ly),
+            (0.0, 0.0),
+            (lx, 0.0),
+            (0.0, ly),
+            (lx, ly),
+        ]
+    }
+
+    fn mapped(m: &HidMapping, w: u32, h: u32, rotation: u16, native: Option<u16>) -> [(u16, u16); 8] {
+        edge_points(w, h).map(|(x, y)| m.map(x, y, w, h, rotation, native))
+    }
+
+    #[test]
+    fn the_outermost_pixels_are_the_digitizers_limits_at_every_rotation() {
+        let (m, mid) = (MAX, MID);
+        let panel = HidMapping { space: HidSpace::Panel, ..HidMapping::default() };
+        // (left, right, top, bottom, top-left, top-right, bottom-left, bottom-right) in the digitizer's
+        // axes, for the framebuffer turned clockwise by the rotation to be upright.
+        let expected: [(u16, [(u16, u16); 8]); 4] = [
+            (0, [(0, mid), (m, mid), (mid, 0), (mid, m), (0, 0), (m, 0), (0, m), (m, m)]),
+            (90, [(mid, m), (mid, 0), (0, mid), (m, mid), (0, m), (0, 0), (m, m), (m, 0)]),
+            (180, [(m, mid), (0, mid), (mid, m), (mid, 0), (m, m), (0, m), (m, 0), (0, 0)]),
+            (270, [(mid, 0), (mid, m), (m, mid), (0, mid), (m, 0), (m, m), (0, 0), (0, m)]),
+        ];
+        for (rotation, want) in expected {
+            // The iPad's framebuffer is 2388x1668; upright it is that, or turned a quarter, 1668x2388.
+            let (w, h) = if rotation % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
+            assert_eq!(mapped(&panel, w, h, rotation, None), want, "rotation {rotation}");
+            assert_eq!(
+                map_touch(0.0, 0.0, w, h, rotation),
+                want[4],
+                "map_touch and the panel space are the same thing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ipads_automatic_mapping_lands_exactly_on_the_limits_at_the_edges_and_corners() {
+        let (m, mid) = (MAX, MID);
+        let auto = HidMapping::default();
+        // Native 270 is swap + flip x. With the framebuffer upright (2388x1668) the point (fx, fy)
+        // becomes (1 - fy, fx); with it turned 90 (the picture portrait, 1668x2388) the two turns
+        // cancel and the digitizer's axes are the upright ones.
+        assert_eq!(
+            mapped(&auto, 2388, 1668, 0, Some(270)),
+            [(mid, 0), (mid, m), (m, mid), (0, mid), (m, 0), (m, m), (0, 0), (0, m)]
+        );
+        assert_eq!(
+            mapped(&auto, 1668, 2388, 90, Some(270)),
+            [(0, mid), (m, mid), (mid, 0), (mid, m), (0, 0), (m, 0), (0, m), (m, m)]
+        );
+        // Whatever the rotation: an edge is a limit on exactly one axis (the other is the middle), a
+        // corner is a limit on both.
+        for rotation in [0, 90, 180, 270] {
+            let (w, h) = if rotation % 180 == 90 { (FB_H, FB_W) } else { (FB_W, FB_H) };
+            let got = mapped(&auto, w, h, rotation, Some(270));
+            let limit = |v: u16| v == 0 || v == m;
+            for (i, (x, y)) in got.into_iter().enumerate() {
+                if i < 4 {
+                    assert!(limit(x) != limit(y) && (x == mid || y == mid), "edge {i} at rotation {rotation}: ({x}, {y})");
+                } else {
+                    assert!(limit(x) && limit(y), "corner {i} at rotation {rotation}: ({x}, {y})");
+                }
+            }
+        }
+        // The home bar: the bottom edge of the portrait picture is the digitizer's far limit on the axis
+        // that runs down the screen, whichever way the screen is held, so the same on the flags that landed.
+        let landed = HidMapping { space: HidSpace::Panel, swap_xy: true, flip_x: true, flip_y: false };
+        for x in [0.0, 100.0, 834.0, 1667.0] {
+            assert_eq!(auto.map(x, 2387.0, 1668, 2388, 90, Some(270)), (to_axis(x / 1667.0), m));
+            assert_eq!(auto.map(x, 2387.0, 1668, 2388, 90, Some(270)), landed.map(x, 2387.0, 1668, 2388, 90, None));
+        }
+    }
+
+    #[test]
+    fn the_last_pixel_row_reaches_the_limit_which_it_used_to_stop_short_of() {
+        // The page sends the last pixel row, 2387 of the iPad's 2388. It used to be 2387/2388 of the way:
+        // HID 65508, 27 units short of the limit.
+        assert_eq!(to_axis(2387.0 / 2388.0), 65508);
+        let auto = HidMapping::default();
+        assert_eq!(auto.map(600.0, 2387.0, 1668, 2388, 90, Some(270)).1, MAX);
+        assert_eq!(map_touch(600.0, 2387.0, 1668, 2388, 0).1, MAX);
+        assert_eq!(auto.map(1667.0, 1200.0, 1668, 2388, 90, Some(270)).0, MAX);
+        assert_eq!(auto.map(0.0, 1200.0, 1668, 2388, 90, Some(270)).0, 0);
+        // The row before it is still short of it, by one pixel's step.
+        let before = auto.map(600.0, 2386.0, 1668, 2388, 90, Some(270)).1;
+        assert!(before < MAX && MAX - before <= 28, "{before}");
+        // At the size itself, or beyond, it is the limit too.
+        assert_eq!(auto.map(600.0, 2388.0, 1668, 2388, 90, Some(270)).1, MAX);
+        assert_eq!(auto.map(600.0, 5000.0, 1668, 2388, 90, Some(270)).1, MAX);
+        // And the first row is 0.
+        assert_eq!(auto.map(600.0, 0.0, 1668, 2388, 90, Some(270)).1, 0);
+    }
+
+    #[test]
+    fn the_rescale_is_below_one_pixel_and_nothing_at_the_first_pixel() {
+        // p / (size - 1) instead of p / size: a touch moves by p / (size * (size - 1)) of the axis,
+        // nothing at pixel 0, half a pixel in the middle, one pixel at the last pixel.
+        for size in [100u32, 1668, 2388, 2656] {
+            let pixel = AXIS_MAX / f64::from(size); // one pixel of the picture, in digitizer units
+            let moved_at = |p: u32| {
+                let old = f64::from(p) / f64::from(size) * AXIS_MAX;
+                f64::from(map_touch(f64::from(p), 0.0, size, 10, 0).0) - old
+            };
+            for p in 0..size {
+                let moved = moved_at(p);
+                assert!(moved >= -0.5 && moved <= pixel + 0.5, "size {size}, pixel {p}: moved {moved}");
+            }
+            // It grows along the axis (give or take the rounding of the integer axis) to one pixel.
+            assert!((moved_at(size - 1) - pixel).abs() <= 0.5, "size {size}: {}", moved_at(size - 1));
+            assert!(moved_at(size / 4) < moved_at(size / 2) && moved_at(size / 2) < moved_at(size - 1));
+            assert_eq!(map_touch(0.0, 0.0, size, 10, 0).0, 0);
+            let mid = size / 2;
+            let moved = f64::from(map_touch(f64::from(mid), 0.0, size, 10, 0).0) - f64::from(mid) / f64::from(size) * AXIS_MAX;
+            assert!(moved > 0.0 && moved < pixel, "size {size}: mid-screen moved {moved} of one pixel ({pixel})");
+        }
+        // The iPad's long axis: mid-screen moves by about 14 units (half a pixel), the far end by 27.
+        let at = |p: f64| f64::from(map_touch(0.0, p, 1668, 2388, 0).1) - p / 2388.0 * AXIS_MAX;
+        assert!((at(1194.0) - 13.7).abs() < 0.6, "{}", at(1194.0));
+        assert!((at(2387.0) - 27.4).abs() < 0.6, "{}", at(2387.0));
+    }
+
+    #[test]
+    fn the_edge_down_message_names_the_edge_and_only_edges() {
+        let say = |x, y, px, py| edge_down_message(x, y, px, py, 1668, 2388);
+        assert_eq!(
+            say(30000, 65535, 800.0, 2387.0).as_deref(),
+            Some("edge touch down at HID (30000, 65535) from upright pixel (800, 2387), edge: bottom")
+        );
+        assert_eq!(
+            say(0, 30000, 0.0, 1000.5).as_deref(),
+            Some("edge touch down at HID (0, 30000) from upright pixel (0, 1000.5), edge: left")
+        );
+        assert!(say(30000, 0, 800.0, 0.0).unwrap().ends_with("edge: top"));
+        assert!(say(65535, 30000, 1667.0, 900.0).unwrap().ends_with("edge: right"));
+        // A corner names both sides.
+        assert!(say(65535, 65535, 1667.0, 2387.0).unwrap().ends_with("edge: right+bottom"));
+        assert!(say(0, 0, 0.0, 0.0).unwrap().ends_with("edge: left+top"));
+        // Inside, there is nothing to say; so one pixel in from the edge, unless the digitizer says so.
+        assert_eq!(say(30000, 30000, 800.0, 1000.0), None);
+        assert_eq!(say(1, 65534, 0.0, 2387.0), None);
+        // The condition is the digitizer's limit, the name the picture's edge: an override that mirrors
+        // the axis puts the picture's right edge at HID 0.
+        let flipped = HidMapping { flip_x: true, ..HidMapping::default() };
+        let (x, y) = flipped.map(1667.0, 1000.0, 1668, 2388, 0, None);
+        assert_eq!(x, 0);
+        assert!(edge_down_message(x, y, 1667.0, 1000.0, 1668, 2388).unwrap().ends_with("edge: right"));
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn every_touch_down_on_the_edge_is_logged_at_info_and_counted_and_nothing_else_is() {
+        let (mut h, q, t0) = rig();
+        let portrait = Some(View { width: 1668, height: 2388, rotation: 0, native: None });
+        let log = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt().with_writer(log.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // The home bar swipe: down on the very last row, up the screen, up.
+            h.on_touch(t0, touch(TouchPhase::Down, 800.0, 2387.0), portrait);
+            h.on_touch(ms(t0, 20), touch(TouchPhase::Move, 800.0, 2000.0), portrait);
+            h.on_touch(ms(t0, 40), touch(TouchPhase::Up, 800.0, 1500.0), portrait);
+            // A touch inside, one on the left edge, a move and a lift onto the edge, one in a corner.
+            h.on_touch(ms(t0, 60), touch(TouchPhase::Down, 800.0, 1000.0), portrait);
+            h.on_touch(ms(t0, 80), touch(TouchPhase::Move, 0.0, 1000.0), portrait);
+            h.on_touch(ms(t0, 100), touch(TouchPhase::Up, 0.0, 1000.0), portrait);
+            h.on_touch(ms(t0, 120), touch(TouchPhase::Down, 0.0, 1000.0), portrait);
+            h.on_touch(ms(t0, 140), touch(TouchPhase::Up, 5.0, 1000.0), portrait);
+            h.on_touch(ms(t0, 160), touch(TouchPhase::Down, 1667.0, 0.0), portrait);
+            // A finger that is not the first one is ignored, edge or not.
+            h.on_touch(ms(t0, 180), Touch { phase: TouchPhase::Down, x: 0.0, y: 0.0, id: 1 }, portrait);
+        });
+        assert_eq!(q.edge_downs(), 3);
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("edge touch down")).collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines.iter().all(|l| l.contains(" INFO ")), "{text}");
+        let hid_at = |x, y| map_touch(x, y, 1668, 2388, 0);
+        let (x0, y0) = hid_at(800.0, 2387.0);
+        assert_eq!(y0, MAX);
+        assert!(
+            lines[0].ends_with(&format!("edge touch down at HID ({x0}, {y0}) from upright pixel (800, 2387), edge: bottom")),
+            "{text}"
+        );
+        let (x1, y1) = hid_at(0.0, 1000.0);
+        assert_eq!(x1, 0);
+        assert!(
+            lines[1].ends_with(&format!("edge touch down at HID ({x1}, {y1}) from upright pixel (0, 1000), edge: left")),
+            "{text}"
+        );
+        assert!(
+            lines[2].ends_with("edge touch down at HID (65535, 0) from upright pixel (1667, 0), edge: right+top"),
+            "{text}"
+        );
+        // The stats event of the engine carries the count (the queue is where the two meet).
+        let cfg = crate::engine::EngineConfig::new(0x1234_5678);
+        let e = crate::engine::Engine::new(cfg, q.clone(), Instant::now());
+        assert_eq!(e.stats().edge_downs, 3);
     }
 }
