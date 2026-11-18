@@ -177,18 +177,38 @@ impl Device {
         .await
     }
 
-    /// Whether Developer Mode is on (the image mounter's `QueryDeveloperModeStatus`).
+    /// Whether Developer Mode is on: the image mounter's `QueryDeveloperModeStatus`, and if the device does not answer
+    /// that, AMFI's own status query.
     ///
     /// # Errors
     ///
     /// Why the device could not be asked.
     pub async fn developer_mode(&self) -> Result<bool, DevError> {
         limited("reading Developer Mode", QUERY_TIMEOUT, async {
-            let mut mounter = self.mounter().await?;
-            mounter
-                .query_developer_mode_status()
-                .await
-                .map_err(|e| DevError::from_idevice("cannot read the Developer Mode status", &e))
+            let from_mounter = async {
+                let mut mounter = self.mounter().await?;
+                mounter
+                    .query_developer_mode_status()
+                    .await
+                    .map_err(|e| DevError::from_idevice("cannot read the Developer Mode status", &e))
+            }
+            .await;
+            match from_mounter {
+                Err(first @ DevError::Failed(_)) => {
+                    // Another way to the same answer, before giving up.
+                    let from_amfi = async {
+                        let mut amfi = AmfiClient::connect(&self.provider)
+                            .await
+                            .map_err(|e| DevError::from_idevice("cannot connect to the device's AMFI service", &e))?;
+                        amfi.get_developer_mode_status()
+                            .await
+                            .map_err(|e| DevError::from_idevice("cannot read the Developer Mode status", &e))
+                    }
+                    .await;
+                    from_amfi.map_err(|_| first)
+                }
+                other => other,
+            }
         })
         .await
     }
