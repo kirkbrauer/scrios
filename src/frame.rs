@@ -77,11 +77,19 @@ impl Frame {
 
     /// Writes header and payload with one `write_all` each (the caller buffers and flushes).
     /// A payload over [`MAX_PAYLOAD`] is an error and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// The writer's error, or `InvalidInput` for a payload over [`MAX_PAYLOAD`].
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         write_frame(w, self.pts_us, self.flags, &self.payload)
     }
 
     /// The whole frame as one buffer.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Frame::write_to`].
     #[cfg(test)]
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut v = Vec::with_capacity(HEADER_LEN + self.payload.len());
@@ -116,6 +124,10 @@ fn header(len: usize, pts_us: u64, flags: u8) -> [u8; HEADER_LEN] {
 /// Writes one frame from its parts (what [`Frame::write_to`] does, for a payload that is not owned by a `Frame`):
 /// the header and the payload with one `write_all` each. A payload over [`MAX_PAYLOAD`] is an error and nothing
 /// is written.
+///
+/// # Errors
+///
+/// The writer's error, or `InvalidInput` for a payload over [`MAX_PAYLOAD`].
 pub fn write_frame<W: Write>(w: &mut W, pts_us: u64, flags: u8, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_PAYLOAD {
         return Err(io::Error::new(
@@ -144,7 +156,7 @@ struct Versioned<'a> {
 pub enum Event {
     /// Sent once before the first access unit, and again whenever the SPS changes.
     Config {
-        /// RFC 6381 / WebCodecs codec string built from the SPS, e.g. `hev1.1.6.L150.B0`.
+        /// RFC 6381 / `WebCodecs` codec string built from the SPS, e.g. `hev1.1.6.L150.B0`.
         codec: String,
         /// Visible size of the screen.
         width: u32,
@@ -244,22 +256,30 @@ pub struct Stats {
 }
 
 /// Decodes one frame from the front of `buf` (tests and tools): the frame and the bytes used.
+///
+/// # Errors
+///
+/// A message if `buf` is shorter than a header or than the frame it declares, or the frame is over [`MAX_PAYLOAD`].
 #[cfg(test)]
 pub fn decode(buf: &[u8]) -> Result<(Frame, usize), String> {
     if buf.len() < HEADER_LEN {
         return Err("short header".into());
     }
-    let len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if len > MAX_PAYLOAD {
         return Err("too long".into());
     }
-    let pts_us = u64::from_be_bytes(buf[4..12].try_into().unwrap());
+    let pts_us = u64::from_be_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
     let flags = buf[12];
     let payload = buf.get(HEADER_LEN..HEADER_LEN + len).ok_or("short payload")?.to_vec();
     Ok((Frame { pts_us, flags, payload }, HEADER_LEN + len))
 }
 
 /// Splits a byte stream into frames (tests).
+///
+/// # Errors
+///
+/// The first message of [`decode`]: what is left of `buf` is not a whole frame.
 #[cfg(test)]
 pub fn decode_all(mut buf: &[u8]) -> Result<Vec<Frame>, String> {
     let mut out = Vec::new();

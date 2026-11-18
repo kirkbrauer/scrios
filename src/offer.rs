@@ -102,6 +102,12 @@ fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     out.push(last);
 }
 
+/// Reads a protobuf message into its fields, in order.
+///
+/// # Errors
+///
+/// A message if a varint is cut short or runs over 64 bits, a field number does not fit 32 bits, a fixed-width or
+/// length-delimited field runs past the end, or a field has a wire type this does not read.
 pub fn parse(buf: &[u8]) -> Result<Vec<Field>, String> {
     let mut fields = Vec::new();
     let mut pos = 0;
@@ -185,6 +191,11 @@ fn deflate(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Edits the raw (uncompressed) media blob.
+///
+/// # Errors
+///
+/// A message if the blob or its video settings are not well-formed protobuf, the blob has no video settings (field
+/// 5), or, for H.264, the offer has no HEVC bank to take out or no H.264 bank to keep.
 pub fn patch_blob(raw: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
     let mut top = parse(raw)?;
     let video = top
@@ -265,6 +276,11 @@ fn remove_ltr_feature(bank: &mut Field) -> Result<bool, String> {
 }
 
 /// Rewrites the stock offer (a binary plist) with `flags`.
+///
+/// # Errors
+///
+/// A message if `stock` is not a plist dictionary with the media blob, or the blob cannot be inflated, edited
+/// ([`patch_blob`]), deflated or written back.
 pub fn patch_offer(stock: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
     let mut value: plist::Value = plist::from_bytes(stock).map_err(|e| format!("the offer is not a plist: {e}"))?;
     let dict = value.as_dictionary_mut().ok_or("the offer is not a dictionary")?;
@@ -277,6 +293,10 @@ pub fn patch_offer(stock: &[u8], flags: OfferFlags) -> Result<Vec<u8>, String> {
 }
 
 /// The video offer with our SSRC and `flags`.
+///
+/// # Errors
+///
+/// A message if the stock offer cannot be built, or cannot be patched (see [`patch_offer`]).
 pub fn build_video_offer(
     call_id: &str,
     call_info: &CallInfoBlob,

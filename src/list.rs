@@ -35,6 +35,11 @@ impl From<&UsbmuxdDevice> for Listed {
 }
 
 /// Asks usbmuxd (at `usbmuxd`, else `$USBMUXD_SOCKET_ADDRESS`, else the system's socket) for its devices.
+///
+/// # Errors
+///
+/// A message if the address is bad (see [`parse_usbmuxd_addr`]), usbmuxd cannot be
+/// connected to, or it does not answer in time.
 pub async fn list_devices(usbmuxd: Option<&str>) -> Result<Vec<Listed>, String> {
     let spec = usbmuxd.map(str::to_string).unwrap_or_else(default_usbmuxd_spec);
     let addr = parse_usbmuxd_addr(&spec)?;

@@ -1,4 +1,4 @@
-//! Everything that touches the phone: usbmuxd, the CoreDevice tunnel, the display service and the
+//! Everything that touches the phone: usbmuxd, the `CoreDevice` tunnel, the display service and the
 //! UDP sockets on the tunnel. The helpers that need no phone (address parsing, device choice, reading
 //! the device's answer) are plain functions with tests.
 
@@ -92,6 +92,11 @@ pub fn default_usbmuxd_spec() -> String {
 
 /// `/path/to/socket` (or a relative `./path`) is a unix socket; `host:port` is TCP; a bare word
 /// is taken as a socket path.
+///
+/// # Errors
+///
+/// A message for an empty address, a `host:port` whose port is not a number, and a host that does not resolve or has no
+/// address.
 pub fn parse_usbmuxd_addr(spec: &str) -> Result<UsbmuxdAddr, String> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -116,6 +121,11 @@ pub fn parse_usbmuxd_addr(spec: &str) -> Result<UsbmuxdAddr, String> {
 
 /// Picks the device: the one named by `udid`, else the only one. A device that usbmuxd lists both
 /// over USB and over the network is one device (USB wins).
+///
+/// # Errors
+///
+/// A message if no device is connected, none has that UDID (the message lists the ones usbmuxd knows), or several are
+/// connected and no UDID tells them apart.
 pub fn select_device<'a>(devices: &'a [UsbmuxdDevice], udid: Option<&str>) -> Result<&'a UsbmuxdDevice, String> {
     let candidates: Vec<&UsbmuxdDevice> = match udid {
         Some(u) => devices.iter().filter(|d| d.udid == u).collect(),
@@ -150,7 +160,7 @@ fn real_to_u64(r: f64) -> u64 {
     r as u64
 }
 
-/// A plist number, or a string of digits, or the `{"int": n}` wrapper CoreDevice uses.
+/// A plist number, or a string of digits, or the `{"int": n}` wrapper `CoreDevice` uses.
 fn value_u64(v: &plist::Value) -> Option<u64> {
     match v {
         plist::Value::Integer(_) => {
@@ -316,7 +326,7 @@ async fn timed<T, F: Future<Output = T>>(what: &str, limit: Duration, fut: F) ->
 
 // ---- display info ----------------------------------------------------------------------------
 
-/// The CoreDevice `deviceinfo` service: read-only queries about the device.
+/// The `CoreDevice` `deviceinfo` service: read-only queries about the device.
 #[derive(Debug)]
 pub struct DeviceInfoClient {
     inner: CoreDeviceServiceClient<Box<dyn ReadWrite>>,
@@ -334,6 +344,10 @@ impl RsdService for DeviceInfoClient {
 
 impl DeviceInfoClient {
     /// The device's displays (`getdisplayinfo`).
+    ///
+    /// # Errors
+    ///
+    /// A message if the request fails or the reply has no usable display (see [`parse_display_info`]).
     pub async fn get_display_info(&mut self) -> Result<Vec<DisplayInfo>, String> {
         let reply = Box::pin(self.inner.invoke_with_plist(GET_DISPLAY_INFO, plist::Dictionary::new()))
             .await
@@ -469,6 +483,12 @@ impl Session {
     /// usbmuxd and the pair record are only read: nothing is paired, mounted or written. The device
     /// gets an audio stream first (it needs one to establish the screen-sharing session), then the
     /// video stream on the same session, with an offer that declares our SSRC.
+    ///
+    /// # Errors
+    ///
+    /// A message that says which step failed or timed out: connecting to usbmuxd, picking the device, opening the tunnel,
+    /// the RSD handshake, connecting the display service, or starting the audio or video stream. Whatever was
+    /// started is stopped by [`Session::shutdown`], which the caller calls after a failure too.
     pub async fn start(&mut self, opts: &DeviceOptions) -> Result<(), String> {
         let spec = opts.usbmuxd.clone().unwrap_or_else(default_usbmuxd_spec);
         let addr = parse_usbmuxd_addr(&spec)?;

@@ -213,6 +213,11 @@ impl ProbeReport {
     }
 
     /// Did the device send H.264? `Ok` carries a one-line summary, `Err` the reason it did not.
+    ///
+    /// # Errors
+    ///
+    /// A message that says why the device did not send H.264: no RTP packets arrived in the window, it answered with
+    /// HEVC, or the packets have another payload type and no H.264 SPS or IDR slice was seen.
     pub fn verdict(&self) -> Result<String, String> {
         let total = self.total_rtp();
         let Some((&pt, &n)) = self.rtp_by_pt.iter().max_by_key(|(_, n)| **n).filter(|_| total > 0) else {
@@ -270,6 +275,10 @@ pub enum Outcome {
 }
 
 /// Writes one datagram to the raw dump: its length as 4 bytes big-endian, then the bytes.
+///
+/// # Errors
+///
+/// The writer's error, or `InvalidInput` for a datagram too long for a 32-bit length.
 pub fn write_raw(out: &mut dyn Write, data: &[u8]) -> io::Result<()> {
     let len =
         u32::try_from(data.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "datagram too long"))?;

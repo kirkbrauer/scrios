@@ -263,6 +263,10 @@ impl OutQueue {
 
 /// The writer: pops frames and writes each with one flush, until the queue is closed and empty.
 /// Returns the first write error (the reader of stdout went away).
+///
+/// # Errors
+///
+/// The first write or flush error of `out`.
 pub fn run_writer<W: Write>(queue: &OutQueue, out: W) -> io::Result<()> {
     let mut out = io::BufWriter::with_capacity(256 * 1024, out);
     while let Some(frame) = queue.pop() {

@@ -1,5 +1,5 @@
-//! scrios: the screen of an iOS device as an H.264 or HEVC stream, with touch and keys, over Apple's CoreDevice
-//! display and HID services (through usbmuxd and the RemoteXPC tunnel, with the idevice crate).
+//! scrios: the screen of an iOS device as an H.264 or HEVC stream, with touch and keys, over Apple's `CoreDevice`
+//! display and HID services (through usbmuxd and the `RemoteXPC` tunnel, with the idevice crate).
 //!
 //! # Using it
 //!

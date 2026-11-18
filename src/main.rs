@@ -138,8 +138,11 @@ enum Cmd {
 
 #[derive(Args, Debug)]
 struct ListArgs {
-    /// usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)
-    #[arg(long, value_name = "PATH|HOST:PORT")]
+    #[arg(
+        long,
+        value_name = "PATH|HOST:PORT",
+        help = "usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)"
+    )]
     usbmuxd: Option<String>,
 }
 
@@ -167,8 +170,11 @@ struct StreamArgs {
     #[arg(short = 's', long, value_name = "UDID")]
     udid: Option<String>,
 
-    /// usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)
-    #[arg(long, value_name = "PATH|HOST:PORT")]
+    #[arg(
+        long,
+        value_name = "PATH|HOST:PORT",
+        help = "usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)"
+    )]
     usbmuxd: Option<String>,
 
     /// The display to stream (1 is the built-in display)

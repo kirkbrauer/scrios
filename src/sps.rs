@@ -64,7 +64,7 @@ impl fmt::Display for SpsError {
 impl std::error::Error for SpsError {}
 
 impl SpsInfo {
-    /// The WebCodecs / RFC 6381 codec string (ISO/IEC 14496-15 annex E):
+    /// The `WebCodecs` / RFC 6381 codec string (ISO/IEC 14496-15 annex E):
     /// `<prefix>.<space><profile_idc>.<compat flags, bit order reversed, hex>.<L|H><level_idc>.<constraint bytes, hex>`
     /// with the trailing zero constraint bytes left out (the first is always written).
     #[must_use]
@@ -87,6 +87,10 @@ impl SpsInfo {
     /// The offsets are `ue(v)` values read from the stream, so they can be anything up to 2^32-1: the
     /// arithmetic is done in 64 bits, and a window that leaves no picture (a crop of the whole coded
     /// size or more) is an error rather than a zero or wrapped size.
+    ///
+    /// # Errors
+    ///
+    /// [`SpsError::Invalid`] if the window leaves no picture.
     pub fn cropped_size(&self) -> Result<(u32, u32), SpsError> {
         let (sub_w, sub_h) = match self.chroma_format_idc {
             1 => (2u64, 2u64),
@@ -237,7 +241,7 @@ impl BitWriter {
         self.ue(u32::try_from(code).unwrap_or(u32::MAX));
     }
 
-    /// rbsp_trailing_bits: a one, then zeros to the byte boundary.
+    /// `rbsp_trailing_bits`: a one, then zeros to the byte boundary.
     pub fn finish(mut self) -> Vec<u8> {
         self.bit(1);
         while !self.nbits.is_multiple_of(8) {
@@ -264,6 +268,13 @@ pub fn escape_rbsp(rbsp: &[u8]) -> Vec<u8> {
 }
 
 /// Parses an SPS NAL unit (including its two-byte NAL unit header, without a start code).
+///
+/// # Errors
+///
+/// [`SpsError::NotSps`] if `nal` is not an HEVC SPS NAL unit of the base layer (under 3 bytes, the forbidden bit set,
+/// another type or a layer id other than 0); [`SpsError::Truncated`] if the bits run out; [`SpsError::Invalid`] for a
+/// `chroma_format_idc` over 3, an `ue(v)` of more than 32 bits, a picture side outside 1 to 32768, or a conformance
+/// window that leaves no picture.
 pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, SpsError> {
     let [b0, b1, payload @ ..] = nal else {
         return Err(SpsError::NotSps);

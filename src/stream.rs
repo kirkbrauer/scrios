@@ -1,6 +1,6 @@
 //! The stream, as a library: start it, read what it yields, send it input.
 //!
-//! [`Stream::start`] begins a session in the background (usbmuxd, the CoreDevice tunnel, the display
+//! [`Stream::start`] begins a session in the background (usbmuxd, the `CoreDevice` tunnel, the display
 //! stream and, unless [`StreamOptions::control`] is off, the touch and key services) and returns at
 //! once. From then on:
 //!
@@ -155,6 +155,10 @@ pub struct Probe {
 
 impl StreamOptions {
     /// Options that do not go together.
+    ///
+    /// # Errors
+    ///
+    /// A message if the options do not go together: a probe asks for the H.264 offer.
     pub fn check(&self) -> Result<(), String> {
         match (&self.probe, self.codec) {
             (Some(_), CodecKind::Hevc) => Err("the probe is for the H.264 offer: ask for H.264, not HEVC".into()),
@@ -259,6 +263,10 @@ impl Stream {
     /// Starts the stream in the background and returns at once; connecting, starting the display stream and
     /// connecting touch and keys happen behind it (a start that fails is an `error` event and an
     /// [`Outcome::StartFailed`]). Fails only if the thread cannot be spawned.
+    ///
+    /// # Errors
+    ///
+    /// The error of spawning the stream's thread.
     pub fn start(opts: StreamOptions) -> io::Result<Stream> {
         let queue = Arc::new(OutQueue::new());
         let gone = Arc::new(Notify::new());

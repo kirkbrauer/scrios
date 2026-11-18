@@ -40,6 +40,10 @@ impl<W: Write> Sink<W> {
     }
 
     /// Writes `item` and flushes. Nothing is written for an event in the raw format.
+    ///
+    /// # Errors
+    ///
+    /// The writer's error.
     pub fn write_item(&mut self, item: &Item) -> io::Result<()> {
         match (self.format, item) {
             (Format::Raw, Item::Unit(au)) => self.out.write_all(&au.data)?,
@@ -53,6 +57,10 @@ impl<W: Write> Sink<W> {
     }
 
     /// Flushes what is buffered (each item is flushed as it is written; this is for the end).
+    ///
+    /// # Errors
+    ///
+    /// The writer's error.
     pub fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }

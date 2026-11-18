@@ -101,7 +101,7 @@ pub struct AvcSps {
 }
 
 impl AvcSps {
-    /// The RFC 6381 codec string: `avc1.` and profile_idc, the constraint byte and level_idc in hex.
+    /// The RFC 6381 codec string: `avc1.` and `profile_idc`, the constraint byte and `level_idc` in hex.
     #[must_use]
     pub fn codec_string(&self) -> String {
         format!("avc1.{:02X}{:02X}{:02X}", self.profile_idc, self.constraint_flags, self.level_idc)
@@ -143,6 +143,12 @@ const MAX_PICTURE_SIDE: u64 = 32768;
 
 /// Parses an H.264 SPS NAL unit (with its one-byte header, without a start code): profile, level,
 /// and the picture size with the cropping applied (ITU-T H.264 7.3.2.1.1).
+///
+/// # Errors
+///
+/// [`SpsError::NotSps`] if `nal` is not an H.264 SPS NAL unit (under 5 bytes, the forbidden bit set, or another type);
+/// [`SpsError::Truncated`] if the bits run out; [`SpsError::Invalid`] for a `chroma_format_idc` over 3, an `ue(v)` of
+/// more than 32 bits, or a coded or cropped picture that is empty or over 32768 pixels on a side.
 pub fn parse_avc_sps(nal: &[u8]) -> Result<AvcSps, SpsError> {
     let (_, payload) = split_sps_nal(nal)?;
     // Emulation prevention covers everything after the NAL header byte, the profile, constraint flags and level
@@ -494,6 +500,10 @@ fn walk_sps(nal: &[u8], write: bool) -> Result<(u32, Option<Restriction>, Option
 }
 
 /// The VUI `bitstream_restriction` of an SPS NAL unit, if it has one.
+///
+/// # Errors
+///
+/// As for [`add_bitstream_restriction`].
 #[cfg(test)]
 pub fn sps_restriction(nal: &[u8]) -> Result<Option<Restriction>, SpsError> {
     Ok(walk_sps(nal, false)?.1)
@@ -503,6 +513,11 @@ pub fn sps_restriction(nal: &[u8]) -> Result<Option<Restriction>, SpsError> {
 /// least 1) to an H.264 SPS NAL unit, copying every bit before it as it was. An SPS with no VUI gets one
 /// that holds only the restriction. An SPS that has a restriction already is not touched. The NAL header
 /// byte is kept, and the result has its emulation prevention bytes.
+///
+/// # Errors
+///
+/// [`SpsError::NotSps`], [`SpsError::Truncated`] or [`SpsError::Invalid`] if `nal` is not an H.264 SPS, ends early or
+/// holds a value that cannot be right (as for [`parse_avc_sps`]).
 pub fn add_bitstream_restriction(nal: &[u8]) -> Result<SpsRewrite, SpsError> {
     let (max_num_ref_frames, existing, writer) = walk_sps(nal, true)?;
     if let Some(r) = existing {
@@ -537,7 +552,7 @@ pub fn slice_type(nal: &[u8]) -> Option<u32> {
     (t <= 9).then_some(t)
 }
 
-/// A B slice (slice_type 1 or 6) of a non-IDR picture: an IDR picture has only I slices (H.264 7.4.3),
+/// A B slice (`slice_type` 1 or 6) of a non-IDR picture: an IDR picture has only I slices (H.264 7.4.3),
 /// so a slice of NAL type 5 is never counted, whatever its header says.
 #[must_use]
 pub fn is_b_slice(nal: &[u8]) -> bool {
@@ -562,6 +577,11 @@ pub struct AvcConfig {
 /// Parses an `AVCDecoderConfigurationRecord`: version 1, profile, compatibility, level, the length
 /// size, the SPS list and the PPS list (each entry a 16-bit length and the NAL unit). Anything after the
 /// PPS list (the extension of the high profiles) is left alone.
+///
+/// # Errors
+///
+/// A message that says what is wrong: the record is under 7 bytes or is not version 1, a list is cut short, or an
+/// entry is not an SPS (or PPS) NAL unit.
 pub fn parse_avcc(rec: &[u8]) -> Result<AvcConfig, String> {
     let [version, profile_indication, profile_compatibility, level_indication, length, num_sps, _, ..] = rec else {
         return Err("avcC record too short".into());
@@ -645,6 +665,11 @@ const VISUAL_SAMPLE_ENTRY_FIELDS: usize = 78;
 
 /// Reads an `avc1` box (as the content of its header: the visual sample entry fields, then child boxes)
 /// and returns the `avcC` record it holds.
+///
+/// # Errors
+///
+/// A message if the box is shorter than a visual sample entry, has no `avcC` child, or that child is not a record
+/// (see [`parse_avcc`]).
 pub fn parse_avc1_content(content: &[u8]) -> Result<AvcConfig, String> {
     let children = content.get(VISUAL_SAMPLE_ENTRY_FIELDS..).ok_or("avc1 box is shorter than a visual sample entry")?;
     let avcc = boxes(children).into_iter().find(|b| &b.kind == b"avcC").ok_or("avc1 box has no avcC child")?;
@@ -731,6 +756,10 @@ fn find_avc_boxes(payload: &[u8]) -> Option<AvcConfig> {
 
 #[cfg(test)]
 pub mod testutil {
+    #![expect(
+        clippy::missing_panics_doc,
+        reason = "test builders: a failed unwrap or assert is a failed test, and nobody reads these docs"
+    )]
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -849,8 +878,8 @@ pub mod testutil {
         pub bit_rate_scale: u32,
         pub cpb_size_scale: u32,
         pub entries: Vec<(u32, u32, bool)>,
-        /// initial_cpb_removal_delay_length_minus1, cpb_removal_delay_length_minus1,
-        /// dpb_output_delay_length_minus1, time_offset_length
+        /// `initial_cpb_removal_delay_length_minus1`, `cpb_removal_delay_length_minus1`,
+        /// `dpb_output_delay_length_minus1`, `time_offset_length`
         pub lengths: [u32; 4],
     }
 
@@ -858,13 +887,13 @@ pub mod testutil {
     #[allow(clippy::type_complexity)]
     #[derive(Debug, Clone, Default)]
     pub struct VuiSpec {
-        /// aspect_ratio_idc, and the SAR for 255.
+        /// `aspect_ratio_idc`, and the SAR for 255.
         pub aspect: Option<(u8, Option<(u16, u16)>)>,
         pub overscan: Option<bool>,
-        /// video_format, full range, and the three colour description bytes.
+        /// `video_format`, full range, and the three colour description bytes.
         pub video_signal: Option<(u32, bool, Option<(u8, u8, u8)>)>,
         pub chroma_loc: Option<(u32, u32)>,
-        /// num_units_in_tick, time_scale, fixed_frame_rate_flag
+        /// `num_units_in_tick`, `time_scale`, `fixed_frame_rate_flag`
         pub timing: Option<(u32, u32, bool)>,
         pub nal_hrd: Option<HrdSpec>,
         pub vcl_hrd: Option<HrdSpec>,

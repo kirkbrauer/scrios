@@ -2067,7 +2067,7 @@ mod tests {
             assert_eq!((s.access_units, s.keyframes, s.dropped_units), (2, 1, 0));
         }
 
-        /// A non-IDR slice with the given slice_type in its header.
+        /// A non-IDR slice with the given `slice_type` in its header.
         fn typed_slice(slice_type: u32) -> Vec<u8> {
             let mut w = crate::sps::testutil::BitWriter::default();
             w.ue(0);

@@ -918,6 +918,10 @@ impl<F: NalFormat> Depacketizer for UnitAssembler<F> {
 /// RTP payload builders shared by the tests of this crate.
 #[cfg(test)]
 pub mod testutil {
+    #![expect(
+        clippy::missing_panics_doc,
+        reason = "test builders: a failed unwrap or assert is a failed test, and nobody reads these docs"
+    )]
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -930,14 +934,14 @@ pub mod testutil {
 
     pub const VPS: [u8; 6] = [0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
     pub const PPS: [u8; 5] = [0x44, 0x01, 0xC1, 0x72, 0xB4];
-    /// An IDR_W_RADL slice (type 19), TID 0.
+    /// An `IDR_W_RADL` slice (type 19), TID 0.
     #[must_use]
     pub fn idr(body: &[u8]) -> Vec<u8> {
         let mut v = vec![19 << 1, 0x01];
         v.extend_from_slice(body);
         v
     }
-    /// A TRAIL_R slice (type 1).
+    /// A `TRAIL_R` slice (type 1).
     #[must_use]
     pub fn trail(body: &[u8]) -> Vec<u8> {
         let mut v = vec![1 << 1, 0x01];
@@ -2051,7 +2055,7 @@ mod h264_tests {
         assert_eq!(H264::transform_nal(crate::avc::NAL_SPS, &reordering), None);
     }
 
-    /// A slice NAL unit of the given NAL header byte and slice_type.
+    /// A slice NAL unit of the given NAL header byte and `slice_type`.
     fn typed_slice(header: u8, slice_type: u32) -> Vec<u8> {
         let mut w = crate::sps::testutil::BitWriter::default();
         w.ue(0);

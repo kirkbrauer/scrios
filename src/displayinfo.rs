@@ -1,4 +1,4 @@
-//! The primary display's size and orientation, from the CoreDevice `deviceinfo` service.
+//! The primary display's size and orientation, from the `CoreDevice` `deviceinfo` service.
 //!
 //! The service answers the read-only feature `com.apple.coredevice.feature.getdisplayinfo` with a
 //! `displays` array; each display has `displayId`, `name`, `primary`, `external`, `nativeSize`
@@ -137,6 +137,10 @@ fn parse_display(d: &plist::Dictionary) -> Option<DisplayInfo> {
 
 /// Reads the `displays` array of a `getdisplayinfo` reply. Displays without a usable `nativeSize`
 /// are skipped; no usable display at all is an error.
+///
+/// # Errors
+///
+/// A message if the reply has no `displays` array, or none of its displays has a usable `nativeSize`.
 pub fn parse_display_info(reply: &plist::Value) -> Result<Vec<DisplayInfo>, String> {
     let displays = find(reply, "displays", 0).and_then(|v| v.as_array()).ok_or("the reply has no `displays` array")?;
     let parsed: Vec<DisplayInfo> = displays.iter().filter_map(|d| d.as_dictionary().and_then(parse_display)).collect();
