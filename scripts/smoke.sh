@@ -55,7 +55,7 @@ ev = json.loads(data[13:])
 assert ev['event'] == 'error' and sys.argv[2] in ev['message'], ev
 PY
 }
-refused "--codec h264" --probe-secs 3
+refused "--codec h264" --codec hevc --probe-secs 3
 refused "--probe-raw is for the probe" --probe-raw /tmp/never-written.raw
 refused "cannot write --probe-raw" --codec h264 --probe-secs 3 --probe-raw /nonexistent-dir/x.raw
 # And the probe itself fails like any start-up when there is no usbmuxd.

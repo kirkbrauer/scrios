@@ -58,14 +58,14 @@ const PANIC_CLEANUP: Duration = Duration::from_secs(8);
 /// The codec the offer asks for (see `--codec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CodecArg {
-    /// The stock offer, which names H.264 and HEVC; the device sends HEVC.
+    /// The stock offer, which names H.264 and HEVC; the device sends HEVC (needs hardware decoding in a browser).
     Hevc,
-    /// An offer that names only H.264 (experimental; with --probe-secs only a probe of what arrives).
+    /// An offer that names only H.264, which every browser decodes (with --probe-secs: a probe of what arrives).
     H264,
 }
 
 /// The codec when `--codec` is not given. One line to change; the README and the tests name it.
-const DEFAULT_CODEC: CodecArg = CodecArg::Hevc;
+const DEFAULT_CODEC: CodecArg = CodecArg::H264;
 
 /// The longest probe window accepted.
 const MAX_PROBE_SECS: u64 = 600;
@@ -174,12 +174,12 @@ struct Args {
     #[arg(long)]
     hid_swap_xy: bool,
 
-    /// The codec to ask for: hevc (the stock offer, byte for byte) or h264 (an offer that leaves the HEVC
-    /// bank out; experimental: the H.264 stream, or with --probe-secs only a probe of what arrives)
+    /// The codec to ask for: h264 (an offer that leaves the HEVC bank out; the default) or hevc (the stock
+    /// offer, byte for byte)
     #[arg(long, value_enum, value_name = "CODEC", default_value_t = DEFAULT_CODEC)]
     codec: CodecArg,
 
-    /// Probe: start the stream (with --codec h264), count for this many seconds what arrives (RTP packets
+    /// Probe: start the stream (needs --codec h264, the default), count for this many seconds what arrives (RTP packets
     /// per payload type, the first payload bytes, H.264 NAL types, the first SPS), log it, stop cleanly
     /// and exit (0 if it was H.264, 1 with an `error` event if not). No frames are written. 0 = off.
     #[arg(long, value_name = "SECS", default_value_t = 0)]
@@ -249,7 +249,7 @@ impl Args {
     /// Options that do not go together.
     fn check(&self) -> Result<(), String> {
         if self.probe_raw.is_some() && self.probe_secs == 0 {
-            return Err("--probe-raw is for the probe: add --codec h264 --probe-secs N".into());
+            return Err("--probe-raw is for the probe: add --probe-secs N".into());
         }
         match (self.codec, self.probe_secs > 0) {
             (CodecArg::Hevc, true) => Err("--probe-secs is for --codec h264".into()),
@@ -712,17 +712,20 @@ mod tests {
         assert_eq!(a.rtp_stall_timeout_ms, 15000);
         assert_eq!(a.visible_size, None);
         assert_eq!(a.max_bitrate, None);
-        // The offer is the stock one unless asked.
-        assert_eq!(a.offer_flags(), OfferFlags::default());
+        // The offer is the stock one, less the HEVC bank, unless asked otherwise.
+        assert_eq!(a.offer_flags(), OfferFlags { codec: Codec::H264, ..OfferFlags::default() });
+        // With --codec hevc it is the stock offer itself.
+        let hevc = Args::parse_from(["jumpstarter-ios-display", "--codec", "hevc"]);
+        assert_eq!(hevc.offer_flags(), OfferFlags::default());
         assert!(!a.device_hub_feedback);
         // HID is off, and its mapping is the automatic one.
         assert!(!a.hid);
         assert_eq!(a.hid_mapping(), HidMapping::default());
         assert_eq!(a.hid_mapping().space, HidSpace::Auto);
-        // The codec is the default one (HEVC for now: the stock offer) and no probe is asked for.
+        // The codec is the default one (H.264: an offer without the HEVC bank) and no probe is asked for.
         assert_eq!(a.codec, DEFAULT_CODEC);
-        assert_eq!(DEFAULT_CODEC, CodecArg::Hevc, "the documented default");
-        assert_eq!(a.offer_flags().codec, Codec::Hevc);
+        assert_eq!(DEFAULT_CODEC, CodecArg::H264, "the documented default");
+        assert_eq!(a.offer_flags().codec, Codec::H264);
         assert_eq!(a.probe_window(), None);
         assert_eq!(a.check(), Ok(()));
         assert_eq!(a.display_poll_ms, 1000);
@@ -730,11 +733,17 @@ mod tests {
 
     #[test]
     fn the_codec_options_go_together_or_not() {
-        // H.264 without a probe is the (experimental) H.264 stream.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264"]);
+        // H.264 is the default, with or without the flag, and without a probe it is the stream.
+        for args in [vec!["jumpstarter-ios-display"], vec!["jumpstarter-ios-display", "--codec", "h264"]] {
+            let a = Args::parse_from(args);
+            assert_eq!(a.check(), Ok(()));
+            assert_eq!(a.offer_flags().codec, Codec::H264);
+            assert_eq!(a.probe_window(), None);
+        }
+        // A probe needs no flag but the window: the default codec is H.264.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--probe-secs", "5"]);
         assert_eq!(a.check(), Ok(()));
-        assert_eq!(a.offer_flags().codec, Codec::H264);
-        assert_eq!(a.probe_window(), None);
+        assert_eq!(a.probe_window(), Some(Duration::from_secs(5)));
         let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "8"]);
         assert_eq!(a.offer_flags().codec, Codec::H264);
         assert_eq!(a.probe_window(), Some(Duration::from_secs(8)));
@@ -742,9 +751,13 @@ mod tests {
         // The window is capped.
         let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "999999"]);
         assert_eq!(a.probe_window(), Some(Duration::from_secs(MAX_PROBE_SECS)));
-        // A probe without H.264 is refused.
-        let a = Args::parse_from(["jumpstarter-ios-display", "--probe-secs", "5"]);
+        // A probe of HEVC is refused: the probe is for H.264.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "hevc", "--probe-secs", "5"]);
         assert!(a.check().unwrap_err().contains("--codec h264"));
+        // HEVC is the opt-in: the stock offer.
+        let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "hevc"]);
+        assert_eq!(a.check(), Ok(()));
+        assert_eq!(a.offer_flags().codec, Codec::Hevc);
         assert!(Args::try_parse_from(["jumpstarter-ios-display", "--codec", "vp9"]).is_err());
         // The raw dump belongs to the probe.
         let a = Args::parse_from(["jumpstarter-ios-display", "--codec", "h264", "--probe-secs", "8", "--probe-raw", "/tmp/x.raw"]);
@@ -793,7 +806,7 @@ mod tests {
             OfferFlags {
                 allow_rtcp_fb: true,
                 ltr: false,
-                ..OfferFlags::default()
+                codec: Codec::H264,
             }
         );
         assert!(a.device_hub_feedback);
@@ -816,8 +829,8 @@ mod tests {
         assert!(Args::try_parse_from(["jumpstarter-ios-display", "--hid-space", "sideways"]).is_err());
         // Each offer flag on its own.
         let a = Args::parse_from(["jumpstarter-ios-display", "--rtcp-fb"]);
-        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, ..OfferFlags::default() });
+        assert_eq!(a.offer_flags(), OfferFlags { allow_rtcp_fb: true, codec: Codec::H264, ..OfferFlags::default() });
         let a = Args::parse_from(["jumpstarter-ios-display", "--no-ltr"]);
-        assert_eq!(a.offer_flags(), OfferFlags { ltr: false, ..OfferFlags::default() });
+        assert_eq!(a.offer_flags(), OfferFlags { ltr: false, codec: Codec::H264, ..OfferFlags::default() });
     }
 }

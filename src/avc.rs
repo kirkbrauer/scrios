@@ -882,6 +882,48 @@ mod tests {
         assert!(find_avc_config(&packet).is_some());
     }
 
+    /// The configuration packet of a real iPad (iPad14,3, iOS 27.0.1): `92 e6 c0 a3` and a 134-byte `avc1`
+    /// box whose `avcC` child is 44 bytes (High profile, level 5.1, one SPS of 17 bytes and one PPS of 4).
+    pub fn ipad_config_packet() -> Vec<u8> {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        };
+        let mut avcc_content = hex("016400 33ffe1 0011".replace(' ', "").as_str());
+        avcc_content.extend(hex("27640033ac131450096034e9b810101010"));
+        avcc_content.extend(hex("01 0004".replace(' ', "").as_str()));
+        avcc_content.extend(hex("28ee3cb0"));
+        avcc_content.extend(hex("02000000"));
+        let avcc = make_box(b"avcC", &avcc_content);
+        assert_eq!(avcc.len(), 44);
+        // The avc1 box: 8 + 78 + 44 = 130, and 4 more bytes make the 134 of the capture.
+        let mut avc1 = avc1_box(2400, 1680, &[avcc, vec![0, 0, 0, 0]]);
+        assert_eq!(avc1.len(), 134);
+        assert_eq!(&avc1[..8], &[0, 0, 0, 0x86, b'a', b'v', b'c', b'1']);
+        let mut packet = vec![0x92, 0xE6, 0xC0, 0xA3];
+        packet.append(&mut avc1);
+        packet
+    }
+
+    #[test]
+    fn the_real_ipad_config_packet_is_read() {
+        let packet = ipad_config_packet();
+        assert_eq!(&packet[..12], &[0x92, 0xE6, 0xC0, 0xA3, 0, 0, 0, 0x86, b'a', b'v', b'c', b'1']);
+        let cfg = find_avc_config(&packet).unwrap();
+        assert_eq!((cfg.profile_indication, cfg.profile_compatibility, cfg.level_indication), (100, 0, 51));
+        assert_eq!(cfg.length_size, 4);
+        assert_eq!(cfg.sps.len(), 1);
+        assert_eq!(cfg.sps[0].len(), 17);
+        assert_eq!(cfg.pps, vec![vec![0x28, 0xEE, 0x3C, 0xB0]]);
+        // The SPS: High profile, level 5.1, the codec string the browser was given.
+        let sps = parse_avc_sps(&cfg.sps[0]).unwrap();
+        assert_eq!(sps.codec_string(), "avc1.640033");
+        assert_eq!((sps.profile_idc, sps.level_idc), (100, 51));
+        assert!(sps.frame_mbs_only);
+        assert_eq!(sps.chroma_format_idc, 1);
+        // The stream is the 2400x1680 "wireless" display of the measurements.
+        assert_eq!((sps.width, sps.height), (2400, 1680));
+    }
+
     #[test]
     fn a_config_that_is_not_an_avc1_box_is_still_read_when_it_is_a_record_or_annexb() {
         let sps = sps_nal();

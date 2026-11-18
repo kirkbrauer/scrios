@@ -1,11 +1,11 @@
 # jumpstarter-ios-display
 
-A small Linux/macOS binary that streams an iPhone's or iPad's screen as **HEVC** to its standard output, and
+A small Linux/macOS binary that streams an iPhone's or iPad's screen as **H.264** (or, with `--codec hevc`, HEVC) to its standard output, and
 (optionally) takes touch and hardware-key commands on its standard input.
 
 It connects to the device through `usbmuxd` (using the pair record usbmuxd already holds), opens the
 iOS 17+ CoreDevice tunnel, starts the display stream of `com.apple.coredevice.displayservice` (RTP/HEVC
-over UDP inside the tunnel), depacketizes it (RFC 7798: single NAL unit, aggregation, fragmentation)
+over UDP inside the tunnel), depacketizes it (RFC 6184 for H.264, RFC 7798 for HEVC: single NAL unit, aggregation, fragmentation)
 into **Annex-B access units**, and writes one length-framed record per picture to stdout. A driver
 reads the frames and fans them out to viewers; commands come back on stdin. With `--hid` the same process
 and the same tunnel also carry the touch and button services (one process against the device).
@@ -15,7 +15,7 @@ crate (pinned by commit in `Cargo.toml`). Everything else (depacketizer, SPS par
 rate limiting, framing, display info, touch mapping) lives in this crate.
 
 ```
-device --RTP/HEVC (UDP in the tunnel)--> jumpstarter-ios-display --stdout: frames--> driver
+device --RTP/H.264 (UDP in the tunnel)--> jumpstarter-ios-display --stdout: frames--> driver
                                                   ^---- stdin: keyframe / stop / touch / key ----+
 ```
 
@@ -41,8 +41,8 @@ jumpstarter-ios-display [OPTIONS]
   --hid                            accept touch and key commands (connects the HID services)
   --hid-space <auto|panel|ui>      where the digitizer's axes lie (default auto, see The touch mapping)
   --hid-flip-x / --hid-flip-y / --hid-swap-xy   mirror or exchange the axes on top of the chosen space
-  --codec <hevc|h264>              the codec to ask for (default hevc: the stock offer; h264: see H.264)
-  --probe-secs <SECS>              with --codec h264: count what arrives for this long, report, stop, exit (default off)
+  --codec <h264|hevc>              the codec to ask for (default h264; hevc is the opt-in: the stock offer; see H.264)
+  --probe-secs <SECS>              with the h264 codec (the default): count what arrives for this long, report, stop, exit (default off)
   --probe-raw <PATH>               with the probe: write every datagram received to this file (see Codec probe)
   --rtcp-fb                        offer allowRTCPFB = 1 (opt-in, see Offer)
   --no-ltr                         offer without long-term reference pictures (opt-in, see Offer)
@@ -91,13 +91,14 @@ unit sent) and when the clock rate is corrected.
 
 ### Control frames (`flags == 0x80`, payload `{"event": ...}`)
 
-- `{"event":"config","codec":"hev1.1.6.L150.B0","width":1206,"height":2622,"coded_width":1216,"coded_height":2656,"fps":60,"clock_hz":24000,"clock_source":"default","ssrc":123,"device_ssrc":456,"rotation":0,"point_scale":3.0,"current_orientation":"rot0","native_orientation":"rot0"}`
+- `{"event":"config","codec":"avc1.640033","width":1206,"height":2622,"coded_width":1216,"coded_height":2656,"fps":60,"clock_hz":24000,"clock_source":"default","ssrc":123,"device_ssrc":456,"rotation":0,"point_scale":3.0,"current_orientation":"rot0","native_orientation":"rot0"}`
   sent once **before the first access unit**, and again whenever something it says changes: the SPS (the
   display resized), the display's size or orientation (it turned: the SPS does not change then), the
   clock rate (corrected from the sender reports). An unchanged `config` is never repeated.
-  - `codec` is the WebCodecs/RFC 6381 string built from the SPS
-    (`hev1.<profile_space+profile_idc>.<reversed general_profile_compatibility_flags hex>.<L or H><level_idc>.<constraint bytes, B0...>`;
-    Main, level_idc 150 is `hev1.1.6.L150.B0`). `coded_*` is the SPS picture size.
+  - `codec` is the WebCodecs/RFC 6381 string built from the SPS: for H.264 (the default) `avc1.PPCCLL` (profile_idc, the constraint byte and
+    level_idc in hex; High, level 5.1 is `avc1.640033`); for HEVC
+    `hev1.<profile_space+profile_idc>.<reversed general_profile_compatibility_flags hex>.<L or H><level_idc>.<constraint bytes, B0...>`
+    (Main, level_idc 150 is `hev1.1.6.L150.B0`). `coded_*` is the SPS picture size.
   - `width`/`height` is the **framebuffer's visible size** (the encoder pads to the right and bottom). It comes
     from `--visible-size`, else from the device's own display info (the primary display's `nativeSize`),
     else from the SPS conformance window, else the SPS size.
@@ -215,19 +216,22 @@ HID events unless a display stream is open: the stream this process holds is tha
 
 ## Offer
 
-The offer is **idevice's stock screen-sharing offer** (the one the system's own client sends), with our SSRC in it.
-That offer, with a PLI sent behind receiver reports, was answered with an IDR in about 50 ms on a real iPad.
+With `--codec hevc` the offer is **idevice's stock screen-sharing offer** (the one the system's own client sends), with our SSRC in it; by default
+(`--codec h264`) it is that offer without the HEVC bank (see below). The stock offer, with a PLI sent behind receiver reports, was answered with an IDR in
+about 50 ms on a real iPad, and so was the H.264 one (57 to 80 ms).
 Two settings of its video settings message can be changed for comparison on a device, each by an opt-in flag:
 `--rtcp-fb` sets `allowRTCPFB` (field 2) to 1, `--no-ltr` sets `ltrpEnabled` (field 7) to 0 and removes `LTR;` from the
 HEVC feature string. Everything else in the blob is left byte for byte as the builder wrote it (a test decodes the offer
 and checks the fields, and that the default is identical to the builder's).
 
-## H.264 (experimental; `--codec hevc` stays the default)
+## H.264 (the default)
 
-**The default codec is `hevc`** (`--codec hevc`, the stock offer). It is a single constant (`DEFAULT_CODEC` in `src/main.rs`), named by the tests of the
-default and by this paragraph, to be flipped once H.264 has been run on a device.
+**The default codec is `h264`**; `--codec hevc` is the opt-in (the stock offer, HEVC, which a browser can only decode in hardware). The default is a single constant
+(`DEFAULT_CODEC` in `src/main.rs`), named by the tests of the default and by this paragraph. H.264 was run on a real iPad (iPad14,3, iOS 27.0.1): the configuration
+packet was read (1 SPS and 1 PPS, profile 100, level 51), the codec string was `avc1.640033`, every IDR carried SPS and PPS, a keyframe request was answered by an IDR in 57 to
+80 ms, and the stream decoded cleanly in ffmpeg and in Chrome.
 
-`--codec h264` sends the offer without the HEVC bank (see below) and runs the stream with an H.264 depacketizer (RFC 6184, packetization mode 1:
+`--codec h264` (the default) sends the offer without the HEVC bank (see below) and runs the stream with an H.264 depacketizer (RFC 6184, packetization mode 1:
 single NAL units, STAP-A, FU-A; the interleaved types are refused). It is the same machinery as for HEVC, with the same loss rules, the same
 keyframe handling and the same frames: `config.codec` is `avc1.PPCCLL` (profile_idc, the constraint byte and level_idc of the SPS, in hex), `width` and
 `height` are the cropped picture (the display's size if known) and `coded_width`/`coded_height` the macroblock-aligned size, KEY is an IDR slice,
@@ -236,24 +240,25 @@ PARAMS says that SPS and PPS are the first NAL units, and every KEY unit has the
 them. SEI and access unit delimiter NAL units are **kept** in the unit, in order; an access unit delimiter stays first, so in a key unit the sets follow it.
 Reserved and extension NAL types (14..=23 and above) are left out. A lost packet inside a fragmented NAL unit (FU-A) drops the unit and asks for a keyframe, as for HEVC.
 
-**Where the SPS and PPS come from is provisional.** The iPad's H.264 stream carries no in-band sets in the packets seen so far; its first packet is of a
-proprietary NAL type 18 (its first byte is `0x92`, which has the forbidden bit set) and looks like a 4-byte header followed by an MP4 `avc1` box. The
+**Where the SPS and PPS come from.** The iPad's H.264 stream carries no in-band sets; its first packet is of a
+proprietary NAL type 18 (its first byte is `0x92`, which has the forbidden bit set): a 4-byte header followed by an MP4 `avc1` box (134 bytes, with a 44-byte `avcC`
+child). The
 depacketizer reads such a packet as a configuration packet: it finds an `avc1` box (or a bare `avcC` box) in it, reads the `avcC` record
 (`AVCDecoderConfigurationRecord`: the SPS list and the PPS list) and caches the first SPS and PPS, which then go in front of every key unit. Sets that
 come in-band (a STAP-A or single NAL units) are used as well, and the latest of each wins. The shape of the
-packet is read off one probe, not specified, so the reading is lenient and degrades instead of failing: first an `avc1` box with an `avcC` child, then a bare `avcC`
+packet was read off one capture, not specified, so the reading is lenient and degrades instead of failing: first an `avc1` box with an `avcC` child, then a bare `avcC`
 box, then a bare `AVCDecoderConfigurationRecord` at one of the first nine offsets, then SPS and PPS NAL units in Annex-B form. If none of them fits, the packet is ignored, the
 sets are taken from the stream's own NAL units, and the log says so once (`--probe-raw` records the real packet). What is read is also said once, at INFO.
 
-## Codec probe (H.264 instead of HEVC?)
+## Codec probe (what does the device send for an H.264-only offer?)
 
 The stock offer names two codec banks in its screen media blob: H.264 (RTP payload type 123, features `FLS;SW:1;`) and HEVC
-(payload type 100); the device picks HEVC. `--codec h264` takes the HEVC bank out of the offer (the repeated bank whose payload type is
+(payload type 100); the device picks HEVC. The H.264 offer takes the HEVC bank out of the offer (the repeated bank whose payload type is
 100) and leaves everything else as the builder wrote it, so a device that can do H.264 has to answer with it (an iPad did: payload type 123).
-`--probe-secs N` (which needs `--codec h264`) turns the run into a measurement instead of a stream.
+`--probe-secs N` (which needs the h264 codec, the default) turns the run into a measurement instead of a stream.
 
 ```
-jumpstarter-ios-display --codec h264 --probe-secs 8 [--udid <UDID>] [--usbmuxd <PATH|HOST:PORT>]
+jumpstarter-ios-display --probe-secs 8 [--udid <UDID>] [--usbmuxd <PATH|HOST:PORT>]
 ```
 
 The probe does the normal start (and logs the device's answer, the server status, the negotiation blob's payloads and streams, and the
