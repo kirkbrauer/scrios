@@ -40,7 +40,6 @@ idevice = { version = "=0.1.68", default-features = false, features = [
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
-libc = "0.2"
 plist = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -53,6 +52,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Platform-only: nothing below is built for the other platform.
+[target.'cfg(unix)'.dependencies]
+# `dup` and `dup2`, to keep the stream's own copy of stdout (see `take_stdout` in main.rs).
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `SetStdHandle`, the Windows form of the same (see `take_stdout` in main.rs). Already in the tree through tokio, mio
+# and socket2, at this version: it adds no crate.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 
@@ -61,7 +70,8 @@ tokio = { version = "1", features = ["test-util"] }
 # indexing or unchecked arithmetic on what comes off the wire. Nothing is allowed here crate-wide: a lint that does
 # not fit one item is `#[expect(.., reason = "..")]` on that item.
 [lints.rust]
-# The one `unsafe` block, `dup`/`dup2` of stdout in main.rs, is allowed on its function, with its safety argument.
+# The one `unsafe` block per platform, in `take_stdout` in main.rs (`dup` and `dup2` on unix, `SetStdHandle` on
+# Windows), is allowed on its function, with its safety argument.
 unsafe_code = "deny"
 # The crate's types are public, so a consumer can print them in a log or an `assert_eq!`.
 missing_debug_implementations = "warn"

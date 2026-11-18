@@ -17,6 +17,15 @@ use scrios::stream::EXIT_START_FAILED;
 /// The exit status of `ddi-status` when the device is reachable and something is missing.
 const EXIT_MISSING: i32 = 1;
 
+/// The help of `--usbmuxd`: the forms of address this host takes, and its own default.
+pub const USBMUXD_HELP: &str = if cfg!(windows) {
+    "usbmuxd address: host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, else 127.0.0.1:27015, the Apple \
+Mobile Device Service)"
+} else {
+    "usbmuxd address: UNIX:/path (or a bare /path), host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, \
+else /var/run/usbmuxd)"
+};
+
 /// Which device to work with.
 #[derive(Args, Debug, Clone, Default)]
 pub struct TargetArgs {
@@ -27,7 +36,7 @@ pub struct TargetArgs {
     #[arg(
         long,
         value_name = "ADDR",
-        help = "usbmuxd address: UNIX:/path (or a bare /path), host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd, or 127.0.0.1:27015 on Windows)"
+        help = USBMUXD_HELP
     )]
     pub usbmuxd: Option<String>,
 }
@@ -405,7 +414,7 @@ pub fn run_developer_mode(args: &DeveloperModeArgs) -> i32 {
 pub enum PreflightEnd {
     /// The device is ready: the options of the stream to go to it.
     Ready(Box<scrios::preflight::ReadyDevice>),
-    /// The user gave up (Ctrl-C, SIGTERM) while it waited.
+    /// The user gave up (Ctrl-C, or SIGTERM on unix) while it waited.
     Interrupted,
     /// It could not be done (the message).
     Failed(String),
@@ -433,22 +442,12 @@ pub fn run_preflight(opts: &PreflightOptions) -> PreflightEnd {
     })
 }
 
-/// Completes when SIGINT or SIGTERM arrives (Ctrl-C elsewhere).
-#[cfg(unix)]
+/// Completes when a stop signal arrives (SIGINT or SIGTERM; Ctrl-C or Ctrl-Break on Windows).
 async fn interrupted() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
-        return std::future::pending().await;
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+    match crate::signals::StopSignals::install() {
+        Ok(mut signals) => signals.recv().await,
+        Err(_) => std::future::pending().await,
     }
-}
-
-#[cfg(not(unix))]
-async fn interrupted() {
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

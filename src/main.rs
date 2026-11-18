@@ -15,8 +15,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod device_cmds;
+mod signals;
 
-use device_cmds::{DdiArgs, DeveloperModeArgs, PreflightEnd, TargetArgs};
+use device_cmds::{DdiArgs, DeveloperModeArgs, PreflightEnd, TargetArgs, USBMUXD_HELP};
 use scrios::codec::CodecKind;
 use scrios::commands::{AtEof, Command, read_commands_at, supervised};
 use scrios::frame::Event;
@@ -87,7 +88,7 @@ enum SpaceArg {
 const AFTER_HELP: &str = "\
 Commands on stdin (one per line; with --format framed the end of input is `stop`):
   keyframe                     ask the device for a fresh keyframe
-  stop                         stop cleanly (SIGINT and SIGTERM do too; it can take about 8 seconds)
+  stop                         stop cleanly (so does {STOP_SIGNALS}; it can take about 8 seconds)
   touch down|move|up X Y ID    a finger, in pixels of the upright picture (finger 0 only)
   key NAME [short|long]        a hardware button: home, app-switcher (switcher), lock, power, sleep,
                                volume-up, volume-down, mute, siri
@@ -109,6 +110,11 @@ Examples:
   scrios --udid 00008110-001234567890401E --record screen.h264
   scrios --format framed --output - | my-program";
 
+/// The text after the options in `--help`: what also stops the stream is the host's own.
+fn after_help() -> String {
+    AFTER_HELP.replace("{STOP_SIGNALS}", signals::NAMES)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "scrios",
@@ -123,7 +129,7 @@ device through the commands on stdin (see below), unless --no-control. Logs go t
 Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows. \
 `scrios ddi-status`, `scrios mount-ddi` and `scrios unmount-ddi` manage the developer disk image that the display \
 service needs.",
-    after_long_help = AFTER_HELP,
+    after_long_help = after_help(),
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -141,7 +147,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Stream the device's screen (what `scrios` does without a subcommand)
-    #[command(after_long_help = AFTER_HELP)]
+    #[command(after_long_help = after_help())]
     Stream(StreamArgs),
     /// List the devices usbmuxd knows: UDID and how each is connected
     List(ListArgs),
@@ -174,7 +180,7 @@ struct ListArgs {
     #[arg(
         long,
         value_name = "ADDR",
-        help = "usbmuxd address: UNIX:/path (or a bare /path), host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd, or 127.0.0.1:27015 on Windows)"
+        help = USBMUXD_HELP
     )]
     usbmuxd: Option<String>,
 }
@@ -216,7 +222,7 @@ struct StreamArgs {
     #[arg(
         long,
         value_name = "ADDR",
-        help = "usbmuxd address: UNIX:/path (or a bare /path), host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd, or 127.0.0.1:27015 on Windows)"
+        help = USBMUXD_HELP
     )]
     usbmuxd: Option<String>,
 
@@ -338,7 +344,8 @@ struct AdvancedArgs {
     hid_swap_xy: bool,
 
     /// Do not read commands from stdin. Only with --format framed is the end of stdin a `stop`; otherwise a stream
-    /// started with stdin closed (`< /dev/null`, nohup, a background job) runs on until SIGINT or SIGTERM
+    /// started with stdin closed (`< /dev/null`, nohup, a background job) runs on until it is stopped (SIGINT or
+    /// SIGTERM; Ctrl-C on Windows)
     #[arg(long)]
     no_stdin: bool,
 
@@ -540,8 +547,8 @@ fn init_logging() {
         .init();
 }
 
-/// Takes stdout for the stream: the descriptor is duplicated and fd 1 is pointed at stderr,
-/// so a stray print anywhere in the process cannot corrupt the stream.
+/// Takes stdout for the stream: the process keeps a private copy of it for the frames and points its own standard
+/// output at stderr, so a stray print anywhere in the process cannot corrupt the stream.
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "dup, dup2 and a File from the descriptor dup returned: no safe API does this")]
 fn take_stdout() -> std::io::Result<File> {
@@ -564,9 +571,36 @@ fn take_stdout() -> std::io::Result<File> {
     }
 }
 
-#[cfg(not(unix))]
+/// The same on Windows: the stream gets a duplicate of the standard output handle, and the process's standard
+/// output handle is then set to its standard error handle. Rust's `print!` looks the handle up at every write, so
+/// it follows. A write through the C runtime's own stdout would not (nothing linked in prints), and a child
+/// process would inherit the new handle (none is run for the stream).
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "SetStdHandle has no safe wrapper in the standard library")]
 fn take_stdout() -> std::io::Result<File> {
-    Err(std::io::Error::other("only unix hosts are supported"))
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Console::{STD_OUTPUT_HANDLE, SetStdHandle};
+    // A process with no standard output has a null handle, which is nothing to write the stream to: the same
+    // refusal as `dup(1)` failing on unix.
+    let stdout = std::io::stdout();
+    if stdout.as_raw_handle().is_null() {
+        return Err(std::io::Error::other("the process has no standard output"));
+    }
+    // The private copy: the standard library's DuplicateHandle, which needs no `unsafe`.
+    let private = stdout.as_handle().try_clone_to_owned()?;
+    // The handle that standard error has now (null if it has none: then a stray print goes nowhere).
+    let stderr = std::io::stderr().as_raw_handle();
+    // SAFETY: `SetStdHandle` stores a handle value in the process's table of standard handles and takes no
+    // ownership of it: the value is standard error's own handle, which stays open, or null. Nothing else is touched.
+    if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, stderr) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(File::from(private))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn take_stdout() -> std::io::Result<File> {
+    Err(std::io::Error::other("only unix and Windows hosts are supported"))
 }
 
 /// One output of the stream: a name for the log and the writer.
@@ -605,18 +639,14 @@ fn consume(stream: &Stream, mut outputs: Vec<Output>) {
     }
 }
 
-/// SIGTERM and SIGINT are a `stop`.
+/// A signal (SIGTERM or SIGINT; on Windows Ctrl-C or Ctrl-Break) is a `stop`.
 async fn stop_on_signals(tx: mpsc::Sender<Command>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+    let Ok(mut signals) = signals::StopSignals::install() else {
         warn!("cannot install the signal handlers");
         return;
     };
     loop {
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
-        }
+        signals.recv().await;
         info!("signal received: stopping");
         if tx.send(Command::Stop).await.is_err() {
             return;
@@ -967,6 +997,20 @@ mod tests {
         assert_eq!(a.stream_options().probe.unwrap().raw_dump.as_deref(), Some(Path::new("/tmp/x.raw")));
         let a = stream_args(&["--probe-raw", "/tmp/x.raw"]);
         assert!(a.check().unwrap_err().contains("--probe-raw is for the probe"));
+    }
+
+    #[test]
+    fn the_help_names_this_hosts_stop_signals_and_usbmuxd_default() {
+        let help = after_help();
+        assert!(!help.contains('{'), "a placeholder is left in the help: {help}");
+        assert!(help.contains(signals::NAMES));
+        if cfg!(windows) {
+            assert!(help.contains("Ctrl-C") && !help.contains("SIGTERM"));
+            assert!(USBMUXD_HELP.contains("127.0.0.1:27015") && !USBMUXD_HELP.contains("UNIX:"));
+        } else {
+            assert!(help.contains("SIGINT or SIGTERM"));
+            assert!(USBMUXD_HELP.contains("/var/run/usbmuxd") && !USBMUXD_HELP.contains("27015"));
+        }
     }
 
     #[test]
