@@ -17,6 +17,12 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # Unmaintained, not vulnerable. It is reached only through winit's Wayland title bar (winit > sctk-adwaita > ab_glyph >
+    # ttf-parser), which parses the user's own system font to draw the window's title: no video, no device and no network
+    # data goes near it. The viewer feature is the only way to it. Revisit with winit 0.31.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained ttf-parser, only in winit's Wayland title bar, on the user's own font" },
+]
 
 [licenses]
 version = 2

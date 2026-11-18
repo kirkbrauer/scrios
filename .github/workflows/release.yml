@@ -2,10 +2,10 @@ name: Release
 
 # A tag `vX.Y.Z` (equal to `version` in Cargo.toml) releases scrios:
 #   1. checks the tag against Cargo.toml and runs the tests;
-#   2. builds scrios-x86_64-linux-musl, scrios-aarch64-linux-musl (static, any Linux distribution),
-#      scrios-aarch64-apple-darwin and, for Windows, scrios-x86_64-pc-windows-msvc.zip (scrios.exe with the README,
-#      LICENSE and NOTICE; also scrios-aarch64-pc-windows-msvc.zip if its cross-build works: it is optional), with
-#      SHA256SUMS;
+#   2. builds scrios-x86_64-linux-musl and scrios-aarch64-linux-musl (static, any Linux distribution, headless: built
+#      with --no-default-features, so without the viewer window), scrios-aarch64-apple-darwin (with the viewer) and, for
+#      Windows, scrios-x86_64-pc-windows-msvc.zip (scrios.exe with the README, LICENSE and NOTICE, with the viewer; also
+#      scrios-aarch64-pc-windows-msvc.zip if its cross-build works: it is optional), with SHA256SUMS;
 #   3. creates the GitHub release with them;
 #   4. publishes the crate to crates.io, with Trusted Publishing (OIDC) if it is configured for this repository,
 #      else with the CARGO_REGISTRY_TOKEN secret (the first publish of a crate needs the token).
@@ -75,7 +75,7 @@ jobs:
       - name: build
         run: |
           if [ "${{ matrix.zig }}" = "true" ]; then
-            cargo zigbuild --release --locked --target "${{ matrix.target }}"
+            cargo zigbuild --release --locked --no-default-features --target "${{ matrix.target }}"
           else
             cargo build --release --locked --target "${{ matrix.target }}"
           fi

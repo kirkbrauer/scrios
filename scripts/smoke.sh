@@ -62,7 +62,7 @@ PY
 
 # A start-up failure in the framed format: one `error` frame on stdout, a log on stderr, exit 2.
 set +e
-run $BIN --format framed --usbmuxd /nonexistent/usbmuxd --stats-interval-ms 0 <&3 > "$out" 2> "$err"
+run $BIN stream --format framed --usbmuxd /nonexistent/usbmuxd --stats-interval-ms 0 <&3 > "$out" 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] || { echo "expected exit 2, got $code"; cat "$err"; exit 1; }
@@ -71,7 +71,7 @@ grep -q "cannot connect to usbmuxd" "$err" || { echo "no log on stderr"; cat "$e
 
 # The same failure in the default (raw) format: nothing on stdout, the same log and status.
 set +e
-run $BIN --usbmuxd /nonexistent/usbmuxd <&3 > "$out" 2> "$err"
+run $BIN stream --usbmuxd /nonexistent/usbmuxd <&3 > "$out" 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] || { echo "expected exit 2, got $code"; cat "$err"; exit 1; }
@@ -81,16 +81,26 @@ echo "ok: a failed start writes nothing in the raw format"
 
 # The old spellings still parse: --hid and --codec h264 get as far as the missing usbmuxd.
 set +e
-run $BIN --hid --codec h264 --usbmuxd /nonexistent/usbmuxd <&3 > "$out" 2> "$err"
+run $BIN stream --hid --codec h264 --usbmuxd /nonexistent/usbmuxd <&3 > "$out" 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] && grep -q "cannot connect to usbmuxd" "$err" || { echo "the old flags are refused"; cat "$err"; exit 1; }
+
+# Without a subcommand a build with the viewer opens a window and a build without it streams; with an option that only
+# a written stream means (--format), the first refuses and the second streams: both fail to start here, with exit 2 and
+# no window and no video on stdout (this runs where there is no display).
+set +e
+run $BIN --format framed --usbmuxd /nonexistent/usbmuxd <&3 > "$out" 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] || { echo "expected exit 2 for scrios --format framed, got $code"; cat "$err"; exit 1; }
+echo "ok: scrios without a subcommand, with a stream's option, fails to start without a window"
 
 # Options that do not go together are refused with an `error` event (framed) and exit 2, before any device is touched.
 refused() {
   local want="$1"; shift
   set +e
-  run $BIN "$@" <&3 > "$out" 2> "$err"
+  run $BIN stream "$@" <&3 > "$out" 2> "$err"
   code=$?
   set -e
   [ "$code" -eq 2 ] || { echo "expected exit 2 for $*, got $code"; cat "$err"; exit 1; }
@@ -109,7 +119,7 @@ refused "usbmuxd" --format framed --probe-secs 3 --usbmuxd /nonexistent/usbmuxd
 python3 -I - "$BIN" <<'PY'
 import os, pty, subprocess, sys
 master, slave = pty.openpty()
-p = subprocess.run([sys.argv[1], '--usbmuxd', '/nonexistent/usbmuxd'], stdout=slave, stderr=subprocess.PIPE,
+p = subprocess.run([sys.argv[1], 'stream', '--usbmuxd', '/nonexistent/usbmuxd'], stdout=slave, stderr=subprocess.PIPE,
                    stdin=subprocess.DEVNULL, timeout=30)
 assert p.returncode == 2, p.returncode
 assert b'refusing to write the video to a terminal' in p.stderr, p.stderr
@@ -181,7 +191,7 @@ echo "ok: USBMUXD_SOCKET_ADDRESS is honoured, and --usbmuxd wins over it"
 
 # A UDID that usbmuxd does not list is a start-up failure that names what it lists (framed: as the error event).
 set +e
-run $BIN --format framed --usbmuxd "$sock" --udid NOSUCHDEVICE <&3 > "$out" 2> "$err"
+run $BIN stream --format framed --usbmuxd "$sock" --udid NOSUCHDEVICE <&3 > "$out" 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] || { echo "expected exit 2, got $code"; cat "$err"; exit 1; }
@@ -205,13 +215,20 @@ echo "ok: a DDI download without its SHA-256 is refused"
 
 # The stream's own preflight: a device that is listed but not trusted. With --no-wait it fails at once (exit 2) ...
 set +e
-run $BIN --no-wait --usbmuxd "$sock" --record "$dir/never.h264" < /dev/null 2> "$err"
+run $BIN stream --no-wait --usbmuxd "$sock" --record "$dir/never.h264" < /dev/null 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] && grep -q "tap Trust" "$err" || { echo "--no-wait: expected exit 2 and the Trust hint, got $code"; cat "$err"; exit 1; }
 [ ! -e "$dir/never.h264" ] || [ ! -s "$dir/never.h264" ] || { echo "a recording was written"; exit 1; }
+# The same for `scrios` without a subcommand, which is the window in a build with the viewer: the set-up runs first, so
+# the device that is not trusted is refused at once, before any window, whatever display there is (none, here).
+set +e
+run $BIN --no-wait --usbmuxd "$sock" < /dev/null > "$out" 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] && grep -q "tap Trust" "$err" || { echo "scrios --no-wait: expected exit 2 and the Trust hint, got $code"; cat "$err"; exit 1; }
 # ... and without it, it waits, says what it waits for once, and a SIGTERM is a clean stop.
-"$BIN" --usbmuxd "$sock" --record "$dir/waits.h264" < /dev/null 2> "$err" &
+"$BIN" stream --usbmuxd "$sock" --record "$dir/waits.h264" < /dev/null 2> "$err" &
 waiter=$!
 sleep 2.5
 kill -0 "$waiter" 2>/dev/null || { echo "scrios stopped instead of waiting for Trust"; cat "$err"; exit 1; }
@@ -228,7 +245,7 @@ echo "ok: scrios waits for Trust, says so once, and stops cleanly on SIGTERM"
 # closed, as under nohup or in a script: that is not a stop, so the start fails for its own reason (exit 2), not with
 # "stop requested while starting" (exit 0), which is what the end of input used to do.
 set +e
-run $BIN --no-preflight --no-control --usbmuxd "$sock" --record "$dir/nopre.h264" < /dev/null 2> "$err"
+run $BIN stream --no-preflight --no-control --usbmuxd "$sock" --record "$dir/nopre.h264" < /dev/null 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] && ! grep -q "tap Trust" "$err" || { echo "--no-preflight still made the checks (exit $code)"; cat "$err"; exit 1; }

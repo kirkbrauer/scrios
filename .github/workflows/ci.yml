@@ -63,6 +63,11 @@ jobs:
         run: |
           cargo test --all-targets --all-features --locked
           cargo test --doc --all-features --locked
+      # The build the static Linux release binaries are: no viewer, so no window system, GPU or video decoder in it.
+      - name: headless (--no-default-features) clippy and test
+        run: |
+          cargo clippy --all-targets --no-default-features --locked -- -D warnings
+          cargo test --all-targets --no-default-features --locked
       - name: cargo doc
         run: cargo doc --no-deps --all-features --locked
       - name: build (release)
@@ -165,7 +170,7 @@ jobs:
         run: pipx install cargo-zigbuild
       - name: build
         run: |
-          cargo zigbuild --release --locked --target "${{ matrix.target }}"
+          cargo zigbuild --release --locked --no-default-features --target "${{ matrix.target }}"
           file "target/${{ matrix.target }}/release/scrios"
       - name: smoke test (x86_64 only, no device)
         if: matrix.target == 'x86_64-unknown-linux-musl'

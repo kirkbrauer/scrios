@@ -5,19 +5,37 @@ scrios selects in `idevice`, compiles a little C and assembly with `cc`. No CMak
 macOS or Windows.
 
 ```
-cargo build --release --locked     # -> target/release/scrios
+cargo build --release --locked     # -> target/release/scrios, with the viewer window
 cargo test --locked                # unit tests: no device, no network at run time
 ```
 
+## The viewer feature
+
+The cargo feature `viewer` (on by default) is the window: winit and wgpu, the VideoToolbox decoder on macOS, and
+OpenH264, which is **built from source** by the `openh264-sys2` crate and so needs a **C++ compiler** as well (`c++` or
+`clang++` on Linux and macOS, Visual C++ on Windows). A `--no-default-features` build has none of that: no window, no GPU
+or window-system code, no decoder, and a binary about half the size; `scrios` without a subcommand is then `scrios stream`.
+
+```
+cargo build --release --locked --no-default-features
+cargo test --no-default-features --locked
+```
+
+On Linux the viewer is built to need no window-system or GPU library at build time: winit (X11, Wayland), wgpu (Vulkan,
+OpenGL) and the key-map library load theirs when the program runs, so the window needs a Wayland or X11 session and a
+Vulkan or OpenGL driver. (This is how their features are set; the viewer has been built and run on macOS only so far.)
+The tests that draw to a texture use whichever adapter wgpu finds, and say so and pass if there is none.
+
 ## Static Linux binaries (musl)
 
-The release binaries are static musl builds, cross-compiled with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)
+The release binaries are static musl builds, **without the viewer** (`--no-default-features`: a static binary has no use
+for a window system), cross-compiled with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)
 (zig as the C compiler and linker), from Linux or macOS:
 
 ```
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
-cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
+cargo zigbuild --release --locked --no-default-features --target x86_64-unknown-linux-musl
+cargo zigbuild --release --locked --no-default-features --target aarch64-unknown-linux-musl
 ```
 
 ```
@@ -26,7 +44,7 @@ ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, str
 ```
 
 About 6.5 MB (aarch64) and 8 MB (x86_64). A glibc build (`--target <arch>-unknown-linux-gnu`, or a native
-`cargo build` on Linux) works too and is dynamically linked against glibc only.
+`cargo build --no-default-features` on Linux) works too and is dynamically linked against glibc only.
 
 ## Windows
 

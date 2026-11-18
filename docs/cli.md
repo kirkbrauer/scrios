@@ -1,8 +1,9 @@
 # The scrios command line
 
 scrios shows an iOS device's screen as an H.264 (or HEVC) video stream and sends it touch and key events, through
-usbmuxd and the device's CoreDevice tunnel. It is a command line in the manner of scrcpy: it writes the video where you
-say, a player or a program reads it, and commands come in on standard input. It has no window of its own.
+usbmuxd and the device's CoreDevice tunnel. It is a command line in the manner of scrcpy. Without a subcommand it opens a
+**window** that shows the screen and takes your mouse and keyboard (see [the viewer](#the-viewer)); `scrios stream`
+writes the video where you say, a player or a program reads it, and commands come in on standard input.
 
 The device needs the CoreDevice display service (iOS 27, with Developer Mode on and the developer disk image mounted)
 and must trust the host (usbmuxd holds the pair record). scrios gets there the way scrcpy does, with no extra steps: it
@@ -12,8 +13,8 @@ the pair record from usbmuxd, never from a file of the host, and a usbmuxd on an
 ([a remote usbmuxd](#a-remote-usbmuxd)).
 
 ```
-scrios [OPTIONS]            the same as: scrios stream [OPTIONS]
-scrios stream [OPTIONS]     stream the screen
+scrios [OPTIONS]            the viewer window (in a build without the viewer: the same as scrios stream [OPTIONS])
+scrios stream [OPTIONS]     stream the screen to a pipe or a file, headless
 scrios list [--usbmuxd ADDR]   list the devices usbmuxd knows       (also: scrios --list-devices)
 scrios doctor               check everything the stream needs, and say how to fix what is missing
 scrios ddi-status           Developer Mode, the mounted developer disk image, the image scrios would mount
@@ -21,6 +22,12 @@ scrios mount-ddi            mount the developer disk image (iOS 17 and later)
 scrios unmount-ddi          unmount it
 scrios developer-mode       is Developer Mode on? reveal its switch; --enable --yes turns it on
 ```
+
+**`scrios` without a subcommand changed.** It used to be `scrios stream`. In a build with the viewer (the default; the
+static Linux release binaries are built without it) it opens the window, and a program that ran `scrios --format framed`
+or `scrios | ffplay ...` must now run `scrios stream --format framed` and `scrios stream | ffplay ...`. The window refuses
+`--output`, `--format` and `--probe-secs` with a message that says so (exit status 2), so such a program fails at once
+instead of opening a window.
 
 ## Examples
 
@@ -36,7 +43,7 @@ Watch the screen. The default output is a raw Annex-B stream on standard output.
 this `ffplay` command line is the one checked on a real iPhone (macOS, ffmpeg 9):
 
 ```
-scrios --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -window_title scrios -
+scrios stream --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -window_title scrios -
 ```
 
 What each flag is for, because raw Annex-B has no timestamps and no container:
@@ -58,10 +65,10 @@ Record to a file. A recording is a raw Annex-B stream, flushed picture by pictur
 playable up to the cut; `ffmpeg` wraps it in a container:
 
 ```
-scrios --record screen.h264                          # Ctrl-C stops it
+scrios stream --record screen.h264                   # Ctrl-C stops it
 ffplay -f h264 screen.h264
 ffmpeg -f h264 -i screen.h264 -c copy screen.mp4
-scrios --record screen.h264 --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch and record
+scrios stream --record screen.h264 --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch and record
 ```
 
 **On Windows** the same commands work from `cmd.exe` or PowerShell with `scrios.exe`, with two differences. Ctrl-C (or
@@ -70,9 +77,9 @@ it as text: write it with `--record FILE` or `--output FILE`, or pipe it in `cmd
 the bytes through):
 
 ```
-.\scrios.exe --record screen.h264
+.\scrios.exe stream --record screen.h264
 ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 screen.h264
-cmd /c ".\scrios.exe --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -window_title scrios -"
+cmd /c ".\scrios.exe stream --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -window_title scrios -"
 ```
 
 (Ctrl-C stops the recording. `ffplay` of a growing file is not live; for watching use the `cmd /c` pipe. VLC plays a recording too: Media > Open
@@ -82,7 +89,7 @@ For a program: the framed format, which also carries the events (the picture's s
 happened to touch and keys) and has a version number. [protocol.md](protocol.md) specifies it.
 
 ```
-scrios --format framed --output - | my-program
+scrios stream --format framed --output - | my-program
 ```
 
 Control. Commands arrive on standard input, one per line (the full list is in `scrios --help` and in
@@ -100,7 +107,7 @@ kb type BASE64               type a string
 ```
 # tap the middle of the screen, press Home, and stop
 { echo "touch down 603 1311 0"; sleep 0.1; echo "touch up 603 1311 0"; sleep 1; echo "key home"; sleep 1; echo stop; } \
-    | scrios --record tap.h264
+    | scrios stream --record tap.h264
 ```
 
 The end of standard input is a `stop` only with `--format framed` (a program that closes its end is done). A raw stream
@@ -220,6 +227,50 @@ The CoreDevice tunnel and the services scrios opens (the display service, touch 
 connections that usbmuxd makes to the device, so they should work over a remote usbmuxd; this is reasoned from how
 they connect and has not been tried on a device.
 
+## The viewer
+
+`scrios` (with no subcommand, in a build with the viewer) opens a window with the device's screen. [README](../README.md#viewer)
+has the overview; the details:
+
+* **Before the window.** The window opens when the device is ready: the same set-up as `scrios stream` runs first, on
+  the terminal ([what scrios does before the stream](#what-scrios-does-before-the-stream): waiting for the device, Trust
+  and Developer Mode, mounting the developer disk image), with `--no-wait`, `--no-preflight` and the image options as
+  there. Ctrl-C while it waits is a clean stop. `scrios doctor` also checks that the build has a decoder for the window.
+* **Window.** It opens at the device's shape, as large as the screen has room for (`--window-width` and `--window-height`
+  limit it, in logical pixels), is resizable, and keeps the picture's shape with black bars. When the device turns, the
+  window follows it (the stream's `config` event gives the rotation). Closing the window, `MOD+W`, Ctrl-C and SIGTERM stop
+  the stream on the device (up to about 8 seconds, with the window already gone) and exit with the stream's status.
+* **Mouse** = finger 0, in pixels of the upright picture (the same `touch down|move|up` as the stdin commands). A press in
+  the bars is ignored; a drag that leaves the picture sticks to its edge; losing the focus or a turn of the device lifts
+  the finger.
+* **Keyboard.** A key goes down and up on the device (`kb down|up`, HID usage by the key's position) as it does on the
+  host. Auto-repeat of the host is not forwarded. Losing the focus lifts every key.
+* **Shortcuts** with `MOD` = **Cmd** on macOS, **Alt** elsewhere; not sent to the device, and neither is the modifier or a
+  key pressed with it that is not a shortcut:
+
+  | | |
+  | --- | --- |
+  | `MOD+H` | `key home` |
+  | `MOD+S` | `key app-switcher` |
+  | `MOD+Up`, `MOD+Down` | `key volume-up`, `key volume-down` (repeat while held) |
+  | `MOD+W` | close the window |
+  | `MOD+P` | `key lock`, only with `--lock-shortcut` |
+
+* **`--decoder auto|platform|software`.** H.264 only (`--video-codec h265` is refused: use `scrios stream`). `auto` is the
+  platform's decoder (VideoToolbox on macOS) with OpenH264 as the fallback if there is none or if it fails; `platform`
+  insists on the platform's (an error on Linux, and on Windows until the Media Foundation decoder is written);
+  `software` is OpenH264. Pictures are decoded and drawn as they arrive; one that is not drawn before the next is
+  decoded is dropped.
+* **`--show-stats`** puts `FPS fps, DELAY ms (max MAX), decode D ms` in the title: the pictures drawn a second, and the
+  time from the access unit's arrival at the viewer to its drawing (decoding and the wait for the screen), averaged over
+  the last second. `skipped N` counts pictures decoded but never drawn, `N dropped` the access units the stream had to
+  drop because the viewer could not keep up. The delay is the viewer's own; the device's encoder and the USB link are not in it.
+* **`--record FILE`** records the raw stream while the window is open (the same file as for `scrios stream`).
+* **`--no-control`** is view only: the mouse and keys do nothing and the title says so. If the device's touch and key
+  services cannot be connected, the window still shows the screen and says so in the title.
+* The window needs a display, a GPU API (Metal, Vulkan, Direct3D 12 or OpenGL) and, to open at all, a build with the
+  `viewer` feature. Without a window system `scrios` exits with status 2 and says why.
+
 ## On Windows
 
 What a Windows host needs is in the [README](../README.md#prerequisites): the Apple Devices app or iTunes (their Apple Mobile
@@ -231,7 +282,7 @@ device yet; `doctor` shows where it stops):
 .\scrios.exe list                              # the device, as usbmuxd lists it
 .\scrios.exe doctor                            # each check, with its fix
 .\scrios.exe mount-ddi --ddi-dir C:\path\to\iOS_DDI
-.\scrios.exe --record test.h264                # Ctrl-C stops it
+.\scrios.exe stream --record test.h264         # Ctrl-C stops it (plain `scrios.exe` opens the window)
 ffplay -f h264 test.h264                       # or VLC: Media > Open File
 ```
 
@@ -240,17 +291,17 @@ for the details of a failure. The Apple Mobile Device Service listens on 127.0.0
 Windows machine from another host, forward its port over ssh (`ssh -N -L 27015:127.0.0.1:27015 you@windows-host`, which
 needs an SSH server there).
 
-## Where the output goes
+## Where the output goes (`scrios stream`)
 
 | Command | Standard output | File |
 | --- | --- | --- |
-| `scrios` | raw, if stdout is not a terminal; otherwise refused | |
-| `scrios --output -` | raw (to a terminal too) | |
-| `scrios --output FILE` | | raw |
-| `scrios --record FILE` | nothing | raw |
-| `scrios --record FILE --output -` | raw | raw |
-| `scrios --format framed` | framed, if stdout is not a terminal | |
-| `scrios --format framed --output FILE` | | framed |
+| `scrios stream` | raw, if stdout is not a terminal; otherwise refused | |
+| `scrios stream --output -` | raw (to a terminal too) | |
+| `scrios stream --output FILE` | | raw |
+| `scrios stream --record FILE` | nothing | raw |
+| `scrios stream --record FILE --output -` | raw | raw |
+| `scrios stream --format framed` | framed, if stdout is not a terminal | |
+| `scrios stream --format framed --output FILE` | | framed |
 
 * **`--format raw`** (the default) writes the access units one after the other: a plain Annex-B elementary stream with
   4-byte start codes and the parameter sets in front of every key unit. Events are not written: errors and warnings are in
@@ -282,6 +333,7 @@ needs an SSH server there).
 | `--no-preflight` | do not check Developer Mode and the developer disk image first, and never mount one |
 | `--ddi-dir DIR` | the developer disk image folder to mount from (see [the developer disk image](#the-developer-disk-image)) |
 | `--ddi-download-url URL`, `--ddi-sha256 HEX` | download the image (a `.tar.gz` of the folder, checked against the hash) when no folder is found; no default URL |
+| `--decoder auto\|platform\|software`, `--window-title`, `--window-width`, `--window-height`, `--show-stats`, `--lock-shortcut` | the viewer's (see above); `scrios` without a subcommand only |
 | `--list-devices` | the same as `scrios list` |
 
 Under **Advanced** in `--help`: `--visible-size`, the RTCP and stall intervals, `--display-poll-ms`, the touch mapping
@@ -305,13 +357,15 @@ service that did not connect is answered with an `ok: false` event.
 | `--display-id` | the same |
 | `--max-fps`, `--video-bit-rate`, `--max-size` | not available: the device's display offer has no frame-rate, bit-rate or size field to set (the stream is the display's own size and rate) |
 | `--no-video` | not available: the device only accepts touch while a display stream is open |
-| audio, window, keyboard and mouse forwarding | not available: there is no viewer yet |
+| the window, mouse and keyboard forwarding | `scrios` opens a window; mouse = one finger, keys = HID keyboard, `MOD+H` Home, `MOD+S` App Switcher, `MOD+Up`/`Down` volume (no multi-touch, no clipboard) |
+| audio | not available |
 
 ### What changed from the first command line
 
 * The default output is **raw**; the machine protocol is `--format framed`. A program that read frames from the earlier
   `scrios` must add `--format framed`.
 * Touch and keys are on by default (`--no-control` turns them off); `--hid` is still accepted and does nothing.
+* `scrios` without a subcommand is the viewer window in a build with the viewer; the old behaviour is `scrios stream`.
 * `--codec` is now `--video-codec`; the old name still works, with `hevc` or `h265`.
 * `--max-bitrate` is still accepted and ignored (the display offer has no bitrate field).
 
@@ -337,11 +391,14 @@ exit with 1 when something is missing, and `scrios ddi-status` when the image is
 
 The command line is a thin layer over the `scrios` crate: `scrios::stream::Stream::start` returns the access units and
 events of a stream and an `Input` for touch, keys and stop; `scrios::sink` writes them in the formats above; `scrios::list`
-lists devices. A viewer written in Rust uses those and does not need a pipe.
+lists devices. A viewer written in Rust uses those and does not need a pipe; the window of `scrios` is one, in
+`scrios::viewer` (feature `viewer`: `Setup::prepare(options)?.run(feed)` with the `Stream` as the feed, started on the
+`ReadyDevice`'s `stream_options`).
 
 What happens before the stream is one function, `scrios::preflight::ensure_ready(&PreflightOptions, &mut progress)`,
 which returns a `ReadyDevice` (its `stream_options` gives the `StreamOptions` for the device that was checked) and
 tells `progress` what it does and waits for as `PreflightStep`s (each has a plain line). `scrios::preflight::doctor`
-is the same checks as a `Report`, to which a program can add its own. `scrios::mux::Mux` is the usbmuxd address
-(`--usbmuxd`, `$USBMUXD_SOCKET_ADDRESS`, the platform's), `scrios::ddi` finds and unpacks the developer disk image, and
-`scrios::ops::Device` has the operations on a device (Developer Mode, mounting).
+is the same checks as a `Report`, to which a program can add its own (`scrios doctor` adds the viewer's decoder).
+`scrios::mux::Mux` is the usbmuxd address (`--usbmuxd`, `$USBMUXD_SOCKET_ADDRESS`, the platform's), `scrios::ddi` finds
+and unpacks the developer disk image, and `scrios::ops::Device` has the operations on a device (Developer Mode,
+mounting).

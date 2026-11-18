@@ -54,14 +54,15 @@ else
 fi
 echo "ok: the help names this host's usbmuxd default"
 
+# (`scrios stream`: without a subcommand a build with the viewer opens a window, which a runner has no display for.)
 # A start-up failure, in the raw format: nothing on stdout, the log on stderr, exit 2.
-run 2 --usbmuxd "$CLOSED" --no-preflight
+run 2 stream --usbmuxd "$CLOSED" --no-preflight
 [ ! -s "$out" ] || fail "the raw format wrote something to stdout on a failed start"
 grep -q "cannot connect to usbmuxd at $CLOSED" "$err" || fail "no 'cannot connect' on stderr"
 echo "ok: a failed start writes nothing to stdout in the raw format"
 
 # The same in the framed format: one `error` control frame (13 header bytes and a JSON payload) on stdout.
-run 2 --format framed --no-stdin --usbmuxd "$CLOSED"
+run 2 stream --format framed --no-stdin --usbmuxd "$CLOSED"
 grep -a -q '"event":"error"' "$out" || fail "no error event on stdout"
 [ "$(grep -a -o '"event"' "$out" | wc -l)" -eq 1 ] || fail "not exactly one event on stdout"
 grep -a -q "cannot connect to usbmuxd" "$out" || fail "the error event does not say why"
@@ -82,9 +83,9 @@ grep -q "^FAIL  usbmuxd" "$out" && grep -q "fix: " "$out" && grep -q "^skip  dev
 echo "ok: list and doctor report an unreachable usbmuxd"
 
 # Options that do not go together are refused before any device is touched.
-run 2 --format framed --no-stdin --video-codec hevc --probe-secs 3
+run 2 stream --format framed --no-stdin --video-codec hevc --probe-secs 3
 grep -a -q "\-\-video-codec h264" "$out" || fail "--probe-secs with hevc was not refused with an error event"
-run 2 --format framed --no-stdin --record "$dir/never.mp4"
+run 2 stream --format framed --no-stdin --record "$dir/never.mp4"
 grep -a -q "raw Annex-B" "$out" || fail "--record to a container was not refused"
 echo "ok: options that do not go together are refused"
 
