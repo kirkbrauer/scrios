@@ -18,7 +18,7 @@ mod device_cmds;
 
 use device_cmds::{DdiArgs, DeveloperModeArgs, PreflightEnd, TargetArgs};
 use scrios::codec::CodecKind;
-use scrios::commands::{Command, read_commands, supervised};
+use scrios::commands::{AtEof, Command, read_commands_at, supervised};
 use scrios::frame::Event;
 use scrios::hid::{HidMapping, HidSpace};
 use scrios::list;
@@ -85,7 +85,7 @@ enum SpaceArg {
 }
 
 const AFTER_HELP: &str = "\
-Commands on stdin (one per line; end of input is `stop`):
+Commands on stdin (one per line; with --format framed the end of input is `stop`):
   keyframe                     ask the device for a fresh keyframe
   stop                         stop cleanly (SIGINT and SIGTERM do too; it can take about 8 seconds)
   touch down|move|up X Y ID    a finger, in pixels of the upright picture (finger 0 only)
@@ -337,8 +337,8 @@ struct AdvancedArgs {
     #[arg(long)]
     hid_swap_xy: bool,
 
-    /// Do not read commands from stdin. Without it, the end of stdin is a `stop`, so a stream started with stdin
-    /// closed (`< /dev/null`, nohup, a background job) would stop at once; stop it with SIGINT or SIGTERM instead
+    /// Do not read commands from stdin. Only with --format framed is the end of stdin a `stop`; otherwise a stream
+    /// started with stdin closed (`< /dev/null`, nohup, a background job) runs on until SIGINT or SIGTERM
     #[arg(long)]
     no_stdin: bool,
 
@@ -624,8 +624,27 @@ async fn stop_on_signals(tx: mpsc::Sender<Command>) {
     }
 }
 
+/// What the end of stdin means for a stream written in `format`: a `stop` for the framed format (a program that
+/// closes its end is done), nothing otherwise (a recording or a player's pipe started with stdin closed, by a script
+/// or `nohup`, must not stop at once).
+fn eof_policy(format: Format) -> AtEof {
+    match format {
+        Format::Framed => AtEof::Stop,
+        Format::Raw => AtEof::Ignore,
+    }
+}
+
+/// Reads the commands on `reader` for the stream, and a reader that dies is a stop.
+async fn feed_commands<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    tx: mpsc::Sender<Command>,
+    at_eof: AtEof,
+) {
+    supervised(read_commands_at(reader, tx.clone(), at_eof), tx).await;
+}
+
 /// Feeds the stream's input from stdin (if `read_stdin`) and from the signals, on a thread of its own.
-fn spawn_input(input: Input, read_stdin: bool) {
+fn spawn_input(input: Input, read_stdin: bool, at_eof: AtEof) {
     let spawned = std::thread::Builder::new().name("scrios-input".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -637,7 +656,7 @@ fn spawn_input(input: Input, read_stdin: bool) {
         rt.block_on(async move {
             let tx = input.sender();
             if read_stdin {
-                tokio::spawn(supervised(read_commands(tokio::io::stdin(), tx.clone()), tx.clone()));
+                tokio::spawn(feed_commands(tokio::io::stdin(), tx.clone(), at_eof));
             }
             stop_on_signals(tx).await;
             // The thread (and its blocked read of stdin) ends with the process.
@@ -716,7 +735,7 @@ fn run_stream(args: &StreamArgs) -> i32 {
         error!("cannot start the writer thread: {e}");
         return EXIT_START_FAILED;
     }
-    spawn_input(stream.input(), !args.advanced.no_stdin);
+    spawn_input(stream.input(), !args.advanced.no_stdin, eof_policy(args.format()));
 
     let outcome = stream.wait();
     // Let the writer finish what is queued (the access units are stale now: only events are kept), but never wait
@@ -1059,6 +1078,33 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(Cli::try_parse_from(["scrios", "developer-mode", "--yes"]).is_err(), "--yes confirms --enable");
+    }
+
+    #[test]
+    fn the_end_of_stdin_stops_only_the_framed_format() {
+        assert_eq!(eof_policy(stream_args(&["--format", "framed"]).format()), AtEof::Stop);
+        // A recording, a pipe to a player and the default are all raw: stdin closed must not stop them.
+        for args in [&[][..], &["--record", "r.h264"], &["--format", "raw"], &["-o", "-", "-r", "r.h264"]] {
+            assert_eq!(eof_policy(stream_args(args).format()), AtEof::Ignore, "{args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_started_with_stdin_closed_is_not_stopped_by_it() {
+        // What `scrios --record out.h264 < /dev/null` feeds the stream: nothing, and then the end.
+        let (tx, mut rx) = mpsc::channel(8);
+        feed_commands(&b""[..], tx, eof_policy(Format::Raw)).await;
+        assert_eq!(rx.recv().await, None, "no stop: the stream goes on until a signal");
+        // The framed format is told the machine hung up.
+        let (tx, mut rx) = mpsc::channel(8);
+        feed_commands(&b"keyframe\n"[..], tx, eof_policy(Format::Framed)).await;
+        assert_eq!(rx.recv().await, Some(Command::Keyframe));
+        assert_eq!(rx.recv().await, Some(Command::Stop));
+        // An explicit stop still stops a raw stream.
+        let (tx, mut rx) = mpsc::channel(8);
+        feed_commands(&b"stop\n"[..], tx, eof_policy(Format::Raw)).await;
+        assert_eq!(rx.recv().await, Some(Command::Stop));
+        assert_eq!(rx.recv().await, None);
     }
 
     #[test]

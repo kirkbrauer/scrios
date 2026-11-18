@@ -8,7 +8,9 @@
 //!   ignores `short|long`.
 //! * `kb down|up <usage>`: a key of the HID keyboard page, by its usage in hex (`04` is A, `e1` is
 //!   Left Shift); `kb type <base64>`: type a UTF-8 string.
-//! * End of input is `stop`.
+//! * End of input is `stop` ([`read_commands`]; the `scrios` binary uses [`AtEof::Stop`] only for the framed format, a
+//!   machine that closes its end to say it is done: a raw stream or a recording runs on, since a script or `nohup` has
+//!   no terminal to read).
 //! * Anything else is logged and ignored; a `touch` or `key` that is malformed is reported.
 
 // The parser modules read untrusted bytes: a malformed input is an error, never a panic, so the lints that find the
@@ -281,9 +283,24 @@ pub fn parse_line(line: &[u8]) -> Parsed {
     }
 }
 
+/// What the end of the input means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtEof {
+    /// A [`Command::Stop`]: the machine that was sending commands has hung up.
+    Stop,
+    /// Nothing: an input that has ended (a closed or empty standard input) is no reason to stop.
+    Ignore,
+}
+
 /// Reads lines from `input` and sends the commands to `tx`; at end of input sends [`Command::Stop`].
 /// Returns when the input ends or `tx` is closed.
 pub async fn read_commands<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Command>) {
+    read_commands_at(input, tx, AtEof::Stop).await;
+}
+
+/// [`read_commands`] with the meaning of the end of input given: [`AtEof::Ignore`] sends no [`Command::Stop`] there
+/// (a last line without a newline is still a command).
+pub async fn read_commands_at<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Command>, at_eof: AtEof) {
     let mut reader = BufReader::new(input);
     let mut line: Vec<u8> = Vec::with_capacity(64);
     let mut too_long = false;
@@ -323,8 +340,13 @@ pub async fn read_commands<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Comm
     if (!line.is_empty() || too_long) && !dispatch(&line, too_long, &tx).await {
         return;
     }
-    debug!("stdin closed: stopping");
-    let _ = tx.send(Command::Stop).await;
+    match at_eof {
+        AtEof::Stop => {
+            debug!("stdin closed: stopping");
+            let _ = tx.send(Command::Stop).await;
+        }
+        AtEof::Ignore => debug!("stdin closed: going on"),
+    }
 }
 
 /// Runs the command reader as its own task. If it dies (a panic), commands can no longer arrive and
@@ -718,6 +740,31 @@ mod tests {
         assert_eq!(rx.recv().await, Some(Command::Keyframe));
         assert_eq!(rx.recv().await, Some(Command::Stop)); // the reader's own, at end of input
         assert_eq!(rx.recv().await, None, "and no second one from the supervisor");
+    }
+
+    #[tokio::test]
+    async fn at_the_end_of_input_ignore_sends_no_stop_and_the_reader_still_returns() {
+        for (input, want) in [
+            (&b""[..], vec![]),
+            (&b"keyframe\n"[..], vec![Command::Keyframe]),
+            (&b"keyframe"[..], vec![Command::Keyframe]),
+            (&b"stop\n"[..], vec![Command::Stop]),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            read_commands_at(input, tx, AtEof::Ignore).await;
+            let mut got = Vec::new();
+            while let Some(c) = rx.recv().await {
+                got.push(c);
+            }
+            assert_eq!(got, want, "{input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_commands_is_the_stop_at_the_end_of_input() {
+        let (tx, mut rx) = mpsc::channel(8);
+        read_commands(&b""[..], tx).await;
+        assert_eq!(rx.recv().await, Some(Command::Stop));
     }
 
     #[tokio::test]

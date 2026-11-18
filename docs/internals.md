@@ -135,7 +135,7 @@ NAL types (to read an HEVC answer). From the first SPS seen whole it logs `profi
 Nothing is written to stdout but the closing event: `stopped` and exit 0 if most packets had payload type 123 (or another payload type that
 carries H.264 SPS or IDR NAL units); an `error` event and exit 1 if the device answered with HEVC anyway (the message says how many packets of
 which payload type), sent nothing, or sent something that is neither. If the device refuses the offer, the start fails like any other
-start (exit 2, an `error` event with what the device said). A `stop`, end of stdin or a signal ends the probe early with exit 0. The probe
+start (exit 2, an `error` event with what the device said). A `stop`, a signal or (with `--format framed`) the end of stdin ends the probe early with exit 0. The probe
 sends no receiver reports, so keep N well under the device's 20 seconds.
 
 `--probe-raw <PATH>` (with the probe) also writes **every datagram** received during the window, RTP and RTCP, to a file: for each, its length

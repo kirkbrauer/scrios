@@ -27,7 +27,8 @@ run $BIN list --help > /dev/null
 run $BIN --version > /dev/null
 
 out="$(mktemp)"; err="$(mktemp)"; dir="$(mktemp -d)"
-# A standard input that never ends: end of input is a `stop`, which would race with a start-up failure.
+# A standard input that never ends: in the framed format end of input is a `stop`, which would race with a start-up
+# failure.
 exec 3< <(sleep 600)
 sleeper=${!:-}
 mux_pid=
@@ -223,13 +224,16 @@ set -e
 waiter=
 [ "$code" -eq 0 ] || { echo "a SIGTERM while waiting should be a clean stop, got $code"; cat "$err"; exit 1; }
 echo "ok: scrios waits for Trust, says so once, and stops cleanly on SIGTERM"
-# --no-preflight skips the checks: the stream starts, and the fake usbmuxd has no tunnel to give it.
+# --no-preflight skips the checks: the stream starts, and the fake usbmuxd has no tunnel to give it. Standard input is
+# closed, as under nohup or in a script: that is not a stop, so the start fails for its own reason (exit 2), not with
+# "stop requested while starting" (exit 0), which is what the end of input used to do.
 set +e
-run $BIN --no-preflight --no-control --usbmuxd "$sock" --record "$dir/nopre.h264" <&3 2> "$err"
+run $BIN --no-preflight --no-control --usbmuxd "$sock" --record "$dir/nopre.h264" < /dev/null 2> "$err"
 code=$?
 set -e
 [ "$code" -eq 2 ] && ! grep -q "tap Trust" "$err" || { echo "--no-preflight still made the checks (exit $code)"; cat "$err"; exit 1; }
-echo "ok: --no-preflight does not make the checks"
+! grep -q "stop requested" "$err" || { echo "the end of stdin stopped a raw stream"; cat "$err"; exit 1; }
+echo "ok: --no-preflight does not make the checks, and a closed stdin does not stop a raw stream"
 
 # doctor: every check, with its fix; exit 1 if one fails.
 set +e

@@ -101,7 +101,7 @@ Control is on by default: the `touch`, `key` and `kb` commands need it (with `--
   `--keyframe-min-interval-ms`**; a request inside the window is coalesced into one sent when the window ends (never sent twice in
   the window). A held request is **cancelled when a keyframe is written**.
 - `stop`: stop cleanly: lift a finger still down, `stopMediaStream` to the device, close the tunnel, send the `stopped` event,
-  exit 0. **End of stdin is `stop`** (unless `--no-stdin`). SIGTERM and SIGINT are `stop` too, and a stop that arrives while the
+  exit 0. **In the framed format, end of stdin is `stop`** (unless `--no-stdin`); in the raw format it is not: a stream started with stdin closed (`< /dev/null`, `nohup`, a script) runs on until a `stop`, SIGTERM or SIGINT. SIGTERM and SIGINT are `stop` too, and a stop that arrives while the
   stream is still starting ends the start (and stops whatever was already started on the device). A clean stop can take up to
   about 8 seconds.
 - `touch down|move|up <x> <y> <id>`: a finger. `x` and `y` are pixels of the **upright picture**, the picture the viewer sees

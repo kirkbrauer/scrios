@@ -75,13 +75,14 @@ kb type BASE64               type a string
 ```
 
 ```
-# tap the middle of the screen, press Home, and stop (the end of input is a stop)
-{ echo "touch down 603 1311 0"; sleep 0.1; echo "touch up 603 1311 0"; sleep 1; echo "key home"; sleep 1; } \
+# tap the middle of the screen, press Home, and stop
+{ echo "touch down 603 1311 0"; sleep 0.1; echo "touch up 603 1311 0"; sleep 1; echo "key home"; sleep 1; echo stop; } \
     | scrios --record tap.h264
 ```
 
-Without a terminal on standard input (`< /dev/null`, nohup, a script that closes it) the end of input would stop the
-stream at once: add `--no-stdin`, and stop it with SIGINT or SIGTERM.
+The end of standard input is a `stop` only with `--format framed` (a program that closes its end is done). A raw stream
+or a recording does not stop at the end of input, so one started with standard input closed (`< /dev/null`, nohup, a
+script) runs on; stop it with `stop`, SIGINT or SIGTERM. `--no-stdin` does not read standard input at all.
 
 ## Where the output goes
 
