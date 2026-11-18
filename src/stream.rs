@@ -82,8 +82,8 @@ const PANIC_CLEANUP: Duration = Duration::from_secs(8);
 pub struct StreamOptions {
     /// UDID of the device (default: the only device usbmuxd lists).
     pub udid: Option<String>,
-    /// The usbmuxd address, a unix socket path or `host:port` (default: `$USBMUXD_SOCKET_ADDRESS`, else the
-    /// system's socket).
+    /// The usbmuxd address: `UNIX:/path` (or a bare `/path`), `host:port` or `TCP:host:port` (default:
+    /// `$USBMUXD_SOCKET_ADDRESS`, else the platform's own: see [`Mux`](crate::mux::Mux)).
     pub usbmuxd: Option<String>,
     /// The display to stream (1 is the built-in display).
     pub display_id: i64,

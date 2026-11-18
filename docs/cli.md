@@ -114,7 +114,7 @@ stream at once: add `--no-stdin`, and stop it with SIGINT or SIGTERM.
 | Option | Meaning |
 | --- | --- |
 | `-s`, `--udid UDID` | the device (default: the only one usbmuxd lists) |
-| `--usbmuxd PATH\|HOST:PORT` | the usbmuxd to ask (default: `$USBMUXD_SOCKET_ADDRESS`, else `/var/run/usbmuxd`) |
+| `--usbmuxd ADDR` | the usbmuxd to ask: `UNIX:/path` (or a bare `/path`), `host:port` or `TCP:host:port`. Default: `$USBMUXD_SOCKET_ADDRESS`, else `/var/run/usbmuxd` (`127.0.0.1:27015` on Windows). usbmuxd is the only way scrios reaches a device, and the only place it reads a pair record |
 | `--display-id N` | the display to stream (default 1, the built-in display) |
 | `--video-codec h264\|h265` | the codec to ask for (default h264, which every player and browser decodes; `hevc` is an alias of `h265`; the older `--codec` still works) |
 | `-r`, `--record FILE` | also record the video to FILE (raw Annex-B) |

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test of a release binary without a device:
 #   * --help and --version work;
-#   * `scrios list` and --list-devices read a fake usbmuxd;
+#   * `scrios list` and --list-devices read a fake usbmuxd, on a unix socket (a path or `UNIX:path`) and on TCP
+#     (`host:port` or `TCP:host:port`), and --usbmuxd wins over $USBMUXD_SOCKET_ADDRESS;
 #   * a start-up failure (no usbmuxd at the given path, or no such UDID) in the framed format writes exactly one
 #     `error` control frame to stdout, logs to stderr, and exits 2; in the raw format stdout stays empty;
 #   * options that do not go together are refused, with an `error` event in the framed format;
@@ -110,11 +111,16 @@ assert b'usbmuxd' not in p.stderr, p.stderr
 print('ok: stdout is a terminal: refused')
 PY
 
-# A fake usbmuxd: answers ListDevices with a device that is attached over USB and over the network.
+# A fake usbmuxd: answers ListDevices with a device that is attached over USB and over the network. It listens on a
+# unix socket and on a TCP port of 127.0.0.1 (the port is written to "$sock.port" before the socket appears).
 sock="$dir/usbmuxd"
 python3 -I - "$sock" <<'PY' &
 import os, plistlib, socket, struct, sys, threading
 path = sys.argv[1]
+tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+tcp.bind(('127.0.0.1', 0))
+tcp.listen(8)
+open(path + '.port', 'w').write(str(tcp.getsockname()[1]))
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 srv.bind(path)
 srv.listen(8)
@@ -136,9 +142,12 @@ def serve(c):
             c.recv(size - 16, socket.MSG_WAITALL)
             body = plistlib.dumps(devices)
             c.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, tag) + body)
-while True:
-    conn, _ = srv.accept()
-    threading.Thread(target=serve, args=(conn,), daemon=True).start()
+def accept(server):
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+threading.Thread(target=accept, args=(tcp,), daemon=True).start()
+accept(srv)
 PY
 mux_pid=$!
 for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.05; done
@@ -147,14 +156,21 @@ for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.05; done
 want="UDID                       CONNECTION
 00008110-001234567890401E  network 192.168.1.5
 00008110-001234567890401E  usb"
-for args in "list --usbmuxd $sock" "--list-devices --usbmuxd $sock"; do
+port="$(cat "$sock.port")"
+for args in "list --usbmuxd $sock" "--list-devices --usbmuxd $sock" "list --usbmuxd UNIX:$sock" \
+    "list --usbmuxd 127.0.0.1:$port" "list --usbmuxd TCP:127.0.0.1:$port"; do
   got="$(run $BIN $args 2> "$err")" || { echo "scrios $args failed"; cat "$err"; exit 1; }
   [ "$got" = "$want" ] || { echo "scrios $args printed:"; echo "$got"; exit 1; }
 done
-echo "ok: scrios list shows the fake usbmuxd's devices"
-# USBMUXD_SOCKET_ADDRESS is honoured as it is for the stream.
-got="$(USBMUXD_SOCKET_ADDRESS=$sock run $BIN list 2> "$err")" || { cat "$err"; exit 1; }
-[ "$got" = "$want" ] || { echo "list with USBMUXD_SOCKET_ADDRESS printed:"; echo "$got"; exit 1; }
+echo "ok: scrios list shows the fake usbmuxd's devices (unix socket, UNIX:, host:port, TCP:)"
+# USBMUXD_SOCKET_ADDRESS is honoured as it is for the stream, in both of its forms, and --usbmuxd wins over it.
+for env in "$sock" "UNIX:$sock" "127.0.0.1:$port"; do
+  got="$(USBMUXD_SOCKET_ADDRESS=$env run $BIN list 2> "$err")" || { cat "$err"; exit 1; }
+  [ "$got" = "$want" ] || { echo "list with USBMUXD_SOCKET_ADDRESS=$env printed:"; echo "$got"; exit 1; }
+done
+got="$(USBMUXD_SOCKET_ADDRESS=/nonexistent/usbmuxd run $BIN list --usbmuxd "$sock" 2> "$err")" || { cat "$err"; exit 1; }
+[ "$got" = "$want" ] || { echo "--usbmuxd did not win over USBMUXD_SOCKET_ADDRESS"; exit 1; }
+echo "ok: USBMUXD_SOCKET_ADDRESS is honoured, and --usbmuxd wins over it"
 
 # A UDID that usbmuxd does not list is a start-up failure that names what it lists (framed: as the error event).
 set +e

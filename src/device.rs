@@ -6,9 +6,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,12 +21,13 @@ use idevice::{
     core_device_proxy::CoreDeviceProxy,
     rsd::RsdHandshake,
     tcp::handle::{AdapterHandle, UdpSocketHandle},
-    usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdDevice},
+    usbmuxd::UsbmuxdDevice,
 };
 use tracing::{debug, info, warn};
 
 use crate::displayinfo::{DisplayInfo, DisplayInfoSource, DisplayQuery, parse_display_info};
 use crate::hid::{Action, HidBackend};
+use crate::mux::{Choice, Mux};
 use crate::offer::{OfferFlags, build_video_offer};
 use crate::session::{Datagram, DatagramSocket};
 
@@ -81,72 +80,25 @@ pub struct StreamInfo {
 
 // ---- pure helpers -----------------------------------------------------------------------------
 
-/// The usbmuxd address to use when `--usbmuxd` is not given.
-#[must_use]
-pub fn default_usbmuxd_spec() -> String {
-    match std::env::var("USBMUXD_SOCKET_ADDRESS") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => UsbmuxdAddr::SOCKET_FILE.to_string(),
-    }
-}
+pub use crate::mux::{default_usbmuxd_spec, parse_usbmuxd_addr};
 
-/// `/path/to/socket` (or a relative `./path`) is a unix socket; `host:port` is TCP; a bare word
-/// is taken as a socket path.
-///
-/// # Errors
-///
-/// A message for an empty address, a `host:port` whose port is not a number, and a host that does not resolve or has no
-/// address.
-pub fn parse_usbmuxd_addr(spec: &str) -> Result<UsbmuxdAddr, String> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return Err("empty usbmuxd address".into());
-    }
-    let looks_like_path = spec.starts_with('/') || spec.starts_with("./") || spec.starts_with("../");
-    if looks_like_path || !spec.contains(':') {
-        return Ok(UsbmuxdAddr::UnixSocket(spec.to_string()));
-    }
-    if let Ok(a) = SocketAddr::from_str(spec) {
-        return Ok(UsbmuxdAddr::TcpSocket(a));
-    }
-    // host:port with a name.
-    let (host, port) = spec.rsplit_once(':').ok_or_else(|| format!("bad usbmuxd address {spec:?}"))?;
-    port.parse::<u16>().map_err(|_| format!("bad port in usbmuxd address {spec:?}"))?;
-    spec.to_socket_addrs()
-        .map_err(|e| format!("cannot resolve usbmuxd host {host:?}: {e}"))?
-        .next()
-        .map(UsbmuxdAddr::TcpSocket)
-        .ok_or_else(|| format!("usbmuxd host {host:?} has no address"))
-}
-
-/// Picks the device: the one named by `udid`, else the only one. A device that usbmuxd lists both
-/// over USB and over the network is one device (USB wins).
+/// Picks the device: the one named by `udid`, else the only one. A device that usbmuxd lists both over USB and
+/// over the network is one device (USB wins).
 ///
 /// # Errors
 ///
 /// A message if no device is connected, none has that UDID (the message lists the ones usbmuxd knows), or several are
 /// connected and no UDID tells them apart.
 pub fn select_device<'a>(devices: &'a [UsbmuxdDevice], udid: Option<&str>) -> Result<&'a UsbmuxdDevice, String> {
-    let candidates: Vec<&UsbmuxdDevice> = match udid {
-        Some(u) => devices.iter().filter(|d| d.udid == u).collect(),
-        None => devices.iter().collect(),
-    };
-    let mut udids: Vec<&str> = candidates.iter().map(|d| d.udid.as_str()).collect();
-    udids.sort_unstable();
-    udids.dedup();
-    match udids.len() {
-        0 => match udid {
-            Some(u) => {
-                let listed: Vec<&str> = devices.iter().map(|d| d.udid.as_str()).collect();
-                Err(format!(
-                    "no device with UDID {u} (usbmuxd lists: {})",
-                    if listed.is_empty() { "nothing".to_string() } else { listed.join(", ") }
-                ))
-            }
-            None => Err("no device is connected (usbmuxd lists none)".into()),
-        },
-        1 => Ok(candidates.iter().find(|d| d.connection_type == Connection::Usb).copied().unwrap_or(candidates[0])),
-        _ => Err(format!("several devices are connected ({}): pass --udid", udids.join(", "))),
+    match crate::mux::choose(devices, udid) {
+        Choice::Found(device) => Ok(device),
+        Choice::NoDevice => Err("no device is connected (usbmuxd lists none)".into()),
+        Choice::UnknownUdid(listed) => Err(format!(
+            "no device with UDID {} (usbmuxd lists: {})",
+            udid.unwrap_or_default(),
+            if listed.is_empty() { "nothing".to_string() } else { listed.join(", ") }
+        )),
+        Choice::Several(udids) => Err(format!("several devices are connected ({}): pass --udid", udids.join(", "))),
     }
 }
 
@@ -494,19 +446,12 @@ impl Session {
         reason = "the connection sequence, one step after the other, each with its own error message: it reads top to bottom"
     )]
     pub async fn start(&mut self, opts: &DeviceOptions) -> Result<(), String> {
-        let spec = opts.usbmuxd.clone().unwrap_or_else(default_usbmuxd_spec);
-        let addr = parse_usbmuxd_addr(&spec)?;
-        info!("connecting to usbmuxd at {spec}");
-        let mut mux = timed("connecting to usbmuxd", CONNECT_TIMEOUT, addr.connect(1))
-            .await?
-            .map_err(|e| format!("cannot connect to usbmuxd at {spec}: {e:?}"))?;
-        let devices = timed("listing devices", CONNECT_TIMEOUT, mux.get_devices())
-            .await?
-            .map_err(|e| format!("usbmuxd device list failed: {e:?}"))?;
-        drop(mux);
+        let mux = Mux::resolve(opts.usbmuxd.as_deref())?;
+        info!("connecting to usbmuxd at {}", mux.spec());
+        let devices = mux.devices().await?;
         let dev = select_device(&devices, opts.udid.as_deref())?;
         info!("using device {} ({:?})", dev.udid, dev.connection_type);
-        let provider = dev.to_provider(addr, LABEL);
+        let provider = mux.provider(dev, LABEL);
 
         let proxy = timed("opening the CoreDevice tunnel", CONNECT_TIMEOUT, CoreDeviceProxy::connect(&provider))
             .await?
@@ -920,6 +865,7 @@ fn fresh_ssrc() -> u32 {
 #[cfg(test)]
 mod tests {
     use idevice::core_device::display_stream::negotiation::{StreamGroup, StreamGroupPayload};
+    use idevice::usbmuxd::Connection;
 
     use super::*;
 
@@ -928,27 +874,10 @@ mod tests {
     }
 
     #[test]
-    fn usbmuxd_addresses() {
-        assert!(matches!(
-            parse_usbmuxd_addr("/var/run/usbmuxd"),
-            Ok(UsbmuxdAddr::UnixSocket(p)) if p == "/var/run/usbmuxd"
-        ));
-        assert!(matches!(parse_usbmuxd_addr("./run/usbmuxd"), Ok(UsbmuxdAddr::UnixSocket(_))));
-        assert!(matches!(parse_usbmuxd_addr("usbmuxd.sock"), Ok(UsbmuxdAddr::UnixSocket(_))));
-        match parse_usbmuxd_addr("127.0.0.1:27015") {
-            Ok(UsbmuxdAddr::TcpSocket(a)) => assert_eq!(a.to_string(), "127.0.0.1:27015"),
-            other => panic!("{other:?}"),
-        }
-        match parse_usbmuxd_addr("[::1]:27015") {
-            Ok(UsbmuxdAddr::TcpSocket(a)) => assert_eq!(a.port(), 27015),
-            other => panic!("{other:?}"),
-        }
-        match parse_usbmuxd_addr("localhost:27015") {
-            Ok(UsbmuxdAddr::TcpSocket(a)) => assert_eq!(a.port(), 27015),
-            other => panic!("{other:?}"),
-        }
-        assert!(parse_usbmuxd_addr("").is_err());
-        assert!(parse_usbmuxd_addr("host:notaport").is_err());
+    fn the_address_helpers_stay_where_they_were() {
+        // They moved to `mux` (which has their tests); the old paths still work.
+        assert!(parse_usbmuxd_addr("127.0.0.1:27015").is_ok());
+        assert!(!default_usbmuxd_spec().is_empty());
     }
 
     #[test]

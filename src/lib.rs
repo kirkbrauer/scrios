@@ -7,7 +7,8 @@
 //!   events ([`stream::Item`]); [`stream::Input`] sends touch, keys, text, keyframe requests and stop.
 //! * [`sink`] writes what a stream yields as a raw Annex-B file or as the framed machine protocol
 //!   (`docs/protocol.md`), which is what the `scrios` binary does.
-//! * [`list`] lists the devices usbmuxd knows.
+//! * [`list`] lists the devices usbmuxd knows; [`mux`] is the address of the usbmuxd to ask (usbmuxd is the only way
+//!   scrios reaches a device).
 //!
 //! The `scrios` binary is a thin command line over these. The other modules are public too, so that other programs
 //! can use the pieces (depacketizers, SPS parsers, the HID controller, ...); their API is not stable yet (0.x).
@@ -23,6 +24,7 @@ pub mod frame;
 pub mod hid;
 pub mod keyframe;
 pub mod list;
+pub mod mux;
 pub mod offer;
 pub mod outqueue;
 pub mod probe;
@@ -31,3 +33,6 @@ pub mod session;
 pub mod sink;
 pub mod sps;
 pub mod stream;
+
+#[cfg(test)]
+mod testmux;

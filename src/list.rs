@@ -4,14 +4,10 @@
 //! lockdown session, which needs the pair record and a TLS handshake, so they are not listed.
 
 use std::fmt::Write as _;
-use std::time::Duration;
 
 use idevice::usbmuxd::{Connection, UsbmuxdDevice};
 
-use crate::device::{default_usbmuxd_spec, parse_usbmuxd_addr};
-
-/// How long connecting to usbmuxd and listing may take.
-const TIMEOUT: Duration = Duration::from_secs(10);
+use crate::mux::Mux;
 
 /// One entry of usbmuxd's device list. A device that is connected both over USB and over the network is listed
 /// twice, once for each.
@@ -35,22 +31,14 @@ impl From<&UsbmuxdDevice> for Listed {
     }
 }
 
-/// Asks usbmuxd (at `usbmuxd`, else `$USBMUXD_SOCKET_ADDRESS`, else the system's socket) for its devices.
+/// Asks usbmuxd (at `usbmuxd`, else `$USBMUXD_SOCKET_ADDRESS`, else the platform's own) for its devices.
 ///
 /// # Errors
 ///
-/// A message if the address is bad (see [`parse_usbmuxd_addr`]), usbmuxd cannot be
+/// A message if the address is bad (see [`parse_usbmuxd_addr`](crate::mux::parse_usbmuxd_addr)), usbmuxd cannot be
 /// connected to, or it does not answer in time.
 pub async fn list_devices(usbmuxd: Option<&str>) -> Result<Vec<Listed>, String> {
-    let spec = usbmuxd.map_or_else(default_usbmuxd_spec, str::to_string);
-    let addr = parse_usbmuxd_addr(&spec)?;
-    let listing = async {
-        let mut mux = addr.connect(1).await.map_err(|e| format!("cannot connect to usbmuxd at {spec}: {e:?}"))?;
-        mux.get_devices().await.map_err(|e| format!("usbmuxd device list failed: {e:?}"))
-    };
-    let devices = tokio::time::timeout(TIMEOUT, listing)
-        .await
-        .map_err(|_| format!("usbmuxd at {spec} did not answer in {} s", TIMEOUT.as_secs()))??;
+    let devices = Mux::resolve(usbmuxd)?.devices().await?;
     let mut listed: Vec<Listed> = devices.iter().map(Listed::from).collect();
     listed.sort_by(|a, b| (&a.udid, &a.connection).cmp(&(&b.udid, &b.connection)));
     Ok(listed)

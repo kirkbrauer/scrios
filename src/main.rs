@@ -140,8 +140,8 @@ enum Cmd {
 struct ListArgs {
     #[arg(
         long,
-        value_name = "PATH|HOST:PORT",
-        help = "usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)"
+        value_name = "ADDR",
+        help = "usbmuxd address: UNIX:/path (or a bare /path), host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd, or 127.0.0.1:27015 on Windows)"
     )]
     usbmuxd: Option<String>,
 }
@@ -172,8 +172,8 @@ struct StreamArgs {
 
     #[arg(
         long,
-        value_name = "PATH|HOST:PORT",
-        help = "usbmuxd address: a unix socket path or host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd)"
+        value_name = "ADDR",
+        help = "usbmuxd address: UNIX:/path (or a bare /path), host:port or TCP:host:port (default: $USBMUXD_SOCKET_ADDRESS, else /var/run/usbmuxd, or 127.0.0.1:27015 on Windows)"
     )]
     usbmuxd: Option<String>,
 
