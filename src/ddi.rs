@@ -32,6 +32,11 @@ use idevice::cryptexd::Cryptex1Assets;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
+pub mod fetch;
+pub mod http;
+pub mod manifest;
+pub mod pin;
+
 /// The environment variable that names a DDI folder.
 pub const ENV_DIR: &str = "SCRIOS_DDI_DIR";
 /// The environment variable that names the URL of a DDI archive to download.
