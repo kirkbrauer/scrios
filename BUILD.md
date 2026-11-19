@@ -28,6 +28,20 @@ ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, str
 About 6.5 MB (aarch64) and 8 MB (x86_64). A glibc build (`--target <arch>-unknown-linux-gnu`, or a native
 `cargo build` on Linux) works too and is dynamically linked against glibc only.
 
+## Windows
+
+`cargo build --release --locked` with the MSVC toolchain (Visual Studio Build Tools with the C++ workload, and
+`rustup default stable-x86_64-pc-windows-msvc`) builds `target\release\scrios.exe`; that is what CI does on
+`windows-latest`, and the release zip is built the same way with `--target x86_64-pc-windows-msvc`. `ring` ships the
+assembly it needs for Windows as object files, so NASM is not needed. An arm64 build is a cross-build from an x64
+host: `rustup target add aarch64-pc-windows-msvc`, then `cargo build --release --locked --target aarch64-pc-windows-msvc`
+(with the MSVC ARM64 build tools; the release workflow tries it and goes on without it if it fails).
+
+The sources can be checked for Windows from another host: `rustup target add x86_64-pc-windows-gnu`, then
+`cargo check --target x86_64-pc-windows-gnu --all-targets --locked` with a C compiler for the target in
+`CC_x86_64_pc_windows_gnu` (for `ring`'s build script; `zig cc -target x86_64-windows-gnu` does). That checks that it
+compiles and passes clippy; it does not run anything.
+
 ## Mirrors and offline builds
 
 `Cargo.lock` names crates.io only; the repository has no Cargo configuration. To build through a mirror of
@@ -50,4 +64,5 @@ downloads of a DDI archive, and its CDLA-Permissive-2.0 licence, which `deny.tom
 ## Releases
 
 A tag `vX.Y.Z` (it must equal `version` in `Cargo.toml`) runs `.github/workflows/release.yml`: the static musl
-binaries and the macOS one, `SHA256SUMS`, a GitHub release, and `cargo publish` to crates.io.
+binaries, the macOS one and the Windows zip (`scrios-x86_64-pc-windows-msvc.zip`, and an arm64 one if its cross-build
+works), `SHA256SUMS`, a GitHub release, and `cargo publish` to crates.io.

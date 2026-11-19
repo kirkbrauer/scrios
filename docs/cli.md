@@ -64,6 +64,20 @@ ffmpeg -f h264 -i screen.h264 -c copy screen.mp4
 scrios --record screen.h264 --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch and record
 ```
 
+**On Windows** the same commands work from `cmd.exe` or PowerShell with `scrios.exe`, with two differences. Ctrl-C (or
+Ctrl-Break) is the stop, and the video must not go through Windows PowerShell 5.1's pipeline or `>`, which re-encode
+it as text: write it with `--record FILE` or `--output FILE`, or pipe it in `cmd.exe` (PowerShell 7.4 and later pass
+the bytes through):
+
+```
+.\scrios.exe --record screen.h264
+ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 screen.h264
+cmd /c ".\scrios.exe --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -window_title scrios -"
+```
+
+(Ctrl-C stops the recording. `ffplay` of a growing file is not live; for watching use the `cmd /c` pipe. VLC plays a recording too: Media > Open
+File, with the demuxer forced to H.264 if it does not recognise the `.h264`.) None of this has been tried on Windows yet.
+
 For a program: the framed format, which also carries the events (the picture's size and orientation, statistics, what
 happened to touch and keys) and has a version number. [protocol.md](protocol.md) specifies it.
 
@@ -91,7 +105,8 @@ kb type BASE64               type a string
 
 The end of standard input is a `stop` only with `--format framed` (a program that closes its end is done). A raw stream
 or a recording does not stop at the end of input, so one started with standard input closed (`< /dev/null`, nohup, a
-script) runs on; stop it with `stop`, SIGINT or SIGTERM. `--no-stdin` does not read standard input at all.
+script) runs on; stop it with `stop`, SIGINT or SIGTERM (on Windows: `stop`, Ctrl-C or Ctrl-Break; there is no SIGTERM).
+`--no-stdin` does not read standard input at all.
 
 ## What scrios does before the stream
 
@@ -113,7 +128,7 @@ Then the stream starts on the device that was checked. The waiting is for a pers
 * `--format framed` (what a program reads) makes none of these checks and never waits: the stream starts as it always
   has, and what is missing arrives as an `error` event. Run `scrios doctor` or `scrios mount-ddi` before it.
 * `--no-preflight` does the same for the other formats.
-* Ctrl-C (SIGINT) or SIGTERM while it waits is a clean stop (exit status 0).
+* Ctrl-C (SIGINT) or SIGTERM while it waits is a clean stop (exit status 0); on Windows, Ctrl-C or Ctrl-Break.
 
 ## Commands that set a device up
 
@@ -169,7 +184,11 @@ folder from a Mac with Xcode into the cache folder**, so that `<cache>/Restore/B
 ```
 # on a Linux host (from a Mac with Xcode)
 mkdir -p ~/.cache/scrios && scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI ~/.cache/scrios/ddi
+# on a Windows host, in PowerShell
+scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI $env:LOCALAPPDATA\scrios\ddi
 ```
+
+(Anywhere else works too: `scrios mount-ddi --ddi-dir C:\path\to\iOS_DDI`, or `$SCRIOS_DDI_DIR`.)
 
 Inside a folder, the build manifest is looked for in the folder, in `Restore/`, and under an `iOS_DDI/` folder in either.
 The image and trust cache are the files the manifest names for the device's board and chip (Xcode's layout is
@@ -200,6 +219,26 @@ every device the usbmuxd knows and read its pair record. Use it only on a link y
 The CoreDevice tunnel and the services scrios opens (the display service, touch and keys, the image mounter) are all
 connections that usbmuxd makes to the device, so they should work over a remote usbmuxd; this is reasoned from how
 they connect and has not been tried on a device.
+
+## On Windows
+
+What a Windows host needs is in the [README](../README.md#prerequisites): the Apple Devices app or iTunes (their Apple Mobile
+Device Service is usbmuxd, on `127.0.0.1:27015`), a trusted device, Developer Mode, and a DDI folder copied from a Mac with
+Xcode. A first session, in PowerShell, from the folder `scrios.exe` was unzipped to (nothing here has been tried on a
+device yet; `doctor` shows where it stops):
+
+```
+.\scrios.exe list                              # the device, as usbmuxd lists it
+.\scrios.exe doctor                            # each check, with its fix
+.\scrios.exe mount-ddi --ddi-dir C:\path\to\iOS_DDI
+.\scrios.exe --record test.h264                # Ctrl-C stops it
+ffplay -f h264 test.h264                       # or VLC: Media > Open File
+```
+
+A usbmuxd somewhere else: `--usbmuxd host:port` or `$env:USBMUXD_SOCKET_ADDRESS = "host:port"`. Set `$env:RUST_LOG = "debug"`
+for the details of a failure. The Apple Mobile Device Service listens on 127.0.0.1 only; to use a device plugged into a
+Windows machine from another host, forward its port over ssh (`ssh -N -L 27015:127.0.0.1:27015 you@windows-host`, which
+needs an SSH server there).
 
 ## Where the output goes
 
@@ -232,7 +271,7 @@ they connect and has not been tried on a device.
 | Option | Meaning |
 | --- | --- |
 | `-s`, `--udid UDID` | the device (default: the only one usbmuxd lists) |
-| `--usbmuxd ADDR` | the usbmuxd to ask: `UNIX:/path` (or a bare `/path`), `host:port` or `TCP:host:port`. Default: `$USBMUXD_SOCKET_ADDRESS`, else `/var/run/usbmuxd` (`127.0.0.1:27015` on Windows). usbmuxd is the only way scrios reaches a device, and the only place it reads a pair record |
+| `--usbmuxd ADDR` | the usbmuxd to ask: `UNIX:/path` (or a bare `/path`), `host:port` or `TCP:host:port`. Default: `$USBMUXD_SOCKET_ADDRESS`, else `/var/run/usbmuxd` (`127.0.0.1:27015` on Windows, the Apple Mobile Device Service; Windows has no unix sockets, so only the `host:port` forms are taken there, and `--help` shows the host's own default). usbmuxd is the only way scrios reaches a device, and the only place it reads a pair record |
 | `--display-id N` | the display to stream (default 1, the built-in display) |
 | `--video-codec h264\|h265` | the codec to ask for (default h264, which every player and browser decodes; `hevc` is an alias of `h265`; the older `--codec` still works) |
 | `-r`, `--record FILE` | also record the video to FILE (raw Annex-B) |
@@ -280,7 +319,7 @@ service that did not connect is answered with an `ok: false` event.
 
 | Variable | Meaning |
 | --- | --- |
-| `USBMUXD_SOCKET_ADDRESS` | the usbmuxd to ask when `--usbmuxd` is not given (`UNIX:/path`, `/path`, `host:port`, `TCP:host:port`; the variable libimobiledevice and go-ios read) |
+| `USBMUXD_SOCKET_ADDRESS` | the usbmuxd to ask when `--usbmuxd` is not given (`UNIX:/path`, `/path`, `host:port`, `TCP:host:port`, the first two not on Windows; the variable libimobiledevice and go-ios read) |
 | `SCRIOS_DDI_DIR` | the DDI folder, when `--ddi-dir` is not given |
 | `SCRIOS_DDI_URL`, `SCRIOS_DDI_SHA256` | the archive to download the DDI from, and its SHA-256 |
 | `RUST_LOG` | the log level (the default is `info`) |
@@ -289,7 +328,8 @@ service that did not connect is answered with an `ok: false` event.
 
 Logs go to standard error (`RUST_LOG` selects the level; the default is `info`). The exit status is 0 after a clean stop, 1
 if the stream failed while running, 2 if it could not be started or the options do not go together, and 101 after an internal
-error. Ctrl-C (SIGINT) and SIGTERM stop the stream cleanly, which can take up to about 8 seconds. A device that is not
+error. Ctrl-C (SIGINT) and SIGTERM stop the stream cleanly (on Windows: Ctrl-C and Ctrl-Break; closing the console window
+or `taskkill /f` ends the process at once), which can take up to about 8 seconds. A device that is not
 ready (and `--no-wait`, or a command that does not wait) is exit status 2. `scrios doctor` and `scrios developer-mode`
 exit with 1 when something is missing, and `scrios ddi-status` when the image is not mounted or Developer Mode is off.
 

@@ -1,6 +1,6 @@
 # scrios
 
-**scrios** ("screen iOS") shows and controls the screen of an iPhone or iPad from a Linux or macOS host: it streams
+**scrios** ("screen iOS") shows and controls the screen of an iPhone or iPad from a Linux, macOS or Windows host: it streams
 the screen as **H.264** (or HEVC) and sends **touch, hardware keys and keyboard text** back to the device. Think of
 it as scrcpy, but for iOS devices: a small command-line program, and a Rust library to embed.
 
@@ -56,7 +56,20 @@ the developer disk image, `scrios doctor`) is tested against scripted fakes of u
 device.
 
 The display service needs iOS 17 or later (the CoreDevice tunnel); **iOS versions older than 27 are untested.**
-Host: Linux (x86_64, aarch64) and macOS (Apple silicon); Unix only.
+
+### Platforms
+
+| Host | Built and tested in CI | Release binary | Checked with a device |
+| --- | --- | --- | --- |
+| **Linux** (x86_64, aarch64) | yes: clippy, tests, doc, smoke test | static musl (`scrios-x86_64-linux-musl`, `scrios-aarch64-linux-musl`) | see [Tested on](#tested-on) (earlier build) |
+| **macOS** (Apple silicon) | yes, the same | `scrios-aarch64-apple-darwin` | yes: this build streamed and recorded an iPhone |
+| **Windows** (x86_64; arm64 is a best-effort cross-build) | yes (`windows-latest`, MSVC): clippy, tests, doc, a smoke test of the release `scrios.exe` | `scrios-x86_64-pc-windows-msvc.zip` | **no: nothing has run against a device on Windows yet** |
+
+On Windows the code path is **reasoned from idevice's sources, not tried**: idevice already talks to a usbmuxd on TCP
+`127.0.0.1:27015` (what the Apple Mobile Device Service listens on) and has no unix socket there, scrios takes its own
+copy of the standard output handle for the stream the way it takes the descriptor on unix, and Ctrl-C and Ctrl-Break
+are its stop signals. What the Apple Mobile Device Service answers to the requests scrios makes (the device list, the
+pair record) has not been seen. If something differs, `scrios doctor` shows where it stops, and `RUST_LOG=debug` says more.
 
 ## Prerequisites
 
@@ -66,14 +79,15 @@ usbmuxd is scrios's only way to a device, as adb is scrcpy's. What the host need
 | --- | --- | --- |
 | **macOS** | built in (`/var/run/usbmuxd`) | **Xcode**, or a copy of its `iOS_DDI` folder: scrios finds `/Library/Developer/DeveloperDiskImages/iOS_DDI` itself |
 | **Linux** | the `usbmuxd` daemon (a package of every distribution; it starts on its own when a device is plugged in, or `sudo systemctl start usbmuxd`) | a copy of `iOS_DDI` from a Mac with Xcode |
-| **Windows** (not supported yet) | the Apple Devices app or iTunes, whose Apple Mobile Device Service is usbmuxd on `127.0.0.1:27015` | a copy of `iOS_DDI` from a Mac with Xcode |
+| **Windows** (see [Platforms](#platforms)) | the Apple Devices app (Microsoft Store) or iTunes: its Apple Mobile Device Service is usbmuxd, on `127.0.0.1:27015`, and must be running | a copy of `iOS_DDI` from a Mac with Xcode, in `%LOCALAPPDATA%\scrios\ddi` or given with `--ddi-dir` |
 
 On every host:
 
 - **Developer Mode** on the device (Settings > Privacy & Security > Developer Mode; scrios reveals the switch and says the
   steps, then waits through the restart);
 - the device **paired and trusted** with the host (tap Trust on the device; scrios itself does not pair, so if the host
-  never asked, pair once with your system's tool: Finder on macOS, `idevicepair pair` from libimobiledevice on Linux);
+  never asked, pair once with your system's tool: Finder on macOS, `idevicepair pair` from libimobiledevice on Linux, the
+  Apple Devices app or iTunes on Windows);
 - **internet for the first mount after each restart of the device**: mounting the personalized image asks Apple's signing
   server (`gs.apple.com`, plain HTTP, not through a proxy) for a ticket. Without internet scrios says so; once the image
   is mounted nothing else is needed until the device restarts.
@@ -86,6 +100,13 @@ once:
 
 ```
 mkdir -p ~/.cache/scrios && scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI ~/.cache/scrios/ddi
+```
+
+On Windows, in PowerShell (the folder from the Mac, copied by any means: `scp`, a USB stick, a share):
+
+```
+scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI $env:LOCALAPPDATA\scrios\ddi
+# or leave it anywhere and say where:  .\scrios.exe --ddi-dir C:\path\to\iOS_DDI
 ```
 
 (The paths of Xcode's folders are from what Xcode is known to do; one was seen on a Mac with Xcode, the other was not.
@@ -109,10 +130,24 @@ scrios --usbmuxd that-machine:27015
 over a link you trust, and prefer the ssh forward. The CoreDevice tunnel and the services all ride usbmuxd connections, so
 they should work remotely; that is reasoned, not tried on a device. See [docs/cli.md](docs/cli.md#a-remote-usbmuxd).
 
+### On Windows
+
+`scrios.exe` is a console program with no installer: unzip it and run it from a terminal. The address of usbmuxd is
+`127.0.0.1:27015` unless `--usbmuxd host:port` or `USBMUXD_SOCKET_ADDRESS` says otherwise (there are no unix sockets:
+`UNIX:` addresses are refused). Ctrl-C and Ctrl-Break are a clean stop; closing the console window or `taskkill /f`
+ends the process at once, without telling the device.
+
+The video is binary, and **Windows PowerShell 5.1 re-encodes what a program writes when it is piped or redirected with
+`>`, which corrupts it**. Use `--output FILE` or `--record FILE`, or do the pipe in `cmd.exe`
+(`cmd /c ".\scrios.exe --output - | ffplay -f h264 -"`); PowerShell 7.4 and later pass the bytes through. The same
+holds for `--format framed` into another program.
+
 ## Install
 
 Release binaries (from the GitHub releases of this repository): `scrios-x86_64-linux-musl` and
-`scrios-aarch64-linux-musl` (static, any Linux distribution) and `scrios-aarch64-apple-darwin`, with `SHA256SUMS`.
+`scrios-aarch64-linux-musl` (static, any Linux distribution), `scrios-aarch64-apple-darwin`, and for Windows
+`scrios-x86_64-pc-windows-msvc.zip` (`scrios.exe` with the README, LICENSE and NOTICE; an arm64 zip when its cross-build
+worked), with `SHA256SUMS`. Every build of `main` also uploads the Windows zip as a workflow artifact (30 days).
 
 From source, with Rust 1.89 or newer and a C compiler (for `ring`, the TLS backend):
 
@@ -139,7 +174,8 @@ specified, with their version, in [docs/protocol.md](docs/protocol.md).
 
 Logs go to standard error (`RUST_LOG` sets the level). Exit status: `0` after a clean stop, `2` if the stream could
 not be started, `1` if it failed while running, `101` after an internal error. The end of standard input stops a stream
-only with `--format framed`; a recording started with standard input closed (nohup, a script) runs until SIGINT or SIGTERM.
+only with `--format framed`; a recording started with standard input closed (nohup, a script) runs until SIGINT or SIGTERM
+(Ctrl-C on Windows).
 
 ## Library
 
@@ -167,10 +203,12 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked                  # no device and no network needed at run time
 cargo deny check                     # licences, bans, sources, advisories (deny.toml)
-scripts/smoke.sh target/release/scrios   # a release binary without a device
+scripts/smoke.sh target/release/scrios   # a release binary without a device (unix: needs python3)
+scripts/smoke-minimal.sh target/release/scrios   # the same, minimal: runs in Git Bash on Windows too (scrios.exe)
 ```
 
-CI (GitHub Actions) runs all of these; a `v*` tag builds the release binaries.
+CI (GitHub Actions) runs all of these on Linux, macOS and Windows (what does not depend on the host, once); a `v*` tag
+builds the release binaries.
 
 ## License
 
