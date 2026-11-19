@@ -51,6 +51,7 @@ idevice = { version = "=0.1.68", default-features = false, features = [
   "rsd",
   "xpc",
   "mobile_image_mounter",
+  "cryptexd",
   "tss",
   "amfi",
 ] }

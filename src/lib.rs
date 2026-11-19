@@ -42,6 +42,8 @@ pub mod stream;
 pub mod viewer;
 
 #[cfg(test)]
+mod testddi;
+#[cfg(test)]
 mod testdir;
 #[cfg(test)]
 mod testmux;

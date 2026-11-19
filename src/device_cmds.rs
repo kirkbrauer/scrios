@@ -1,4 +1,5 @@
-//! The commands that manage the device rather than stream it: `ddi-status`, `mount-ddi`, `unmount-ddi`.
+//! The commands that manage the device rather than stream it: `ddi-status`, `mount-ddi`, `unmount-ddi`, `doctor`,
+//! `developer-mode`.
 //! They print what they find on standard output and what they are doing on standard error.
 
 use std::fmt::Write as _;
@@ -8,10 +9,12 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::error;
 
-use scrios::ddi::{DdiSources, Found};
-use scrios::ops::{DevError, Device, Mounted};
+use scrios::ddi::DdiSources;
+use scrios::ops::{DevError, Device, Mounted, Removed};
 use scrios::preflight::doctor::{self, DoctorOptions};
-use scrios::preflight::{Blocker, PreflightOptions, PreflightStep, Target, ensure_ready, open_device};
+use scrios::preflight::{
+    Blocker, PreflightOptions, PreflightStep, Target, ensure_ready, install_developer_image, open_device,
+};
 use scrios::stream::EXIT_START_FAILED;
 
 /// The exit status of `ddi-status` when the device is reachable and something is missing.
@@ -141,18 +144,13 @@ impl Report {
     }
 }
 
-/// How a found folder is described.
-fn describe_found(found: &Found) -> String {
-    let build = found.folder.build().map_or_else(String::new, |b| format!(", build {b}"));
-    format!("{} ({}{build})", found.folder.root().display(), found.origin.label())
-}
-
 fn dev_error(what: &str, e: &DevError) {
     error!("{what}: {e}");
 }
 
-/// `scrios ddi-status`: Developer Mode, the mounted images, and the folder scrios would mount. Exit status 0 if the
-/// developer disk image is mounted and Developer Mode is on, 1 if one of them is not, 2 if the device could not be asked.
+/// `scrios ddi-status`: Developer Mode, the mounted images and installed cryptex, how the image would be installed, and
+/// the folder scrios would install it from. Exit status 0 if the developer disk image is in place and Developer Mode is
+/// on, 1 if one of them is not, 2 if the device could not be asked.
 pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
     let sources = match ddi.sources() {
         Ok(s) => s,
@@ -192,8 +190,16 @@ pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
                 dev_error("cannot read Developer Mode", &e);
             }
         }
+        // The cryptex that cryptexd lists is the sure word on a cryptex install: the image mounter's list does not always
+        // show it. A device that cannot be asked for it (older iOS, no cryptexd) simply has none.
+        let route = device.route().await.ok();
+        let cryptex = match route {
+            Some(scrios::ops::Route::Cryptexd) => device.installed_ddi().await.ok().flatten(),
+            _ => None,
+        };
         match device.image_mounted().await {
             Ok(mounted) => {
+                let mounted = mounted || cryptex.is_some();
                 complete &= mounted;
                 report.line("Developer image", if mounted { "mounted" } else { "not mounted" });
             }
@@ -207,9 +213,19 @@ pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
                 report.more(&entry_line(image));
             }
         }
-        match sources.locate() {
-            Ok(found) => report.line("Image to mount", &describe_found(&found)),
-            Err(why) => report.line("Image to mount", &format!("none ({why})")),
+        if let Some(image) = &cryptex {
+            report.line("Cryptex", &format!("{} {} (installed through cryptexd)", image.identifier, image.version));
+        }
+        if let Some(route) = route {
+            report.line("Install route", route.describe());
+        }
+        let located = match route {
+            Some(route) => sources.locate_for(route.variant()),
+            None => sources.locate(),
+        };
+        match located {
+            Ok(found) => report.line("Image to install", &found.describe()),
+            Err(why) => report.line("Image to install", &format!("none ({why})")),
         }
         out(&report.0);
         if failed {
@@ -222,7 +238,8 @@ pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
     })
 }
 
-/// `scrios mount-ddi`: mounts the personalized developer disk image from the folder the sources name.
+/// `scrios mount-ddi`: puts the developer disk image on the device, the way the device takes it: as a cryptex through
+/// cryptexd (iOS 17.4 and later), else through the image mounter, from the folder the sources name.
 pub fn run_mount_ddi(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
     let sources = match ddi.sources() {
         Ok(s) => s,
@@ -251,51 +268,27 @@ pub fn run_mount_ddi(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
                 return EXIT_START_FAILED;
             }
         }
-        let downloading = &mut |host: &str| {
-            say(&PreflightStep::Downloading { host: host.to_string() }.line().unwrap_or_default());
-        };
-        let folder = match Box::pin(sources.find_or_download(downloading)).await {
-            Ok(folder) => folder,
-            Err(why) => {
-                error!("{why}");
-                return EXIT_START_FAILED;
+        let mut print = |step: &PreflightStep| {
+            if let Some(line) = step.line() {
+                say(&line);
             }
         };
-        say(&format!(
-            "Mounting the developer disk image from {} (the first mount after each restart of the device needs internet, for Apple's signing server)",
-            describe_found(&folder)
-        ));
-        match mount_with_progress(&device, &folder).await {
+        match Box::pin(install_developer_image(&device, &sources, &mut print)).await {
             Ok(Mounted::Now) => {
-                say("Mounted.");
+                say("Done.");
                 0
             }
-            Ok(Mounted::Already) => {
-                say("The developer disk image is already mounted.");
-                0
-            }
-            Err(e) => {
-                dev_error("cannot mount the developer disk image", &e);
+            Ok(Mounted::Already) => 0,
+            Err(stop) => {
+                error!("cannot install the developer disk image: {}", stop.message());
                 EXIT_START_FAILED
             }
         }
     })
 }
 
-/// Mounts `folder`'s image on `device`, saying how far the upload is every tenth.
-async fn mount_with_progress(device: &Device, folder: &Found) -> Result<Mounted, DevError> {
-    let mut last = u8::MAX;
-    let mut progress = move |percent: u8| {
-        let tenth = percent / 10;
-        if tenth != last {
-            last = tenth;
-            say(&format!("Uploading the image: {}%", u32::from(tenth) * 10));
-        }
-    };
-    Box::pin(device.mount_ddi(&folder.folder, &mut progress)).await
-}
-
-/// `scrios unmount-ddi`: unmounts the developer disk image.
+/// `scrios unmount-ddi`: takes the developer disk image off the device: a cryptex is uninstalled through cryptexd, an
+/// image that was mounted is unmounted through the image mounter.
 pub fn run_unmount_ddi(target: &TargetArgs) -> i32 {
     run_async(async {
         let (mux, found) = match open_device(&target.target()).await {
@@ -305,9 +298,13 @@ pub fn run_unmount_ddi(target: &TargetArgs) -> i32 {
                 return EXIT_START_FAILED;
             }
         };
-        match Device::new(&mux, &found).unmount_ddi().await {
-            Ok(()) => {
-                say("Unmounted the developer disk image.");
+        match Device::new(&mux, &found).remove_ddi().await {
+            Ok(Removed::Cryptex(image)) => {
+                say(&format!("Uninstalled the developer disk image ({} {}).", image.identifier, image.version));
+                0
+            }
+            Ok(Removed::Unmounted(path)) => {
+                say(&format!("Unmounted the developer disk image ({path})."));
                 0
             }
             Err(e) => {

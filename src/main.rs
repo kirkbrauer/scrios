@@ -179,12 +179,13 @@ enum Cmd {
     Stream(StreamArgs),
     /// List the devices usbmuxd knows: UDID and how each is connected
     List(ListArgs),
-    /// Show Developer Mode, the mounted developer disk image, and the image scrios would mount
+    /// Show Developer Mode, the developer disk image (mounted, or installed as a cryptex), how it would be installed,
+    /// and the image scrios would install it from
     DdiStatus(DdiCommandArgs),
-    /// Mount the developer disk image the display service needs (iOS 17 and later; needs internet for Apple's
-    /// signing server the first time after each restart of the device)
+    /// Install the developer disk image the display service needs: as a cryptex through cryptexd (iOS 17.4 and
+    /// later), else through the image mounter (needs internet for Apple's signing server)
     MountDdi(DdiCommandArgs),
-    /// Unmount the developer disk image
+    /// Remove the developer disk image: uninstall the cryptex, or unmount the image
     UnmountDdi(TargetArgs),
     /// Check everything the stream needs (usbmuxd, the device, trust, Developer Mode, the developer disk image, the
     /// display service) and say how to fix what is missing

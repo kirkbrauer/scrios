@@ -1,11 +1,17 @@
-//! The developer disk image (DDI): where scrios finds one to mount, and which of its files belong to a device.
+//! The developer disk image (DDI): where scrios finds one to install, and which of its files belong to a device.
 //!
-//! The display service is only offered to a device that has the developer disk image mounted. iOS 17 and later take
+//! The display service is only offered to a device that has the developer disk image installed. iOS 17 and later take
 //! the *personalized* image: a folder of the kind Xcode installs (`iOS_DDI`), with a `BuildManifest.plist`, the
-//! image (`.dmg`) and its trust cache, which Apple's signing server (TSS) personalizes for the device's chip.
+//! image (`.dmg`) and its trust cache, which Apple's signing server (TSS) personalizes for the device. It goes onto
+//! the device in one of two ways, which want different parts of that folder ([`Variant`]):
 //!
-//! scrios never ships or hosts Apple's image, and it has no default place to download one from. It looks, in this
-//! order, at:
+//! * as a **cryptex** through `cryptexd`, over the `CoreDevice` tunnel (iOS 17.4 and later: it is what Xcode does, and
+//!   the only way for the newest devices): the manifest's `Cryptex1,*` entries (image, trust cache, cryptex info and
+//!   volume root hash);
+//! * through the **image mounter** (iOS 17.0 to 17.3.1, and where `cryptexd` is not offered): the image and trust
+//!   cache that the manifest names for the device's board and chip.
+//!
+//! scrios does not ship or host Apple's image. It looks, in this order, at:
 //!
 //! 1. the folder given (`--ddi-dir`),
 //! 2. `$SCRIOS_DDI_DIR`,
@@ -14,13 +20,15 @@
 //!    download goes if the caller configured one ([`Download`]: a URL and the SHA-256 it must match).
 //!
 //! In a folder, the build manifest is looked for in the folder, in `Restore/`, and under an `iOS_DDI/` folder in
-//! either. The image and trust cache are the ones the manifest names for the device's board and chip (Xcode's layout:
-//! `Restore/<name>.dmg` and `Restore/Firmware/<name>.dmg.trustcache`), else `Image4.dmg`, `Image.dmg` or
-//! `DeveloperDiskImage.dmg` with a `.trustcache` next to it.
+//! either. For the image mounter the image and trust cache are the ones the manifest names for the device's board and
+//! chip (Xcode's layout: `Restore/<name>.dmg` and `Restore/Firmware/<name>.dmg.trustcache`), else `Image4.dmg`,
+//! `Image.dmg` or `DeveloperDiskImage.dmg` with a `.trustcache` next to it.
 
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use idevice::cryptexd::Cryptex1Assets;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
@@ -62,6 +70,64 @@ impl Origin {
             Origin::Cache => "scrios's cache",
         }
     }
+}
+
+/// Which form of the developer disk image a device takes (see the module's documentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Variant {
+    /// The cryptex that `cryptexd` installs: the manifest's `Cryptex1,*` entries (iOS 17.4 and later).
+    Cryptex,
+    /// The personalized image that the image mounter mounts (iOS 17.0 to 17.3.1, and the fallback).
+    Personalized,
+}
+
+impl Variant {
+    /// The name of the folder that holds this variant's files in the `DeveloperDiskImage` repository (and in the cache).
+    #[must_use]
+    pub fn folder(self) -> &'static str {
+        match self {
+            Variant::Cryptex => "Xcode_iOS_DDI_Cryptex",
+            Variant::Personalized => "Xcode_iOS_DDI_Personalized",
+        }
+    }
+
+    /// How a message names it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Variant::Cryptex => "cryptex",
+            Variant::Personalized => "personalized image",
+        }
+    }
+}
+
+/// The manifest entries that a cryptex install reads a file for.
+const CRYPTEX_ENTRIES: [&str; 4] =
+    ["Cryptex1,GenericDmg", "Cryptex1,GenericTrustCache", "Cryptex1,CryptexInfoPlist", "Cryptex1,GenericVolume"];
+
+/// A path from a manifest or a download, as a relative path that stays inside the folder it is joined to: no `..`, no
+/// root or drive, no backslash, no NUL. (What a manifest names is read from the disk and sent to a device.)
+///
+/// # Errors
+///
+/// A message that says what is wrong with the path.
+pub fn safe_relative(path: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if path.is_empty() || path.contains(['\\', '\0']) {
+        return Err(format!("{path:?} is not a relative path inside the folder"));
+    }
+    let mut clean = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => return Err(format!("{path:?} leaves the folder it is in")),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err(format!("{path:?} is not a relative path inside the folder"));
+    }
+    Ok(clean)
 }
 
 /// An archive to download the DDI folder from, and the SHA-256 it must have. There is no default: scrios does not
@@ -219,6 +285,59 @@ impl DdiFolder {
         manifest.get("ProductBuildVersion").and_then(plist::Value::as_string).map(str::to_string)
     }
 
+    /// Whether the folder has what `variant` needs: for the personalized image, what [`DdiFolder::open`] has checked
+    /// (an image next to the manifest; the device's own identity is looked for when it is mounted); for the cryptex,
+    /// a cryptex build identity in the manifest and the four files it names (image, trust cache, cryptex info and
+    /// volume root hash), each a path that stays inside the folder.
+    ///
+    /// # Errors
+    ///
+    /// A message that says what the folder lacks (an Xcode older than the cryptex install has no cryptex identity).
+    pub fn check(&self, variant: Variant) -> Result<(), String> {
+        match variant {
+            Variant::Personalized => Ok(()),
+            Variant::Cryptex => self.check_cryptex(),
+        }
+    }
+
+    fn check_cryptex(&self) -> Result<(), String> {
+        let (_, manifest) = self.read_manifest()?;
+        let identity = idevice::tss::select_cryptex_build_identity(&manifest).map_err(|_| {
+            format!(
+                "the DDI in {} has no developer disk image cryptex (no `Cryptex1,*` build identity): it is from an Xcode older than the cryptex install; use the iOS_DDI folder of a newer one",
+                self.root.display()
+            )
+        })?;
+        for entry in CRYPTEX_ENTRIES {
+            let named = entry_path(identity, entry).ok_or_else(|| {
+                format!("the cryptex identity of {} names no file for {entry}", self.manifest.display())
+            })?;
+            let relative =
+                safe_relative(named).map_err(|why| format!("{entry} in {}: {why}", self.manifest.display()))?;
+            if !self.root.join(&relative).is_file() {
+                return Err(format!(
+                    "{} is missing in {}: the folder is incomplete (copy all of iOS_DDI)",
+                    relative.display(),
+                    self.root.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The payloads of a cryptex install, read from the folder (idevice's [`Cryptex1Assets`]): the image, trust
+    /// cache, cryptex info and volume root hash the cryptex identity names, and the identity itself.
+    ///
+    /// # Errors
+    ///
+    /// The reason the folder has no usable cryptex ([`DdiFolder::check`]), or why a file could not be read.
+    pub async fn cryptex_assets(&self) -> Result<Cryptex1Assets, String> {
+        self.check(Variant::Cryptex)?;
+        Cryptex1Assets::load(&self.root)
+            .await
+            .map_err(|e| format!("cannot load the cryptex from {}: {e}", self.root.display()))
+    }
+
     /// Whether the image that `identity` names (or a conventional one) is in the folder.
     fn has_image(&self, identity: &plist::Dictionary) -> bool {
         entry_path(identity, "PersonalizedDMG").is_some_and(|p| self.root.join(p).is_file())
@@ -367,6 +486,15 @@ pub struct Found {
     pub origin: Origin,
 }
 
+impl Found {
+    /// The folder, where it came from and the build it is for, as one phrase: `/x/Restore (Xcode, build 27B48)`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let build = self.folder.build().map_or_else(String::new, |b| format!(", build {b}"));
+        format!("{} ({}{build})", self.folder.root().display(), self.origin.label())
+    }
+}
+
 impl DdiSources {
     /// The sources on this host: `dir` and `url` and `sha256` are the options, the rest is read from the
     /// environment ([`ENV_DIR`], and [`ENV_URL`] with [`ENV_SHA256`] for what the options leave out) and the host.
@@ -414,32 +542,65 @@ impl DdiSources {
         Ok(DdiSources { dir, env_dir, xcode: Vec::new(), cache: cache_dir_for(platform, get), download })
     }
 
-    /// The first DDI folder there is. A folder that was asked for (`--ddi-dir`, `$SCRIOS_DDI_DIR`) must be a DDI
-    /// folder; Xcode's and the cache are tried only if they exist.
+    /// The first DDI folder there is, of either variant (what a report says it would use when the device's way of
+    /// installing is not known; see [`DdiSources::locate_for`]). A folder that was asked for (`--ddi-dir`,
+    /// `$SCRIOS_DDI_DIR`) must be a DDI folder; Xcode's and the cache are tried only if they exist.
     ///
     /// # Errors
     ///
     /// The reason an explicit folder is not a DDI folder, or [`DdiSources::not_found`] if there is none to be found.
     pub fn locate(&self) -> Result<Found, String> {
+        self.locate_by(None)
+    }
+
+    /// The first DDI folder that has what `variant` needs ([`DdiFolder::check`]). An explicit folder that lacks it is
+    /// an error that says so; Xcode's and the cache are skipped if they lack it (and the message says that).
+    ///
+    /// # Errors
+    ///
+    /// As [`DdiSources::locate`].
+    pub fn locate_for(&self, variant: Variant) -> Result<Found, String> {
+        self.locate_by(Some(variant))
+    }
+
+    fn locate_by(&self, variant: Option<Variant>) -> Result<Found, String> {
+        let open = |dir: &Path| -> Result<DdiFolder, String> {
+            let folder = DdiFolder::open(dir)?;
+            if let Some(variant) = variant {
+                folder.check(variant)?;
+            }
+            Ok(folder)
+        };
         if let Some(dir) = &self.dir {
-            return DdiFolder::open(dir)
+            return open(dir)
                 .map(|folder| Found { folder, origin: Origin::Option })
                 .map_err(|why| format!("--ddi-dir: {why}"));
         }
         if let Some(dir) = &self.env_dir {
-            return DdiFolder::open(dir)
+            return open(dir)
                 .map(|folder| Found { folder, origin: Origin::Env })
                 .map_err(|why| format!("${ENV_DIR}: {why}"));
         }
         let tried =
             self.xcode.iter().map(|dir| (dir, Origin::Xcode)).chain(self.cache.iter().map(|dir| (dir, Origin::Cache)));
+        let mut unusable = Vec::new();
         for (dir, origin) in tried {
-            match DdiFolder::open(dir) {
+            match open(dir) {
                 Ok(folder) => return Ok(Found { folder, origin }),
-                Err(why) => debug!("no DDI in {}: {why}", dir.display()),
+                Err(why) => {
+                    debug!("no usable DDI in {}: {why}", dir.display());
+                    // A folder that is there and lacks what the variant needs is worth saying; one that is not there is not.
+                    if dir.is_dir() && DdiFolder::open(dir).is_ok() {
+                        unusable.push(why);
+                    }
+                }
             }
         }
-        Err(self.not_found())
+        let mut why = self.not_found();
+        if !unusable.is_empty() {
+            let _ = write!(why, " (skipped: {})", unusable.join("; "));
+        }
+        Err(why)
     }
 
     /// What to tell a user who has no DDI folder: where scrios looked and how to provide one.
@@ -467,7 +628,28 @@ impl DdiSources {
     ///
     /// The reason there is no usable DDI folder: what [`DdiSources::locate`] says, or why the download failed.
     pub async fn find_or_download(&self, downloading: &mut (dyn FnMut(&str) + Send)) -> Result<Found, String> {
-        let first = self.locate();
+        Box::pin(self.find_or_download_by(None, downloading)).await
+    }
+
+    /// [`DdiSources::find_or_download`] for a folder that has what `variant` needs ([`DdiSources::locate_for`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`DdiSources::find_or_download`]; an archive that lacks what the variant needs is an error too.
+    pub async fn find_or_download_for(
+        &self,
+        variant: Variant,
+        downloading: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Found, String> {
+        Box::pin(self.find_or_download_by(Some(variant), downloading)).await
+    }
+
+    async fn find_or_download_by(
+        &self,
+        variant: Option<Variant>,
+        downloading: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Found, String> {
+        let first = self.locate_by(variant);
         let (Err(why), Some(download)) = (&first, &self.download) else { return first };
         let Some(cache) = &self.cache else {
             return Err(format!(
@@ -479,6 +661,9 @@ impl DdiSources {
         }
         downloading(&host_of(&download.url));
         let folder = Box::pin(fetch(download, cache)).await?;
+        if let Some(variant) = variant {
+            folder.check(variant).map_err(|why| format!("the downloaded archive is no use: {why}"))?;
+        }
         Ok(Found { folder, origin: Origin::Cache })
     }
 }
@@ -951,5 +1136,168 @@ mod tests {
         let explicit = DdiSources { dir: Some("/nonexistent/ddi".into()), download, ..none };
         let why = Box::pin(explicit.find_or_download(&mut |_| {})).await.unwrap_err();
         assert!(why.starts_with("--ddi-dir: "), "{why}");
+    }
+
+    // ---- the cryptex variant ----------------------------------------------------------------------
+
+    use crate::testddi;
+
+    #[test]
+    fn a_path_from_a_manifest_stays_inside_its_folder() {
+        assert_eq!(safe_relative("Image.dmg").unwrap(), PathBuf::from("Image.dmg"));
+        assert_eq!(safe_relative("./Firmware/a.dmg.trustcache").unwrap(), PathBuf::from("Firmware/a.dmg.trustcache"));
+        for bad in ["", ".", "../x", "a/../../x", "/etc/passwd", "a\\b", "a\0b", "./"] {
+            assert!(safe_relative(bad).is_err(), "{bad:?} was accepted");
+        }
+        if cfg!(windows) {
+            assert!(safe_relative("C:/x").is_err());
+        }
+    }
+
+    #[test]
+    fn a_cryptex_folder_is_checked_for_its_identity_and_its_four_files() {
+        let dir = TempDir::new("ddi-cryptex");
+        testddi::cryptex_folder(&dir);
+        let folder = DdiFolder::open(dir.path()).unwrap();
+        assert!(folder.check(Variant::Cryptex).is_ok());
+        assert_eq!(folder.build().as_deref(), Some("27B52"));
+        // A file the cryptex identity names that is not there.
+        std::fs::remove_file(dir.path().join("Image.dmg.root_hash")).unwrap();
+        let why = folder.check(Variant::Cryptex).unwrap_err();
+        assert!(why.contains("Image.dmg.root_hash") && why.contains("incomplete"), "{why}");
+        // A folder with a personalized identity only (an Xcode from before the cryptex install).
+        let old = TempDir::new("ddi-cryptex-old");
+        testddi::personalized_folder(&old);
+        let folder = DdiFolder::open(old.path()).unwrap();
+        assert!(folder.check(Variant::Personalized).is_ok());
+        let why = folder.check(Variant::Cryptex).unwrap_err();
+        assert!(why.contains("no developer disk image cryptex") && why.contains("older"), "{why}");
+        // A manifest that names a file outside its folder is refused before anything is read.
+        let evil = TempDir::new("ddi-cryptex-evil");
+        evil.write("BuildManifest.plist", &testddi::manifest(None, Some(["../../etc/passwd", "t", "i", "v"])));
+        evil.write("Image.dmg", b"x");
+        let why = DdiFolder::open(evil.path()).unwrap().check(Variant::Cryptex).unwrap_err();
+        assert!(why.contains("Cryptex1,GenericDmg") && why.contains("leaves the folder"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn what_scrios_gives_cryptexd_is_the_four_payloads_and_the_identity_of_the_folder() {
+        use idevice::cryptexd::{CryptexInstallRequest, DDI_IMAGE_TYPE_INDEX, DDI_NONCE_PERSISTENCE, DDI_PERSISTENCE};
+        use idevice::xpc::XPCObject;
+        let dir = TempDir::new("ddi-assets");
+        testddi::cryptex_folder(&dir);
+        let assets = DdiFolder::open(dir.path()).unwrap().cryptex_assets().await.unwrap();
+        // The payloads are the files the identity names, the identity is the cryptex's.
+        assert_eq!(assets.image, testddi::CRYPTEX_IMAGE);
+        assert_eq!(assets.trustcache, testddi::CRYPTEX_TRUSTCACHE);
+        assert_eq!(assets.info, testddi::CRYPTEX_INFO);
+        assert_eq!(assets.volumehash, testddi::CRYPTEX_VOLUME);
+        assert_eq!(assets.nonce_domain().unwrap(), testddi::NONCE_DOMAIN);
+        // The `Cryptex1,*` parameters of the install request: unsigned integers (a signed one is refused by the
+        // device), the identity's own values, and `MountedCryptex` false, as Xcode sends them.
+        let properties = assets.cryptex1_properties().unwrap();
+        let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "Cryptex1,NonceDomain",
+                "Cryptex1,PreauthVersion",
+                "Cryptex1,SubType",
+                "Cryptex1,UseProductClass",
+                "Cryptex1,Version",
+                "MountedCryptex",
+            ]
+        );
+        assert!(
+            matches!(properties.get("Cryptex1,NonceDomain"), Some(XPCObject::UInt64(n)) if *n == testddi::NONCE_DOMAIN)
+        );
+        assert!(matches!(properties.get("Cryptex1,SubType"), Some(XPCObject::UInt64(2))));
+        assert!(matches!(properties.get("MountedCryptex"), Some(XPCObject::Bool(false))));
+        // The request that `install_ddi` makes of them: Xcode's DDI parameters.
+        let request = CryptexInstallRequest::new(
+            assets.image.clone(),
+            assets.trustcache.clone(),
+            b"ticket".to_vec(),
+            assets.info.clone(),
+            assets.volumehash.clone(),
+            properties,
+        );
+        assert_eq!(
+            (request.image_type_index, request.persistence, request.nonce_persistence, request.auth),
+            (DDI_IMAGE_TYPE_INDEX, DDI_PERSISTENCE, DDI_NONCE_PERSISTENCE, 0)
+        );
+        assert_eq!((DDI_IMAGE_TYPE_INDEX, DDI_PERSISTENCE, DDI_NONCE_PERSISTENCE), (10, 2, 1));
+        // And the ticket request it signs: the identity has what Apple's signing server is asked about.
+        let mut chip = plist::Dictionary::new();
+        chip.insert("img4_chip_chip".into(), 0x8140_u64.into());
+        chip.insert("img4_chip_ecid".into(), 0x1234_u64.into());
+        chip.insert("img4_chip_cpro".into(), true.into());
+        let mut ticket = idevice::tss::TSSRequest::new();
+        ticket.add_cryptex1_tags(&assets.build_identity, &chip, &[1, 2, 3]).unwrap();
+        let sent = format!("{ticket:?}");
+        for want in ["@Cryptex1,Ticket", "Cryptex1,ChipID", "Cryptex1,Nonce", "Cryptex1,UDID"] {
+            assert!(sent.contains(want), "{want} missing from the ticket request");
+        }
+        // A folder that has no cryptex gives no assets.
+        let old = TempDir::new("ddi-assets-old");
+        testddi::personalized_folder(&old);
+        let why = DdiFolder::open(old.path()).unwrap().cryptex_assets().await.unwrap_err();
+        assert!(why.contains("no developer disk image cryptex"), "{why}");
+    }
+
+    #[test]
+    fn the_source_that_has_the_form_the_device_takes_is_the_one_found() {
+        let (xcode, cache) = (TempDir::new("ddi-form-x"), TempDir::new("ddi-form-c"));
+        testddi::personalized_folder(&xcode);
+        testddi::cryptex_folder(&cache);
+        let sources =
+            DdiSources { xcode: vec![xcode.path().into()], cache: Some(cache.path().into()), ..DdiSources::default() };
+        // Xcode's folder is first and will do for the image mounter; the cryptex is the cache's.
+        assert_eq!(sources.locate_for(Variant::Personalized).unwrap().origin, Origin::Xcode);
+        assert_eq!(sources.locate_for(Variant::Cryptex).unwrap().origin, Origin::Cache);
+        assert_eq!(sources.locate().unwrap().origin, Origin::Xcode);
+        // With only a folder that has no cryptex, the message says what was skipped and why.
+        let sources = DdiSources { cache: None, ..sources };
+        let why = sources.locate_for(Variant::Cryptex).unwrap_err();
+        assert!(why.contains("no developer disk image") && why.contains("skipped") && why.contains("cryptex"), "{why}");
+        // A folder that was asked for and has no cryptex is an error, not a fall back.
+        let explicit = DdiSources { dir: Some(xcode.path().into()), cache: Some(cache.path().into()), ..sources };
+        let why = explicit.locate_for(Variant::Cryptex).unwrap_err();
+        assert!(why.starts_with("--ddi-dir: ") && why.contains("no developer disk image cryptex"), "{why}");
+        assert_eq!(explicit.locate_for(Variant::Personalized).unwrap().origin, Origin::Option);
+        // What a report says it found.
+        let found = explicit.locate_for(Variant::Personalized).unwrap();
+        assert_eq!(found.describe(), format!("{} (--ddi-dir, build 27B52)", xcode.path().display()));
+    }
+
+    #[test]
+    fn the_variants_name_their_folders_in_the_repository() {
+        assert_eq!(Variant::Cryptex.folder(), "Xcode_iOS_DDI_Cryptex");
+        assert_eq!(Variant::Personalized.folder(), "Xcode_iOS_DDI_Personalized");
+        assert_ne!(Variant::Cryptex.label(), Variant::Personalized.label());
+    }
+
+    /// For a person: `SCRIOS_TEST_CRYPTEX_DIR=<a real DDI folder> cargo test --lib real_cryptex_folder -- --ignored`
+    /// (the folder `scrios ddi-fetch` fills, or Xcode's `Restore`). Reads the files; touches no device.
+    #[tokio::test]
+    #[ignore = "needs a real DDI folder in $SCRIOS_TEST_CRYPTEX_DIR"]
+    async fn a_real_cryptex_folder_loads_the_way_cryptexd_install_reads_it() {
+        let dir = std::env::var("SCRIOS_TEST_CRYPTEX_DIR").expect("SCRIOS_TEST_CRYPTEX_DIR");
+        let folder = DdiFolder::open(Path::new(&dir)).unwrap();
+        folder.check(Variant::Cryptex).unwrap();
+        let assets = folder.cryptex_assets().await.unwrap();
+        let properties = assets.cryptex1_properties().unwrap();
+        println!(
+            "build {:?}: image {} bytes, trust cache {}, info {}, volume hash {}, nonce domain {}, {} properties",
+            folder.build(),
+            assets.image.len(),
+            assets.trustcache.len(),
+            assets.info.len(),
+            assets.volumehash.len(),
+            assets.nonce_domain().unwrap(),
+            properties.len()
+        );
+        assert!(!assets.image.is_empty() && !assets.trustcache.is_empty() && !assets.volumehash.is_empty());
     }
 }

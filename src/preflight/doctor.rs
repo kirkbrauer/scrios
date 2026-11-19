@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use super::{Blocker, Ops, Target, listed_or_nothing};
 use crate::ddi::DdiSources;
 use crate::mux::{Choice, Mux, PairLookup, choose, usbmuxd_hint};
-use crate::ops::{DevError, Device};
+use crate::ops::{DevError, Device, Route};
 
 /// How a check came out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +113,7 @@ pub(crate) async fn run_with<O: Ops>(
         for name in ["device", "pairing", "developer mode", "developer disk image"] {
             report.push(Check::skipped(name, "usbmuxd"));
         }
-        report.push(image_source(&opts.ddi, None));
+        report.push(image_source(&opts.ddi, None, None));
         report.push(Check::skipped("display service", "usbmuxd"));
         return report;
     };
@@ -122,7 +122,7 @@ pub(crate) async fn run_with<O: Ops>(
         for name in ["pairing", "developer mode", "developer disk image"] {
             report.push(Check::skipped(name, "a device"));
         }
-        report.push(image_source(&opts.ddi, None));
+        report.push(image_source(&opts.ddi, None, None));
         report.push(Check::skipped("display service", "a device"));
         return report;
     };
@@ -130,7 +130,7 @@ pub(crate) async fn run_with<O: Ops>(
         for name in ["developer mode", "developer disk image"] {
             report.push(Check::skipped(name, "a device that trusts this computer"));
         }
-        report.push(image_source(&opts.ddi, None));
+        report.push(image_source(&opts.ddi, None, None));
         report.push(Check::skipped("display service", "a device that trusts this computer"));
         return report;
     }
@@ -140,13 +140,25 @@ pub(crate) async fn run_with<O: Ops>(
     // report a personalized image that is mounted): ask for it first, and the image mounter only when it is absent.
     let display = if mode_ok { Some(check_display_service(&on_device).await) } else { None };
     let offered = display.as_ref().is_some_and(|check| check.status == Status::Ok);
+    // The cryptex that cryptexd lists as installed is the sure word on a cryptex install; it is told when there is one.
+    let cryptex = on_device
+        .installed_cryptex()
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(String::new, |c| format!("; cryptex {} {} is installed", c.identifier, c.version));
     let mounted = if offered {
-        report.push(Check::ok("developer disk image", "mounted (the device offers the display service)"));
+        report.push(Check::ok(
+            "developer disk image",
+            format!("mounted (the device offers the display service{cryptex})"),
+        ));
         Some(true)
     } else {
-        check_image_mounted(&on_device, &mut report).await
+        check_image_mounted(&on_device, &cryptex, &mut report).await
     };
-    report.push(image_source(&opts.ddi, Some(mounted == Some(true))));
+    // Which form of the image the device takes decides which folder is any use.
+    let route = if mode_ok { on_device.route().await.ok() } else { None };
+    report.push(image_source(&opts.ddi, Some(mounted == Some(true)), route));
     report.push(display.unwrap_or_else(|| Check::skipped("display service", "Developer Mode")));
     report
 }
@@ -268,10 +280,11 @@ async fn check_developer_mode<O: Ops>(on_device: &O, udid: &str, report: &mut Re
     }
 }
 
-async fn check_image_mounted<O: Ops>(on_device: &O, report: &mut Report) -> Option<bool> {
+async fn check_image_mounted<O: Ops>(on_device: &O, cryptex: &str, report: &mut Report) -> Option<bool> {
     match on_device.image_mounted().await {
         Ok(true) => {
-            report.push(Check::ok("developer disk image", "mounted"));
+            let note = cryptex.strip_prefix("; ").map_or_else(String::new, |note| format!(" ({note})"));
+            report.push(Check::ok("developer disk image", format!("mounted{note}")));
             Some(true)
         }
         Ok(false) => {
@@ -289,13 +302,18 @@ async fn check_image_mounted<O: Ops>(on_device: &O, report: &mut Report) -> Opti
     }
 }
 
-/// Where the image to mount would come from. `mounted`: whether the device has it mounted already (then not finding
-/// one is no failure), if that is known.
-fn image_source(ddi: &DdiSources, mounted: Option<bool>) -> Check {
-    match ddi.locate() {
+/// Where the image to install would come from. `mounted`: whether the device has it already (then not finding one is
+/// no failure), if that is known. `route`: how the device takes the image, if that is known: it decides which form of
+/// the image is any use.
+fn image_source(ddi: &DdiSources, mounted: Option<bool>, route: Option<Route>) -> Check {
+    let located = match route {
+        Some(route) => ddi.locate_for(route.variant()),
+        None => ddi.locate(),
+    };
+    match located {
         Ok(found) => {
-            let build = found.folder.build().map_or_else(String::new, |b| format!(", build {b}"));
-            Check::ok("image source", format!("{} ({}{build})", found.folder.root().display(), found.origin.label()))
+            let form = route.map_or_else(String::new, |route| format!("{}: ", route.variant().label()));
+            Check::ok("image source", format!("{form}{}", found.describe()))
         }
         Err(why) if mounted == Some(true) => {
             Check::ok("image source", format!("none found, not needed now: the image is mounted ({why})"))
@@ -494,6 +512,43 @@ mod tests {
         assert_eq!(by_name[6], ("display service", Status::Fail));
         assert!(report.checks[5].detail.contains("not needed now"));
         assert!(report.checks[6].fix.as_deref().is_some_and(|f| f.contains("iOS 27")));
+    }
+
+    #[tokio::test]
+    async fn on_the_cryptexd_route_the_cryptex_is_told_and_the_folder_that_counts_is_one_with_a_cryptex() {
+        use crate::ops::Route;
+        use crate::testddi;
+        let fake = FakeMux::tcp();
+        fake.attach_usb(UDID, 1);
+        fake.set_pair_record(UDID, pair_record_bytes(UDID));
+        let device = FakeDevice::default();
+        device.with(|s| {
+            s.route = VecDeque::from([Ok(Route::Cryptexd)]);
+            s.display_service = VecDeque::from([Ok(true)]);
+            s.installed = VecDeque::from([Ok(Some(crate::testops::fake_cryptex()))]);
+        });
+        let cryptex = TempDir::new("doctor-cryptex");
+        testddi::cryptex_folder(&cryptex);
+        let ddi = DdiSources { dir: Some(cryptex.path().to_path_buf()), ..DdiSources::default() };
+        let report = run_with(&opts(&fake, ddi), |_, _| device.clone()).await;
+        assert!(report.passed(), "{}", report.render());
+        assert!(
+            report.checks[4].detail.contains("cryptex com.apple.MobileAsset.DDI 27.2.52.0 is installed"),
+            "{}",
+            report.render()
+        );
+        assert!(report.checks[5].detail.starts_with("cryptex: "), "{}", report.render());
+        // A folder with no cryptex, for a device that takes one and has none: the source check fails and says why.
+        let device = FakeDevice::default();
+        device.with(|s| {
+            s.route = VecDeque::from([Ok(Route::Cryptexd)]);
+            s.mounted = VecDeque::from([Ok(false)]);
+        });
+        let (_dir, personalized) = ddi_folder();
+        let xcode = DdiSources { dir: None, xcode: vec![personalized.dir.clone().unwrap()], ..personalized };
+        let report = run_with(&opts(&fake, xcode), |_, _| device.clone()).await;
+        assert_eq!(report.checks[5].status, Status::Fail, "{}", report.render());
+        assert!(report.checks[5].fix.as_deref().is_some_and(|f| f.contains("cryptex")), "{}", report.render());
     }
 
     #[tokio::test]
