@@ -1,6 +1,6 @@
 # Building
 
-You need Rust 1.89 or newer, a C compiler, and a C++ compiler for the window.
+You need [Rust](https://www.rust-lang.org/tools/install) 1.89 or newer, a C compiler, and a C++ compiler for the window.
 
 ```
 cargo build --release --locked
@@ -30,7 +30,7 @@ cargo zigbuild --release --locked --no-default-features --target aarch64-unknown
 
 ## Windows
 
-Use the MSVC toolchain: Visual Studio Build Tools with the C++ workload.
+Use the MSVC toolchain: [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the C++ workload.
 
 ```
 cargo build --release --locked
@@ -46,7 +46,7 @@ cargo test --no-default-features --locked
 cargo deny check
 ```
 
-The tests need no device and no network. CI runs them on Linux, macOS and Windows.
+`cargo deny` is [cargo-deny](https://github.com/EmbarkStudios/cargo-deny). The tests need no device and no network. CI runs them on Linux, macOS and Windows.
 
 `scripts/smoke.sh target/release/scrios` runs a release binary through its commands without a device.
 

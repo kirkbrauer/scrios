@@ -9,7 +9,7 @@ device --RTP over the CoreDevice tunnel--> scrios --H.264--> window, file or pro
        <------------- HID touch and keys ---------------
 ```
 
-1. scrios finds the device through usbmuxd and opens the CoreDevice tunnel. The
+1. scrios finds the device through [usbmuxd](https://github.com/libimobiledevice/usbmuxd) and opens the CoreDevice tunnel. The
    [idevice](https://github.com/jkcoxson/idevice) crate does this.
 2. It asks the display service to start a video stream. The device sends RTP packets.
 3. scrios reassembles the packets into pictures and passes them on.

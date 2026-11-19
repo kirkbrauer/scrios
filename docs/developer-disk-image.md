@@ -1,7 +1,7 @@
 # The developer disk image
 
-An iOS device only offers its screen to developer tools after Apple's developer disk image is installed on it. Xcode
-does this for you. So does scrios.
+An iOS device only offers its screen to developer tools after Apple's developer disk image is installed on it.
+[Xcode](https://developer.apple.com/xcode/) does this for you. So does scrios.
 
 You normally do not need to do anything. This page is for when you want to control where the image comes from.
 
@@ -20,8 +20,8 @@ The cache folder is `~/Library/Caches/scrios/ddi` on macOS, `~/.cache/scrios/ddi
 ## The download
 
 The image is Apple's, and scrios does not host it. It downloads the files from
-[doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage), a repository run by the pymobiledevice3
-project that republishes the image Xcode ships.
+[doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage), a repository run by the
+[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) project that republishes the image Xcode ships.
 
 - The download is about 18 MB and is kept in the cache folder.
 - It is pinned to one commit of that repository.

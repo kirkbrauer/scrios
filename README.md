@@ -1,6 +1,6 @@
 # scrios
 
-scrcpy for iOS: see and control an iPhone or iPad from your computer, over USB.
+[scrcpy](https://github.com/Genymobile/scrcpy) for iOS: see and control an iPhone or iPad from your computer, over USB.
 
 - Works on Linux, macOS and Windows
 - No jailbreak, and nothing to install on the device
@@ -12,14 +12,14 @@ scrcpy for iOS: see and control an iPhone or iPad from your computer, over USB.
 
 On the device (iOS 27):
 
-1. Turn on **Developer Mode** in Settings > Privacy & Security.
+1. Turn on [Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device) in Settings > Privacy & Security.
 2. Plug it in and tap **Trust**.
 
 On the computer:
 
 - **macOS**: nothing to install.
-- **Linux**: install `usbmuxd`.
-- **Windows**: install the Apple Devices app or iTunes.
+- **Linux**: install [usbmuxd](https://github.com/libimobiledevice/usbmuxd). Most distributions have a `usbmuxd` package.
+- **Windows**: install the [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) app or [iTunes](https://www.apple.com/itunes/).
 
 ## Get scrios
 
@@ -39,7 +39,7 @@ scrios
 
 A window opens with the device's screen. Click and drag to touch, type to type, close the window to stop.
 
-The first run downloads Apple's developer disk image and installs it on the device, so it needs internet access.
+The first run downloads Apple's [developer disk image](docs/developer-disk-image.md) and installs it on the device, so it needs internet access.
 If something goes wrong, run `scrios doctor`.
 
 ## Examples
@@ -51,6 +51,8 @@ scrios --udid 00008110-001234567890401E   # pick a device (see `scrios list`)
 scrios stream | ffplay -f h264 -       # no window: send the video to a player
 scrios stream --format framed | my-program   # video, events and control for a program
 ```
+
+`ffplay` is part of [FFmpeg](https://ffmpeg.org/).
 
 ## Shortcuts
 
@@ -73,7 +75,7 @@ scrios stream --format framed | my-program   # video, events and control for a p
 - [How it works](docs/internals.md)
 - [Building](BUILD.md)
 
-scrios uses the developer services Xcode uses, through the [idevice](https://github.com/jkcoxson/idevice) library.
+scrios uses the developer services [Xcode](https://developer.apple.com/xcode/) uses, through the [idevice](https://github.com/jkcoxson/idevice) library.
 Built against **idevice 0.1.68**.
 
 ## License

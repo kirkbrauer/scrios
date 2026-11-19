@@ -43,7 +43,7 @@ For `scrios` only.
 | `--window-title TITLE` | The window title. |
 | `--window-width N`, `--window-height N` | The largest size the window opens at. |
 | `--show-stats` | Show the frame rate and delay in the title. |
-| `--decoder auto\|platform\|software` | The H.264 decoder. `platform` is VideoToolbox on macOS. `software` is OpenH264. `auto` tries the platform decoder first. |
+| `--decoder auto\|platform\|software` | The H.264 decoder. `platform` is [VideoToolbox](https://developer.apple.com/documentation/videotoolbox) on macOS. `software` is [OpenH264](https://www.openh264.org/). `auto` tries the platform decoder first. |
 | `--edge-margin N` | Add a band around the picture. A press in the band lands on the very edge of the screen, which makes edge swipes easier. Try 24. |
 | `--bottom-swipe keys\|touch` | What a drag up from the bottom edge does. See [the bottom swipe](#the-bottom-swipe). |
 | `--lock-shortcut` | Let `MOD+P` lock the device. Off by default so you cannot lock yourself out by accident. |
@@ -68,13 +68,13 @@ Where the video ends up:
 | `scrios stream --record FILE --output -` | The file and standard output. |
 
 scrios refuses to write video to a terminal. Recordings are raw H.264 (`.h264`) or HEVC (`.h265`), not MP4. To get an
-MP4:
+MP4, use [FFmpeg](https://ffmpeg.org/):
 
 ```
 ffmpeg -f h264 -i screen.h264 -c copy screen.mp4
 ```
 
-For a live view in `ffplay` with low delay:
+For a live view in [ffplay](https://ffmpeg.org/ffplay.html) with low delay:
 
 ```
 scrios stream | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -
@@ -119,10 +119,10 @@ Other drags that start at the bottom are sent as normal touch. Use `--bottom-swi
 
 Before it connects, scrios checks each of these and waits for the ones you can fix:
 
-1. usbmuxd is running.
+1. [usbmuxd](https://github.com/libimobiledevice/usbmuxd) is running.
 2. A device is plugged in.
 3. The device trusts the computer. Unlock it and tap **Trust**.
-4. Developer Mode is on. scrios shows the switch in Settings and prints the steps. It does not turn it on for you.
+4. [Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device) is on. scrios shows the switch in Settings and prints the steps. It does not turn it on for you.
 5. The developer disk image is installed. scrios installs it. See [developer-disk-image.md](developer-disk-image.md).
 
 `scrios doctor` runs the same checks without waiting and prints `ok` or `FAIL` for each, with the fix:
@@ -156,7 +156,7 @@ This has not been tried on a real device yet.
 
 ## Windows
 
-- Install the Apple Devices app or iTunes. scrios talks to its service on `127.0.0.1:27015`.
+- Install the [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) app or [iTunes](https://www.apple.com/itunes/). scrios talks to its service on `127.0.0.1:27015`.
 - Stop with Ctrl-C.
 - Windows PowerShell 5.1 corrupts piped video. Use `--record FILE` or `--output FILE`, or run the pipe in `cmd.exe`.
   PowerShell 7.4 and later are fine.
@@ -182,6 +182,8 @@ This has not been tried on a real device yet.
 Logs go to standard error. Stopping can take a few seconds while the device ends the stream.
 
 ## Compared with scrcpy
+
+For people who know [scrcpy](https://github.com/Genymobile/scrcpy):
 
 | scrcpy | scrios |
 | --- | --- |

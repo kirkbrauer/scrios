@@ -28,6 +28,8 @@ Run a debug build now and then as well. It is slower, but it catches integer ove
 
 ## Checking the SPS rewrite against ffmpeg
 
+This needs [FFmpeg](https://ffmpeg.org/).
+
 The rewrite must not change how a stream decodes. `rewrite_sps` applies it to a file so you can compare:
 
 ```
