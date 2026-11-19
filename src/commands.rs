@@ -8,7 +8,7 @@
 //!   ignores `short|long`.
 //! * `kb down|up <usage>`: a key of the HID keyboard page, by its usage in hex (`04` is A, `e1` is
 //!   Left Shift); `kb type <base64>`: type a UTF-8 string.
-//! * End of input is `stop` ([`read_commands`]; the `scrios` binary uses [`AtEof::Stop`] only for the framed format, a
+//! * End of input is `stop` ([`read_commands_at`]; the `scrios` binary uses [`AtEof::Stop`] only for the framed format, a
 //!   machine that closes its end to say it is done: a raw stream or a recording runs on, since a script or `nohup` has
 //!   no terminal to read).
 //! * Anything else is logged and ignored; a `touch` or `key` that is malformed is reported.
@@ -292,13 +292,8 @@ pub enum AtEof {
     Ignore,
 }
 
-/// Reads lines from `input` and sends the commands to `tx`; at end of input sends [`Command::Stop`].
-/// Returns when the input ends or `tx` is closed.
-pub async fn read_commands<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Command>) {
-    read_commands_at(input, tx, AtEof::Stop).await;
-}
-
-/// [`read_commands`] with the meaning of the end of input given: [`AtEof::Ignore`] sends no [`Command::Stop`] there
+/// Reads lines from `input` and sends the commands to `tx`, until the input ends or `tx` is closed. What the end of
+/// input means is given: [`AtEof::Ignore`] sends no [`Command::Stop`] there
 /// (a last line without a newline is still a command).
 pub async fn read_commands_at<R: AsyncRead + Unpin>(input: R, tx: mpsc::Sender<Command>, at_eof: AtEof) {
     let mut reader = BufReader::new(input);
@@ -393,7 +388,7 @@ mod tests {
 
     async fn run(input: &[u8]) -> Vec<Command> {
         let (tx, mut rx) = mpsc::channel(64);
-        read_commands(input, tx).await;
+        read_commands_at(input, tx, AtEof::Stop).await;
         let mut v = Vec::new();
         while let Ok(c) = rx.try_recv() {
             v.push(c);
@@ -736,7 +731,7 @@ mod tests {
     async fn a_reader_that_ends_normally_adds_nothing() {
         let (tx, mut rx) = mpsc::channel(4);
         let tx2 = tx.clone();
-        supervised(async move { read_commands(&b"keyframe\n"[..], tx2).await }, tx).await;
+        supervised(async move { read_commands_at(&b"keyframe\n"[..], tx2, AtEof::Stop).await }, tx).await;
         assert_eq!(rx.recv().await, Some(Command::Keyframe));
         assert_eq!(rx.recv().await, Some(Command::Stop)); // the reader's own, at end of input
         assert_eq!(rx.recv().await, None, "and no second one from the supervisor");
@@ -763,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn read_commands_is_the_stop_at_the_end_of_input() {
         let (tx, mut rx) = mpsc::channel(8);
-        read_commands(&b""[..], tx).await;
+        read_commands_at(&b""[..], tx, AtEof::Stop).await;
         assert_eq!(rx.recv().await, Some(Command::Stop));
     }
 
@@ -772,6 +767,6 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         // Must return rather than wait for more input.
-        read_commands(&b"keyframe\nkeyframe\n"[..], tx).await;
+        read_commands_at(&b"keyframe\nkeyframe\n"[..], tx, AtEof::Stop).await;
     }
 }

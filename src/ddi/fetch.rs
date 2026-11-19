@@ -189,16 +189,10 @@ impl Plan {
         Ok(Plan { variant, source: mirror.label.clone(), build: None, subdir: mirror.subdir.clone(), files })
     }
 
-    /// The folder of the cache (`cache` is [`super::cache_dir`]) where the files are kept.
+    /// The folder of the cache (`cache` is [`super::cache_dir_for`]) where the files are kept.
     #[must_use]
     pub fn dir_in(&self, cache: &Path) -> PathBuf {
         cache.join(&self.subdir).join(self.variant.folder())
-    }
-
-    /// How many bytes the files are in all, if each size is known.
-    #[must_use]
-    pub fn total_bytes(&self) -> Option<u64> {
-        self.files.iter().try_fold(0_u64, |sum, file| file.size.map(|size| sum.saturating_add(size)))
     }
 
     /// The folder in the cache, if every file of it is there and has the size and SHA-256 it must have (the files are
@@ -634,7 +628,6 @@ mod tests {
                 pin::COMMIT
             )
         );
-        assert_eq!(cryptex.total_bytes(), Some(pin::CRYPTEX_FILES.iter().map(|f| f.size).sum()));
         assert_eq!(Plan::pinned(Variant::Personalized).unwrap().files.len(), 3);
         assert_eq!(cryptex.dir_in(Path::new("/c")), Path::new("/c").join(pin::BUILD).join("Xcode_iOS_DDI_Cryptex"));
         // Every file of both variants is downloaded from the host that serves the pinned commit, over https.
@@ -670,7 +663,6 @@ mod tests {
         assert_eq!(mirror.label(), "mirror.example:8443/ddi");
         let plan = Plan::mirror(&mirror, Variant::Cryptex).unwrap();
         assert_eq!(plan.build, None);
-        assert_eq!(plan.total_bytes(), None);
         assert!(plan.subdir.starts_with("mirror-") && plan.subdir.len() == "mirror-".len() + 16, "{}", plan.subdir);
         let image = plan.files.iter().find(|f| f.name == "Image.dmg").unwrap();
         assert_eq!(

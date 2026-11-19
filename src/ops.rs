@@ -718,16 +718,6 @@ impl Device {
         }
     }
 
-    /// Unmounts the developer disk image through the image mounter (`/System/Developer` on iOS 17 and later,
-    /// `/Developer` before). [`Device::remove_ddi`] uninstalls the cryptex instead where the image is one.
-    ///
-    /// # Errors
-    ///
-    /// Why the device could not be asked, or refused.
-    pub async fn unmount_ddi(&self) -> Result<(), DevError> {
-        self.unmount_ddi_path().await.map(|_| ())
-    }
-
     async fn unmount_ddi_path(&self) -> Result<String, DevError> {
         let version = self.product_version().await?;
         let path = if major(&version) < FIRST_PERSONALIZED_IOS { "/Developer" } else { "/System/Developer" };

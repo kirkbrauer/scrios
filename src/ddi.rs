@@ -16,7 +16,7 @@
 //! 1. the folder given (`--ddi-dir`),
 //! 2. `$SCRIOS_DDI_DIR`,
 //! 3. on macOS, the folders Xcode installs the image in,
-//! 4. a per-user cache folder (see [`cache_dir`]): a folder copied there from a Mac with Xcode, an archive that was
+//! 4. a per-user cache folder (see [`cache_dir_for`]): a folder copied there from a Mac with Xcode, an archive that was
 //!    downloaded ([`Download`]: a URL and the SHA-256 it must match), or the files that were downloaded from the
 //!    `DeveloperDiskImage` repository before ([`fetch`]: checked against their SHA-256 every time they are used);
 //! 5. and, in [`DdiMode::Auto`] (the command line's default), a download of those files: from the commit that
@@ -283,12 +283,6 @@ impl DdiFolder {
         &self.root
     }
 
-    /// The build manifest.
-    #[must_use]
-    pub fn manifest(&self) -> &Path {
-        &self.manifest
-    }
-
     /// The manifest as it is on disk (what the mounter sends to Apple's signing server) and parsed.
     ///
     /// # Errors
@@ -452,12 +446,6 @@ pub fn cache_dir_for(platform: Platform, get: &dyn Fn(&str) -> Option<String>) -
     Some(base.join("scrios").join("ddi"))
 }
 
-/// The cache folder on this host (see [`cache_dir_for`]).
-#[must_use]
-pub fn cache_dir() -> Option<PathBuf> {
-    cache_dir_for(Platform::current(), &|name| std::env::var(name).ok())
-}
-
 /// The folders Xcode may have installed the iOS image in. `selected` is what `xcode-select -p` printed (the
 /// developer directory of the selected Xcode), if it printed anything. These paths are from what Xcode is known to
 /// do, not checked against every Xcode: only the ones that exist are used.
@@ -613,22 +601,6 @@ impl Found {
 }
 
 impl DdiSources {
-    /// The sources on this host: `dir` and `url` and `sha256` are the options, the rest is read from the
-    /// environment ([`ENV_DIR`], and [`ENV_URL`] with [`ENV_SHA256`] for what the options leave out) and the host.
-    /// This is [`DdiSources::from_options`] with no other option: [`DdiMode::Auto`], the pinned image.
-    ///
-    /// # Errors
-    ///
-    /// A message if only one of the URL and the hash is given, or either is malformed.
-    pub fn from_host(dir: Option<PathBuf>, url: Option<&str>, sha256: Option<&str>) -> Result<DdiSources, String> {
-        DdiSources::from_options(&DdiOptions {
-            dir,
-            download_url: url.map(str::to_string),
-            sha256: sha256.map(str::to_string),
-            ..DdiOptions::default()
-        })
-    }
-
     /// The sources the command line asks for: `opts` are the options, and what they leave out is read from the
     /// environment ([`ENV_DIR`], [`ENV_URL`], [`ENV_SHA256`], [`ENV_SOURCE`], [`ENV_REPO`], [`ENV_REF`],
     /// [`ENV_MANIFEST`]) and the host. With nothing given the mode is [`DdiMode::Auto`] and the image is the pinned one.
@@ -705,7 +677,7 @@ impl DdiSources {
     ///
     /// # Errors
     ///
-    /// The same as [`DdiSources::from_host`].
+    /// The same as [`DdiSources::from_options`].
     pub fn for_platform(
         platform: Platform,
         dir: Option<PathBuf>,
@@ -899,24 +871,6 @@ impl DdiSources {
     /// The reason there is no usable DDI folder: what [`DdiSources::locate`] says, or why the download failed.
     pub async fn find_or_download(&self, downloading: &mut (dyn FnMut(&str) + Send)) -> Result<Found, String> {
         Box::pin(self.obtain_by(None, &mut |event| {
-            if let DdiEvent::Archive { host } = event {
-                downloading(&host);
-            }
-        }))
-        .await
-    }
-
-    /// [`DdiSources::find_or_download`] for a folder that has what `variant` needs ([`DdiSources::locate_for`]).
-    ///
-    /// # Errors
-    ///
-    /// As [`DdiSources::find_or_download`]; an archive that lacks what the variant needs is an error too.
-    pub async fn find_or_download_for(
-        &self,
-        variant: Variant,
-        downloading: &mut (dyn FnMut(&str) + Send),
-    ) -> Result<Found, String> {
-        Box::pin(self.obtain_by(Some(variant), &mut |event| {
             if let DdiEvent::Archive { host } = event {
                 downloading(&host);
             }

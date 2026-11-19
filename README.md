@@ -1,349 +1,157 @@
 # scrios
 
-**scrios** ("screen iOS") shows and controls the screen of an iPhone or iPad from a Linux, macOS or Windows host: it streams
-the screen as **H.264** (or HEVC) and sends **touch, hardware keys and keyboard text** back to the device. Think of
-it as scrcpy, but for iOS devices: a small command-line program with a [viewer window](#viewer), and a Rust library to
-embed.
+scrcpy for iOS. scrios shows an iPhone or iPad's screen on your computer and lets you control it with the mouse and
+keyboard. It can also write the screen as an H.264 stream for a browser, a player, or another program.
 
-- `scrios` opens a **window** with the device's screen: click and drag to touch, type to type, Cmd+H (Alt+H on Linux
-  and Windows) for Home. `scrios stream` is the same stream without a window, for players and programs.
-- The video is plain Annex-B H.264/HEVC: write it to a file or pipe it into `ffplay` (see [docs/cli.md](docs/cli.md) for the flags that keep it live), or use the documented
-  framed mode (`--format framed`), with timestamps, key-unit markers and control events, for programs that consume
-  it.
-- Control is a line protocol on standard input: touch down/move/up, keys (home, app switcher, lock, volume, …),
-  keyboard keys and text, a keyframe request, and stop.
-
-## How it works, and what the device needs
-
-scrios uses Apple's own developer services: the **CoreDevice display service and HID service** that Xcode uses,
-reached over the standard usbmuxd/RemoteXPC tunnel. These are official Apple developer services, but they are not
-publicly documented. **No jailbreak is needed**; the device only needs:
-
-- **Developer Mode** enabled (Settings > Privacy & Security > Developer Mode);
-- to be **paired/trusted** with the host (the pair record is in usbmuxd, which is the only place scrios reads it);
-- the **developer disk image** installed, which scrios does itself: from the `iOS_DDI` folder of Xcode if the host has
-  one, else from a download it checks (see [Prerequisites](#prerequisites)); no other tool (go-ios, pymobiledevice3) is
-  needed.
-
-scrios works like scrcpy, with no extra steps: `scrios` waits for the device ("Plug in and unlock your iPhone or iPad"),
-for Trust ("Unlock the device and tap Trust") and for Developer Mode (it reveals the switch and prints the steps), and
-installs the developer disk image if it is missing. It never turns Developer Mode on by itself and never pairs: the device's
-owner does that on the device (`scrios developer-mode --enable --yes` turns Developer Mode on when you ask for it by name).
-`scrios doctor` checks everything and says how to fix what is missing.
-
-The CoreDevice, RemoteXPC, usbmuxd and lockdown protocols come from the [idevice](https://github.com/jkcoxson/idevice)
-crate by Jackson Coxson (MIT), pinned to one release. scrios adds the display stream on top: the offer, the RTP
-depacketizer (RFC 6184 for H.264, RFC 7798 for HEVC), parameter-set handling, an H.264 SPS rewrite so that
-browsers' hardware decoders do not buffer frames, RTCP, keyframe requests, display size/orientation tracking, and
-the touch mapping onto the device's digitizer. Details: [docs/internals.md](docs/internals.md).
+It works over USB on Linux, macOS and Windows. The device does not need a jailbreak or an app installed.
 
 ```
-device --RTP H.264/HEVC over the CoreDevice tunnel--> scrios --Annex-B or framed--> stdout / file / your program
-       <-------------- HID touch / keys / text -------------- stdin: one command per line
+scrios                               # open a window with the device's screen
+scrios stream | ffplay -f h264 -     # the same video, headless, into a player
+scrios stream --record screen.h264   # record it
 ```
 
-### Compatibility
+## Requirements
 
-Built against **idevice 0.1.68** (pinned exactly; see [BUILD.md](BUILD.md#idevice)).
+**On the device**
 
-### Tested on
+- iOS 27. Older versions are untested and may not send the stream.
+- Developer Mode turned on (Settings > Privacy & Security > Developer Mode).
+- The computer trusted: tap **Trust** when the device asks.
 
-The display stream and touch were tested, on an earlier build of scrios, with the devices below. This build (idevice
-0.1.68) has streamed and recorded an iPhone's screen on macOS; touch on it is not yet checked.
+**On the computer**
 
-- iPhone 16 Pro, iOS 27.2
-- iPad (iPad14,3), iOS 27.0.1
+| | What you need |
+| --- | --- |
+| macOS | Nothing extra. |
+| Linux | The `usbmuxd` package. |
+| Windows | The Apple Devices app (Microsoft Store) or iTunes. |
 
-The set-up described under [Prerequisites](#prerequisites) (waiting for the device, Trust and Developer Mode, installing
-the developer disk image, `scrios doctor`) is tested against scripted fakes of usbmuxd and the device, not yet on a
-device. The download of the image was run against GitHub (the files are what the pin says, and load the way the install
-reads them); the install through cryptexd, the way Xcode does it on iOS 17.4 and later, has not run on a device yet.
-
-The display service needs iOS 17 or later (the CoreDevice tunnel); **iOS versions older than 27 are untested.**
-
-### Platforms
-
-| Host | Built and tested in CI | Release binary | Checked with a device |
-| --- | --- | --- | --- |
-| **Linux** (x86_64, aarch64) | yes: clippy, tests, doc, smoke test | static musl (`scrios-x86_64-linux-musl`, `scrios-aarch64-linux-musl`) | see [Tested on](#tested-on) (earlier build) |
-| **macOS** (Apple silicon) | yes, the same | `scrios-aarch64-apple-darwin` | yes: this build streamed and recorded an iPhone |
-| **Windows** (x86_64; arm64 is a best-effort cross-build) | yes (`windows-latest`, MSVC): clippy, tests, doc, a smoke test of the release `scrios.exe` | `scrios-x86_64-pc-windows-msvc.zip` | **no: nothing has run against a device on Windows yet** |
-
-On Windows the code path is **reasoned from idevice's sources, not tried**: idevice already talks to a usbmuxd on TCP
-`127.0.0.1:27015` (what the Apple Mobile Device Service listens on) and has no unix socket there, scrios takes its own
-copy of the standard output handle for the stream the way it takes the descriptor on unix, and Ctrl-C and Ctrl-Break
-are its stop signals. What the Apple Mobile Device Service answers to the requests scrios makes (the device list, the
-pair record) has not been seen. If something differs, `scrios doctor` shows where it stops, and `RUST_LOG=debug` says more.
-
-The **viewer window** is tested on macOS. On Linux and Windows it is built (the Windows zip includes it) but not run: it is the same code on winit, wgpu and OpenH264, with software decoding there (Windows' Media Foundation decoder is a stub).
-
-## Prerequisites
-
-usbmuxd is scrios's only way to a device, as adb is scrcpy's. What the host needs, by platform:
-
-| Host | usbmuxd | The developer disk image |
-| --- | --- | --- |
-| **macOS** | built in (`/var/run/usbmuxd`) | **Xcode**'s own copy (scrios finds `/Library/Developer/DeveloperDiskImages/iOS_DDI` itself), else downloaded |
-| **Linux** | the `usbmuxd` daemon (a package of every distribution; it starts on its own when a device is plugged in, or `sudo systemctl start usbmuxd`) | downloaded (or a copy of `iOS_DDI` from a Mac with Xcode) |
-| **Windows** (see [Platforms](#platforms)) | the Apple Devices app (Microsoft Store) or iTunes: its Apple Mobile Device Service is usbmuxd, on `127.0.0.1:27015`, and must be running | downloaded (or a copy of `iOS_DDI` from a Mac with Xcode, in `%LOCALAPPDATA%\scrios\ddi` or given with `--ddi-dir`) |
-
-On every host:
-
-- **Developer Mode** on the device (Settings > Privacy & Security > Developer Mode; scrios reveals the switch and says the
-  steps, then waits through the restart);
-- the device **paired and trusted** with the host (tap Trust on the device; scrios itself does not pair, so if the host
-  never asked, pair once with your system's tool: Finder on macOS, `idevicepair pair` from libimobiledevice on Linux, the
-  Apple Devices app or iTunes on Windows);
-- **internet for the first install after each restart of the device**: installing the image asks Apple's signing server
-  (`gs.apple.com`, plain HTTP, not through a proxy) for a ticket. Without internet scrios says so; once the image is
-  installed nothing else is needed until the device restarts. (The download of the image, below, is a separate, one-time
-  use of the internet.)
-
-**Where the developer disk image comes from.** The image is **Apple's**: the one Xcode installs on a device (it is what
-lets a developer tool use the display service). **scrios does not host Apple's files.** It looks, in this order, at
-`--ddi-dir`, `$SCRIOS_DDI_DIR`, Xcode's folders on macOS, and its cache folder (`~/Library/Caches/scrios/ddi` on macOS,
-`~/.cache/scrios/ddi` on Linux, `%LOCALAPPDATA%\scrios\ddi` on Windows). If there is none, **scrios downloads it
-automatically**, so that plain `scrios` just works: from the `DeveloperDiskImage` repository of the pymobiledevice3
-project (https://github.com/doronz88/DeveloperDiskImage), which republishes the image that Xcode ships, as files any
-host can use. The download is pinned to one commit of that repository (today the image of Xcode build 27B52), goes over
-https, is limited in size and time, and **every file is checked against a SHA-256 that is built into scrios before it is
-used**; a file that does not match is refused and not kept. The checked files are kept in the cache folder, under the
-build (`<cache>/27B52/...`), and checked again each time they are used.
-
-How the image is put on the device follows the iOS version: on iOS 17.4 and later it is installed **as a cryptex through
-`cryptexd`**, the way Xcode does it (the `Xcode_iOS_DDI_Cryptex` files of the repository); on iOS 17.0 to 17.3.1, and where
-the device does not offer `cryptexd`, it is mounted through the image mounter (the `Xcode_iOS_DDI_Personalized` files).
-Both ask Apple's signing server for a ticket for the device.
-
-You can change where it comes from:
-
-- `--ddi-source local` never downloads (only local copies are used), and `--ddi-source none` installs nothing at all (it
-  only reports); the default is `auto`. The environment has `$SCRIOS_DDI_SOURCE`.
-- `--ddi-dir DIR` (or `$SCRIOS_DDI_DIR`) uses a folder of your own: the `iOS_DDI` folder of a Mac with Xcode, copied
-  anywhere. On Linux or Windows, copying it into the cache folder works too:
-
-  ```
-  mkdir -p ~/.cache/scrios && scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI ~/.cache/scrios/ddi
-  ```
-
-  (On Windows, in PowerShell: `scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI $env:LOCALAPPDATA\scrios\ddi`, or
-  leave it anywhere and say where: `.\scrios.exe --ddi-dir C:\path\to\iOS_DDI`.)
-
-- `--ddi-repo URL --ddi-ref COMMIT --ddi-sha256-manifest FILE` downloads from a mirror of the repository instead of GitHub
-  (all three are needed: a mirror's files are never used unchecked; the manifest is a `sha256sum` list of the files, with
-  their paths from the root of the repository).
-- `scrios ddi-fetch` downloads and checks the image into the cache without a device (and prints the folder), for a
-  host that will have no internet later, or to see that the download works.
-
-(The paths of Xcode's folders are from what Xcode is known to do; one was seen on a Mac with Xcode, the other was not.
-Details, the archive download for fleets, the mirror manifest and the pin: [docs/cli.md](docs/cli.md#the-developer-disk-image),
-[BUILD.md](BUILD.md#the-developer-disk-image-pin).)
-
-### A device on another machine
-
-Point `--usbmuxd` at the usbmuxd of the machine the device is plugged into, as scrcpy does with a remote adb:
-
-```
-# where scrios runs: forward a local port to the usbmuxd socket of the machine the device is plugged into
-ssh -N -L 27015:/var/run/usbmuxd you@that-machine &
-scrios --usbmuxd 127.0.0.1:27015
-
-# or, without ssh, on that machine: serve the socket on TCP, and give scrios its address
-socat TCP-LISTEN:27015,reuseaddr,fork UNIX-CONNECT:/var/run/usbmuxd
-scrios --usbmuxd that-machine:27015
-```
-
-**The socat port is unauthenticated** (anyone who reaches it can use every device and read its pair record): use it only
-over a link you trust, and prefer the ssh forward. The CoreDevice tunnel and the services all ride usbmuxd connections, so
-they should work remotely; that is reasoned, not tried on a device. See [docs/cli.md](docs/cli.md#a-remote-usbmuxd).
-
-### On Windows
-
-`scrios.exe` is a console program with no installer: unzip it and run it from a terminal. The address of usbmuxd is
-`127.0.0.1:27015` unless `--usbmuxd host:port` or `USBMUXD_SOCKET_ADDRESS` says otherwise (there are no unix sockets:
-`UNIX:` addresses are refused). Ctrl-C and Ctrl-Break are a clean stop; closing the console window or `taskkill /f`
-ends the process at once, without telling the device.
-
-The video is binary, and **Windows PowerShell 5.1 re-encodes what a program writes when it is piped or redirected with
-`>`, which corrupts it**. Use `--output FILE` or `--record FILE`, or do the pipe in `cmd.exe`
-(`cmd /c ".\scrios.exe stream --output - | ffplay -f h264 -"`); PowerShell 7.4 and later pass the bytes through. The same
-holds for `--format framed` into another program.
+The first run needs internet access. scrios installs Apple's developer disk image on the device, and downloads it if
+you do not have Xcode. See [where the image comes from](docs/cli.md#the-developer-disk-image).
 
 ## Install
 
-Release binaries (from the GitHub releases of this repository): `scrios-x86_64-linux-musl` and
-`scrios-aarch64-linux-musl` (static, any Linux distribution; **headless**: no viewer window), `scrios-aarch64-apple-darwin`
-(with the viewer), and for Windows `scrios-x86_64-pc-windows-msvc.zip` (`scrios.exe`, with the viewer, with the README,
-LICENSE and NOTICE; an arm64 zip when its cross-build worked), with `SHA256SUMS`. Every build of `main` also uploads the
-Windows zip as a workflow artifact (30 days).
-
-From source, with Rust 1.89 or newer, a C compiler (for `ring`, the TLS backend) and, for the viewer, a C++ compiler
-(OpenH264 is built from source):
+Download a binary from the [releases page](https://github.com/kirkbrauer/scrios/releases), or build from source with
+Rust 1.89 or newer:
 
 ```
-cargo build --release --locked                          # with the viewer window -> target/release/scrios
-cargo build --release --locked --no-default-features    # headless: no window, no GPU, no decoder; much smaller
+cargo build --release --locked
 ```
 
-Cross-builds and static musl binaries: [BUILD.md](BUILD.md).
+The Linux release binaries are headless: they have `scrios stream` but no window. Build from source for the window.
+More build options are in [BUILD.md](BUILD.md).
 
 ## Usage
 
-```
-scrios list                                          # the devices usbmuxd knows
-scrios doctor                                        # check everything, with the fix for what is missing
-scrios                                               # the window: see and use the screen
-scrios stream --output - | ffplay -f h264 -framerate 60 -probesize 32 -flags low_delay -framedrop -y 1000 -   # watch it in ffplay
-scrios stream --record screen.h264                   # record raw H.264, no window
-scrios stream --format framed                        # the machine protocol, for programs
-```
-
-`scrios` waits for what is missing (`--no-wait` fails at once) and installs the developer disk image if needed; `scrios
-mount-ddi`, `ddi-status`, `unmount-ddi` and `developer-mode` do those steps by hand. Every option, with examples:
-[docs/cli.md](docs/cli.md). The framed output and the stdin control protocol are
-specified, with their version, in [docs/protocol.md](docs/protocol.md).
-
-Logs go to standard error (`RUST_LOG` sets the level). Exit status: `0` after a clean stop, `2` if the stream could
-not be started, `1` if it failed while running, `101` after an internal error. The end of standard input stops a stream
-only with `--format framed`; a recording started with standard input closed (nohup, a script) runs until SIGINT or SIGTERM
-(Ctrl-C on Windows).
-
-## Viewer
-
-`scrios` with no subcommand opens a window that shows the device's screen and lets you use it with the mouse and the
-keyboard, like scrcpy:
+Plug in the device and run:
 
 ```
-scrios                       # the only device usbmuxd lists
-scrios --udid 00008110-001234567890401E --show-stats
-scrios --record screen.h264  # record raw H.264 while the window is open
-scrios --no-control          # view only: no touch, no keys
+scrios
 ```
 
-Close the window (or press Ctrl-C in the terminal) to stop: the window goes at once and the stream is stopped on the
-device, which can take a few seconds. If the stream fails the window closes and the reason is on standard error.
+scrios waits for anything that is missing and tells you what to do: plug in the device, tap Trust, turn on Developer
+Mode. If something does not work, `scrios doctor` checks each step and says how to fix it.
 
-**The window.** It opens shaped like the device's screen and as large as the screen of your computer has room for, and it
-can be resized; the picture keeps its shape, with black bars if the window's shape differs. It follows the device's
-orientation: when the device turns, the window turns with it. The frame rate and delay can be shown in the title
-with `--show-stats` (the delay is the viewer's own: from the moment the stream hands over a picture to the moment it is
-drawn; it does not include the device's encoder or the USB link).
+| Command | What it does |
+| --- | --- |
+| `scrios` | Open the window. |
+| `scrios stream` | Write the video to standard output or a file, with no window. |
+| `scrios list` | List connected devices. |
+| `scrios doctor` | Check the setup and explain what is wrong. |
 
-**Mouse.** The left button is one finger (touch 0): press, drag and release on the picture are `touch down`, `move`
-and `up` at the matching point of the device's screen. A drag that leaves the picture stays on its edge. One finger only
-(there is no multi-touch yet).
+Common options:
 
-**The edge margin** (off by default: the window is the picture). With `--edge-margin 24` the picture is inset from the
-window's edges by a band of that many logical pixels, a little lighter than the black bars. A press that starts **in the
-band is on the device's edge**: in the top band it is the very top row of the screen, at the sides the very first or last
-column, with the position along the edge as you aimed (the Control Center swipe from the top right corner, for one). The
-window's own resize border, which is at the window's edge, is outside the band, so a drag from the picture's edge does not
-resize the window. The first window is the picture's size plus the band. A short bar like iOS's home indicator shows in the
-bottom band while the pointer is in it.
+| Option | What it does |
+| --- | --- |
+| `-s`, `--udid UDID` | Pick a device when more than one is connected. |
+| `-r`, `--record FILE` | Record the video to a file (raw H.264). |
+| `-n`, `--no-control` | View only: send no touch or keys. |
+| `--video-codec h264\|h265` | Choose the codec. The default is H.264. |
+| `--usbmuxd ADDR` | Use a device plugged into [another machine](docs/cli.md#a-remote-usbmuxd). |
 
-**The bottom swipe is the Home button.** iOS ignores the swipe up from the home indicator when it is injected as touch,
-even at the exact edge. So a drag that starts in the lowest 3% of the picture (at least 12 pixels; or in the bottom band,
-if there is one) and goes up by more than 8% of the screen's height is not sent as touch:
-- when you let go the device gets the **Home** button;
-- if you stopped for about 300 ms before letting go (swipe up and **hold**) it gets the **App Switcher** instead, the
-  double Home press that `MOD+S` makes too. The window says which in its title ("Home", "App Switcher") for a moment.
+Every command and option is in [docs/cli.md](docs/cli.md), or run `scrios --help`.
 
-Everything else is touch, as it was, so the App Switcher itself works with the mouse: a drag between the cards, a tap on a
-card to open it, and a flick up on a card to close the app all start above the lowest strip and go through as they happen.
-Only a press in the strip is held back until it is decided; a tap there, a short drag and a sideways drag are sent as the
-touch they were. A quick sideways drag along the bottom edge (iOS's "previous app" gesture) is such a drag: it is not turned
-into the App Switcher, since a drag that is an app's own would be taken from it; use the hold or `MOD+S`.
-`--bottom-swipe touch` sends the bottom drag as touch like any other, for an iOS that accepts it.
+### The window
 
-**Keyboard.** Keys are sent to the device as a hardware keyboard by their position (letters, digits, arrows, function
-keys, modifiers), so the device interprets them with its own layout (US). A key is down on the device while it is down
-on the host (the host's auto-repeat is not forwarded). The window losing the focus lifts every key and the finger.
+Click and drag to touch. Type to type. Close the window to stop.
 
-**Shortcuts.** Held with the *shortcut modifier*, **Cmd** on macOS and **Alt** on Linux and Windows (as in scrcpy's
-`MOD`). The shortcuts and the modifier itself are not sent to the device, and neither is any other key pressed
-with the modifier held.
+Shortcuts use **Cmd** on macOS and **Alt** on Linux and Windows:
 
-| Shortcut | Does |
+| Shortcut | Action |
 | --- | --- |
 | `MOD+H` | Home |
 | `MOD+S` | App Switcher |
-| `MOD+Up`, `MOD+Down` | Volume up, down (repeat while held) |
-| `MOD+G` | the bottom swipe, made for you: the Home button (the same as `MOD+H`), or with `--bottom-swipe touch` the touch swipe up from the bottom edge |
-| `MOD+W` | close the window |
-| `MOD+P` | lock the device, **only with `--lock-shortcut`** |
+| `MOD+Up`, `MOD+Down` | Volume |
+| `MOD+W` | Close the window |
 
-There is no lock or power shortcut by default: with the screen as the only way in, a lock from the keyboard is a way to
-lock yourself out.
+Dragging up from the bottom edge goes Home. Drag up and hold to open the App Switcher.
+Details are in [docs/cli.md](docs/cli.md#the-viewer).
 
-**Decoders.** The viewer decodes H.264 only (HEVC: use `scrios stream`). `--decoder` chooses:
+### Streaming to another program
 
-| `--decoder` | |
+`scrios stream` writes plain H.264 (Annex-B) that `ffplay`, `ffmpeg` and `mpv` read directly:
+
+```
+scrios stream --record screen.h264
+ffmpeg -f h264 -i screen.h264 -c copy screen.mp4
+```
+
+For a low-latency live view, use the `ffplay` flags in [docs/cli.md](docs/cli.md#examples).
+
+Programs that need timestamps, screen size and rotation, or want to send touch and keys, use the framed format:
+
+```
+scrios stream --format framed | my-program
+```
+
+Touch and key commands go in on standard input, one per line (`touch down 600 1300 0`, `key home`, `stop`).
+The format and the commands are specified in [docs/protocol.md](docs/protocol.md).
+[Jumpstarter](https://github.com/jumpstarter-dev/jumpstarter) uses this to show and control the iOS devices it leases
+out.
+
+### As a Rust library
+
+The `scrios` crate has the same stream and controls as the command line. Start with `scrios::stream::Stream`. The API
+is not stable yet.
+
+## Status
+
+scrios is new, and not everything has been tried on a real device.
+
+| | Tested on a device |
 | --- | --- |
-| `auto` (default) | the platform's decoder, and OpenH264 where there is none or if the platform's fails |
-| `platform` | the platform's decoder only: VideoToolbox on macOS; an error elsewhere |
-| `software` | OpenH264 (Cisco), built into scrios from its source (BSD-2-Clause) |
+| Streaming and recording on macOS | Yes (iPhone 16 Pro on iOS 27.2, iPad on iOS 27.0.1) |
+| Touch and keys through `scrios stream` | Yes, on an earlier build |
+| Touch and keys through the window | No |
+| Installing the developer disk image | No. The download is tested; the install is tested against a fake device only |
+| The window on Linux and Windows | No. It builds but has not been run |
+| Anything on Windows | No |
+| iOS versions before 27 | No |
 
-macOS uses **VideoToolbox**, the hardware decoder. Linux decodes with OpenH264 (VA-API and others may come later).
-Windows decodes with OpenH264 too: a Media Foundation decoder is a stub that says it is not written yet. Each picture
-is decoded and shown as soon as it arrives, with no queue and no pacing: a picture that has not been drawn when the next
-one is decoded is dropped. Pictures are drawn with wgpu (Metal, Vulkan, Direct3D 12 or OpenGL) from the decoder's own
-NV12 planes.
+Not supported yet: audio, multi-touch, clipboard, and HEVC in the window.
 
-| Option | |
-| --- | --- |
-| `--window-title TITLE` | the window's title (default `scrios`) |
-| `--window-width PIXELS`, `--window-height PIXELS` | the first window is at most this wide / high (logical pixels) |
-| `--edge-margin PIXELS` | a margin round the picture, in which a press is on the device's edge (default 0: none; 24 is a good band) |
-| `--bottom-swipe keys\|touch` | a drag up from the bottom edge is the Home button / App Switcher (`keys`, the default) or touch |
-| `--show-stats` | frame rate and delay in the title |
-| `--lock-shortcut` | `MOD+P` locks the device |
-| `--decoder auto\|platform\|software` | the H.264 decoder |
-| `--record FILE`, `--udid`, `--no-control`, ... | as for `scrios stream` |
+## How it works
 
-`--output`, `--format` and the probe belong to `scrios stream` and are refused here. A build without the viewer (the
-static Linux release binaries, `cargo build --no-default-features`) has no window: `scrios` is then `scrios stream`.
+scrios talks to the same developer services Xcode uses: the CoreDevice display service for video, and the HID service
+for touch and keys. It reaches them through usbmuxd using the [idevice](https://github.com/jkcoxson/idevice) library.
+Apple does not document these services, so a new iOS version can break them.
 
-**Where it is tested.** On macOS, without a device: the window, the picture's drawing (each rotation, the crop, the
-letterbox), VideoToolbox and OpenH264 decoding recorded video, the mouse and key mapping. Touch and keys through the window
-have not been tried on a device yet. Linux and Windows are the same code on winit, wgpu and OpenH264, but are not tested
-(and scrios drives the device through idevice, which is Unix-only for now).
+Built against **idevice 0.1.68**.
 
-## Library
-
-The crate is a library (`scrios`) and the `scrios` binary on top of it. The modules are public so that other
-programs can embed the stream; the API is not stable yet (0.x). See the crate documentation (`cargo doc --open`).
-
-## Users
-
-- [Jumpstarter](https://github.com/jumpstarter-dev/jumpstarter) runs `scrios stream --format framed` for the screen of
-  the iOS devices it leases out, with touch and keys. The framed format makes none of the checks above and never waits (a
-  program reads what is missing as an `error` event): run `scrios doctor` or `scrios mount-ddi` before. (Before the
-  viewer, `scrios --format framed` meant the same; with the viewer in a build, `scrios` without a subcommand is the
-  window, and refuses `--format` and `--output`.)
-
-## Roadmap
-
-- The viewer: HEVC, a Media Foundation decoder on Windows (and a hardware decoder on Linux), pinch and two-finger
-  gestures from the mouse and keyboard, clipboard, Linux and Windows tested.
-- Multi-touch (today: one finger), audio (the device's audio stream is started but discarded), more devices and
-  iOS versions tested.
+The device sends video as RTP. scrios reassembles it into H.264 and passes it on. More detail is in
+[docs/internals.md](docs/internals.md).
 
 ## Development
 
 ```
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-features --locked   # no device and no network needed at run time
-cargo test --no-default-features --locked    # the headless build
-cargo deny check                     # licences, bans, sources, advisories (deny.toml)
-scripts/smoke.sh target/release/scrios   # a release binary without a device (unix: needs python3)
-scripts/smoke-minimal.sh target/release/scrios   # the same, minimal: runs in Git Bash on Windows too (scrios.exe)
+cargo test --all-features --locked
 ```
 
-CI (GitHub Actions) runs all of these on Linux, macOS and Windows (what does not depend on the host, once); a `v*` tag
-builds the release binaries.
+The tests need no device and no network.
 
 ## License
 
-Apache-2.0: see [LICENSE](LICENSE). Third-party crates, including idevice (MIT), are listed with their licences in
-[NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

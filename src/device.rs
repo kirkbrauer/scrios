@@ -80,8 +80,6 @@ pub struct StreamInfo {
 
 // ---- pure helpers -----------------------------------------------------------------------------
 
-pub use crate::mux::{default_usbmuxd_spec, parse_usbmuxd_addr};
-
 /// Picks the device: the one named by `udid`, else the only one. A device that usbmuxd lists both over USB and
 /// over the network is one device (USB wins).
 ///
@@ -871,13 +869,6 @@ mod tests {
 
     fn dev(udid: &str, conn: Connection, id: u32) -> UsbmuxdDevice {
         UsbmuxdDevice { connection_type: conn, udid: udid.into(), device_id: id }
-    }
-
-    #[test]
-    fn the_address_helpers_stay_where_they_were() {
-        // They moved to `mux` (which has their tests); the old paths still work.
-        assert!(parse_usbmuxd_addr("127.0.0.1:27015").is_ok());
-        assert!(!default_usbmuxd_spec().is_empty());
     }
 
     #[test]

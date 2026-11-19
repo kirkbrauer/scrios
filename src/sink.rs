@@ -35,10 +35,6 @@ impl<W: Write> Sink<W> {
         Sink { format, out: BufWriter::with_capacity(BUFFER, out) }
     }
 
-    pub fn format(&self) -> Format {
-        self.format
-    }
-
     /// Writes `item` and flushes. Nothing is written for an event in the raw format.
     ///
     /// # Errors

@@ -52,15 +52,6 @@ pub fn describe(addr: &UsbmuxdAddr) -> String {
     }
 }
 
-/// The address when none is given: `$USBMUXD_SOCKET_ADDRESS` if it is set, else the platform's own.
-#[must_use]
-pub fn default_usbmuxd_spec() -> String {
-    match std::env::var(ADDRESS_ENV) {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => describe(&UsbmuxdAddr::default()),
-    }
-}
-
 /// `UNIX:/path` and a bare `/path` (or `./path`, or a word without a colon) are a unix socket; `host:port` and
 /// `TCP:host:port` are TCP. The prefixes are not case sensitive.
 ///
