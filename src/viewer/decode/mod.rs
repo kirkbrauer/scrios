@@ -5,7 +5,7 @@
 //! queue, no reordering (the stream has no B-frames; its SPS says so). What it gives back is a [`Picture`]: 8-bit 4:2:0
 //! as a luma plane and one interleaved chroma plane (NV12), which is what the renderer uploads whatever decoded it.
 //!
-//! * [`videotoolbox`] (macOS): Apple's `VideoToolbox`, the hardware decoder.
+//! * `videotoolbox` (macOS only, so not linked to): Apple's `VideoToolbox`, the hardware decoder.
 //! * [`software`]: `OpenH264`, Cisco's decoder, built into the binary; it runs anywhere.
 //! * [`mediafoundation`] (Windows): not written yet; it says so and the software decoder is used.
 //!
