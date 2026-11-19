@@ -212,6 +212,12 @@ code=$?
 set -e
 [ "$code" -eq 2 ] && grep -q "SHA-256" "$err" || { echo "a download without a hash was not refused"; cat "$err"; exit 1; }
 echo "ok: a DDI download without its SHA-256 is refused"
+set +e
+run $BIN mount-ddi --usbmuxd "$sock" --ddi-repo https://mirror.example/ddi --ddi-ref abc123 2> "$err"
+code=$?
+set -e
+[ "$code" -eq 2 ] && grep -q "ddi-sha256-manifest" "$err" || { echo "a DDI mirror without its manifest was not refused"; cat "$err"; exit 1; }
+echo "ok: a DDI mirror without its manifest is refused"
 
 # The stream's own preflight: a device that is listed but not trusted. With --no-wait it fails at once (exit 2) ...
 set +e

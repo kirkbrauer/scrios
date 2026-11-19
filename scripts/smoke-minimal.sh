@@ -6,6 +6,7 @@
 #     writes nothing to stdout in the raw format, and in the framed format writes exactly one `error` control frame
 #     (which also proves that the process can take its own stdout, as the stream does);
 #   * `list` and `doctor` say where usbmuxd was looked for, and `doctor` fails with a fix;
+#   * the developer disk image options that contradict each other are refused before the network is touched;
 #   * options that do not go together are refused (exit 2);
 #   * on Windows: there is no `UNIX:` address, and the help names 127.0.0.1:27015 as the default.
 # It never contacts the usbmuxd of the host: every run is given an address, or none that gets as far as connecting.
@@ -41,6 +42,7 @@ run 0 stream --help
 run 0 list --help
 run 0 doctor --help
 run 0 mount-ddi --help
+run 0 ddi-fetch --help
 echo "ok: --version and --help"
 
 # The help names this host's usbmuxd default.
@@ -88,6 +90,14 @@ grep -a -q "\-\-video-codec h264" "$out" || fail "--probe-secs with hevc was not
 run 2 stream --format framed --no-stdin --record "$dir/never.mp4"
 grep -a -q "raw Annex-B" "$out" || fail "--record to a container was not refused"
 echo "ok: options that do not go together are refused"
+
+# The developer disk image options that do not go together are refused before anything is downloaded or any device is asked
+# (a mirror without its manifest, and a download with downloading off): no network is touched.
+run 2 mount-ddi --usbmuxd "$CLOSED" --ddi-repo https://mirror.example/ddi --ddi-ref abc123
+grep -q "ddi-sha256-manifest" "$err" || fail "a mirror without its manifest was not refused"
+run 2 ddi-fetch --ddi-source local
+grep -q "ddi-source auto" "$err" || fail "ddi-fetch with --ddi-source local was not refused"
+echo "ok: a mirror without its manifest and a download that is turned off are refused"
 
 if [ "$windows" -eq 1 ]; then
   # No unix sockets: a UNIX: address (or a bare path) is refused, and the message says what to give instead.

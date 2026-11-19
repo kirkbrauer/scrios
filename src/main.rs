@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 mod device_cmds;
 mod signals;
 
-use device_cmds::{DdiArgs, DeveloperModeArgs, PreflightEnd, TargetArgs, USBMUXD_HELP};
+use device_cmds::{DdiArgs, DeveloperModeArgs, FetchVariantArg, PreflightEnd, TargetArgs, USBMUXD_HELP};
 use scrios::codec::CodecKind;
 use scrios::commands::{AtEof, Command, read_commands_at, supervised};
 use scrios::frame::Event;
@@ -187,6 +187,9 @@ enum Cmd {
     MountDdi(DdiCommandArgs),
     /// Remove the developer disk image: uninstall the cryptex, or unmount the image
     UnmountDdi(TargetArgs),
+    /// Download the developer disk image into scrios's cache and check it (no device): every file against its
+    /// SHA-256, then that it loads the way the install reads it
+    DdiFetch(DdiFetchArgs),
     /// Check everything the stream needs (usbmuxd, the device, trust, Developer Mode, the developer disk image, the
     /// display service) and say how to fix what is missing
     Doctor(DdiCommandArgs),
@@ -199,6 +202,18 @@ enum Cmd {
 struct DdiCommandArgs {
     #[command(flatten)]
     target: TargetArgs,
+
+    #[command(flatten, next_help_heading = "Developer disk image")]
+    ddi: DdiArgs,
+}
+
+/// What `scrios ddi-fetch` downloads, and from where.
+#[derive(Args, Debug)]
+struct DdiFetchArgs {
+    /// Which form of the image: the cryptex (what cryptexd installs, iOS 17.4 and later), the personalized image
+    /// (what the image mounter mounts, iOS 17.0 to 17.3.1), or both
+    #[arg(long, value_enum, value_name = "FORM", default_value = "cryptex")]
+    variant: FetchVariantArg,
 
     #[command(flatten, next_help_heading = "Developer disk image")]
     ddi: DdiArgs,
@@ -224,6 +239,7 @@ enum Action {
     DdiStatus(DdiCommandArgs),
     MountDdi(DdiCommandArgs),
     UnmountDdi(TargetArgs),
+    DdiFetch(DdiFetchArgs),
     Doctor(DdiCommandArgs),
     DeveloperMode(DeveloperModeArgs),
     /// The window (`scrios` without a subcommand, in a build with the viewer).
@@ -239,6 +255,7 @@ impl Cli {
             Some(Cmd::DdiStatus(a)) => Action::DdiStatus(a),
             Some(Cmd::MountDdi(a)) => Action::MountDdi(a),
             Some(Cmd::UnmountDdi(a)) => Action::UnmountDdi(a),
+            Some(Cmd::DdiFetch(a)) => Action::DdiFetch(a),
             Some(Cmd::Doctor(a)) => Action::Doctor(a),
             Some(Cmd::DeveloperMode(a)) => Action::DeveloperMode(a),
             None if self.list_devices => Action::List { usbmuxd: self.stream.usbmuxd },
@@ -1006,6 +1023,7 @@ fn main() {
         Action::DdiStatus(a) => device_cmds::run_ddi_status(&a.target, &a.ddi),
         Action::MountDdi(a) => device_cmds::run_mount_ddi(&a.target, &a.ddi),
         Action::UnmountDdi(target) => device_cmds::run_unmount_ddi(&target),
+        Action::DdiFetch(a) => device_cmds::run_ddi_fetch(&a.ddi, a.variant),
         Action::Doctor(a) => device_cmds::run_doctor(&a.target, &a.ddi),
         Action::DeveloperMode(a) => device_cmds::run_developer_mode(&a),
         #[cfg(feature = "viewer")]
@@ -1310,6 +1328,36 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(Cli::parse_from(["scrios", "unmount-ddi"]).action(), Action::UnmountDdi(_)));
+        // Where the image comes from: the same options for every command that installs or looks at it.
+        match Cli::parse_from(["scrios", "mount-ddi", "--ddi-source", "local"]).action() {
+            Action::MountDdi(a) => assert!(matches!(a.ddi.source, Some(device_cmds::DdiSourceArg::Local))),
+            other => panic!("{other:?}"),
+        }
+        let mirror = [
+            "--ddi-repo",
+            "https://mirror.example/ddi",
+            "--ddi-ref",
+            "abc123",
+            "--ddi-sha256-manifest",
+            "/m/ddi.sha256",
+        ];
+        for command in ["doctor", "ddi-status", "mount-ddi", "ddi-fetch"] {
+            let args = ["scrios", command].into_iter().chain(mirror).collect::<Vec<_>>();
+            assert!(Cli::try_parse_from(args).is_ok(), "{command}");
+        }
+        let stream = stream_args(&["--ddi-source", "none", "--ddi-repo", "https://mirror.example/ddi"]);
+        assert_eq!(stream.ddi.repo.as_deref(), Some("https://mirror.example/ddi"));
+        assert!(Cli::try_parse_from(["scrios", "mount-ddi", "--ddi-source", "sometimes"]).is_err());
+        // The download without a device.
+        match Cli::parse_from(["scrios", "ddi-fetch"]).action() {
+            Action::DdiFetch(a) => assert_eq!(a.variant, FetchVariantArg::Cryptex),
+            other => panic!("{other:?}"),
+        }
+        match Cli::parse_from(["scrios", "ddi-fetch", "--variant", "all"]).action() {
+            Action::DdiFetch(a) => assert_eq!(a.variant, FetchVariantArg::All),
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["scrios", "ddi-fetch", "--udid", "U"]).is_err(), "it has no device");
         // Turning Developer Mode on is a thing to ask for by name, twice.
         match Cli::parse_from(["scrios", "developer-mode"]).action() {
             Action::DeveloperMode(a) => assert!(!a.enable && !a.yes),

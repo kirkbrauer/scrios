@@ -16,8 +16,14 @@
 //! 1. the folder given (`--ddi-dir`),
 //! 2. `$SCRIOS_DDI_DIR`,
 //! 3. on macOS, the folders Xcode installs the image in,
-//! 4. a per-user cache folder (see [`cache_dir`]), where a folder copied from a Mac with Xcode is kept, and where a
-//!    download goes if the caller configured one ([`Download`]: a URL and the SHA-256 it must match).
+//! 4. a per-user cache folder (see [`cache_dir`]): a folder copied there from a Mac with Xcode, an archive that was
+//!    downloaded ([`Download`]: a URL and the SHA-256 it must match), or the files that were downloaded from the
+//!    `DeveloperDiskImage` repository before ([`fetch`]: checked against their SHA-256 every time they are used);
+//! 5. and, in [`DdiMode::Auto`] (the command line's default), a download of those files: from the commit that
+//!    [`pin`] names (Apple's image as the pymobiledevice3 project's `DeveloperDiskImage` repository publishes it), or
+//!    from a mirror the user names ([`Mirror`]) with a manifest of the SHA-256 values its files must have. Every
+//!    file is checked against its size and hash before it is used; [`DdiMode::Local`] never downloads, and
+//!    [`DdiMode::None`] installs nothing.
 //!
 //! In a folder, the build manifest is looked for in the folder, in `Restore/`, and under an `iOS_DDI/` folder in
 //! either. For the image mounter the image and trust cache are the ones the manifest names for the device's board and
@@ -27,6 +33,7 @@
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use idevice::cryptexd::Cryptex1Assets;
 use sha2::{Digest, Sha256};
@@ -37,17 +44,30 @@ pub mod http;
 pub mod manifest;
 pub mod pin;
 
+use fetch::{Fetch, FetchEvent, Https, Mirror, Plan};
+use manifest::Manifest;
+
 /// The environment variable that names a DDI folder.
 pub const ENV_DIR: &str = "SCRIOS_DDI_DIR";
 /// The environment variable that names the URL of a DDI archive to download.
 pub const ENV_URL: &str = "SCRIOS_DDI_URL";
 /// The environment variable that holds the SHA-256 of the archive at [`ENV_URL`].
 pub const ENV_SHA256: &str = "SCRIOS_DDI_SHA256";
+/// The environment variable that names the mode: `auto`, `local` or `none` (see [`DdiMode`]).
+pub const ENV_SOURCE: &str = "SCRIOS_DDI_SOURCE";
+/// The environment variable that names a mirror of the `DeveloperDiskImage` repository.
+pub const ENV_REPO: &str = "SCRIOS_DDI_REPO";
+/// The environment variable that names the commit of the mirror to read.
+pub const ENV_REF: &str = "SCRIOS_DDI_REF";
+/// The environment variable that names the file of SHA-256 values of the mirror's files.
+pub const ENV_MANIFEST: &str = "SCRIOS_DDI_SHA256_MANIFEST";
 
 /// The largest archive that is unpacked (its entries' sizes added up): the image itself is some tens of MB.
 const MAX_UNPACKED: u64 = 2 * 1024 * 1024 * 1024;
 /// The manifest's file name.
 const MANIFEST: &str = "BuildManifest.plist";
+/// The folder of the cache that a downloaded archive is unpacked into.
+const ARCHIVE_DIR: &str = "archive";
 /// Names of the image in a folder that has no manifest path for it, most specific first.
 const IMAGE_NAMES: [&str; 3] = ["Image4.dmg", "Image.dmg", "DeveloperDiskImage.dmg"];
 
@@ -469,7 +489,91 @@ pub fn xcode_dirs() -> Vec<PathBuf> {
     xcode_dirs_for(selected.as_deref())
 }
 
+/// Whether scrios may download an image it does not have, and whether it installs one at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DdiMode {
+    /// Local sources first; if none has the image, download it. This is what the command line does by default.
+    Auto,
+    /// Local sources only: never the network. This is the default of the type, so that a program that builds
+    /// [`DdiSources`] itself (or a test) never downloads unless it says so.
+    #[default]
+    Local,
+    /// Nothing is installed or mounted: scrios only reports what it finds.
+    None,
+}
+
+impl DdiMode {
+    /// The mode that `text` (`auto`, `local`, `none`, in any case) names.
+    ///
+    /// # Errors
+    ///
+    /// A message that lists the three if it is none of them.
+    pub fn parse(text: &str) -> Result<DdiMode, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(DdiMode::Auto),
+            "local" => Ok(DdiMode::Local),
+            "none" => Ok(DdiMode::None),
+            other => Err(format!("the DDI source must be auto, local or none (got {other:?})")),
+        }
+    }
+}
+
+/// Where the files to download come from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Remote {
+    /// The pinned commit of the `DeveloperDiskImage` repository ([`pin`]).
+    #[default]
+    Pinned,
+    /// A mirror of it, with the manifest of SHA-256 values its files must have.
+    Mirror(Mirror),
+}
+
+/// What an [`obtain`](DdiSources::obtain) says as it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DdiEvent {
+    /// An archive (`--ddi-download-url`) is being downloaded from this host (the rest of a URL can carry a secret).
+    Archive { host: String },
+    /// The files of the repository are being downloaded, or have been (see [`FetchEvent`]).
+    Fetch(FetchEvent),
+}
+
+impl DdiEvent {
+    /// The plain line to show for the event.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self {
+            DdiEvent::Archive { host } => {
+                format!("Downloading the developer disk image from {host} (checked against the SHA-256 you gave)")
+            }
+            DdiEvent::Fetch(event) => event.line(),
+        }
+    }
+}
+
+/// What the command line and the environment say about where the image comes from: the options as they are given,
+/// before the environment fills in what they leave out ([`DdiSources::from_options`]).
+#[derive(Debug, Clone, Default)]
+pub struct DdiOptions {
+    /// `--ddi-dir`.
+    pub dir: Option<PathBuf>,
+    /// `--ddi-download-url`.
+    pub download_url: Option<String>,
+    /// `--ddi-sha256`.
+    pub sha256: Option<String>,
+    /// `--ddi-source`.
+    pub source: Option<DdiMode>,
+    /// `--ddi-repo`.
+    pub repo: Option<String>,
+    /// `--ddi-ref`.
+    pub git_ref: Option<String>,
+    /// `--ddi-sha256-manifest`.
+    pub sha256_manifest: Option<PathBuf>,
+}
+
 /// Where to look for a DDI folder, in the order of the module's documentation.
+///
+/// `DdiSources::default()` has no folder anywhere and never downloads ([`DdiMode::Local`]); [`DdiSources::from_options`]
+/// is what the command line uses.
 #[derive(Debug, Clone, Default)]
 pub struct DdiSources {
     /// `--ddi-dir`.
@@ -482,6 +586,12 @@ pub struct DdiSources {
     pub cache: Option<PathBuf>,
     /// The archive to download into the cache when nothing is found.
     pub download: Option<Download>,
+    /// Whether to download, and whether to install.
+    pub mode: DdiMode,
+    /// Where the files are downloaded from in [`DdiMode::Auto`] when there is no archive.
+    pub remote: Remote,
+    /// What downloads the files: `None` is the program's own https client ([`Https`]).
+    pub fetcher: Option<Arc<dyn Fetch>>,
 }
 
 /// A DDI folder that was found, and where.
@@ -503,21 +613,89 @@ impl Found {
 impl DdiSources {
     /// The sources on this host: `dir` and `url` and `sha256` are the options, the rest is read from the
     /// environment ([`ENV_DIR`], and [`ENV_URL`] with [`ENV_SHA256`] for what the options leave out) and the host.
+    /// This is [`DdiSources::from_options`] with no other option: [`DdiMode::Auto`], the pinned image.
     ///
     /// # Errors
     ///
     /// A message if only one of the URL and the hash is given, or either is malformed.
     pub fn from_host(dir: Option<PathBuf>, url: Option<&str>, sha256: Option<&str>) -> Result<DdiSources, String> {
-        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-        let mut sources = DdiSources::for_platform(
-            Platform::current(),
+        DdiSources::from_options(&DdiOptions {
             dir,
-            env(ENV_DIR).map(PathBuf::from),
-            url.map(str::to_string).or_else(|| env(ENV_URL)),
-            sha256.map(str::to_string).or_else(|| env(ENV_SHA256)),
+            download_url: url.map(str::to_string),
+            sha256: sha256.map(str::to_string),
+            ..DdiOptions::default()
+        })
+    }
+
+    /// The sources the command line asks for: `opts` are the options, and what they leave out is read from the
+    /// environment ([`ENV_DIR`], [`ENV_URL`], [`ENV_SHA256`], [`ENV_SOURCE`], [`ENV_REPO`], [`ENV_REF`],
+    /// [`ENV_MANIFEST`]) and the host. With nothing given the mode is [`DdiMode::Auto`] and the image is the pinned one.
+    ///
+    /// # Errors
+    ///
+    /// A message if the options do not go together (a mirror needs its revision and its manifest, and cannot be
+    /// asked for with an archive; an archive needs its hash), or the manifest cannot be read or is malformed.
+    pub fn from_options(opts: &DdiOptions) -> Result<DdiSources, String> {
+        let mut sources = DdiSources::from_options_with(
+            Platform::current(),
+            opts,
             &|name| std::env::var(name).ok(),
+            &read_manifest_file,
         )?;
         sources.xcode = xcode_dirs();
+        Ok(sources)
+    }
+
+    /// [`DdiSources::from_options`] for `platform`, with the environment (`get`) and the reading of the manifest file
+    /// (`read`) given.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`DdiSources::from_options`].
+    pub fn from_options_with(
+        platform: Platform,
+        opts: &DdiOptions,
+        get: &dyn Fn(&str) -> Option<String>,
+        read: &dyn Fn(&Path) -> Result<String, String>,
+    ) -> Result<DdiSources, String> {
+        let env = |name: &str| get(name).filter(|v| !v.trim().is_empty());
+        let mut sources = DdiSources::for_platform(
+            platform,
+            opts.dir.clone(),
+            env(ENV_DIR).map(PathBuf::from),
+            opts.download_url.clone().or_else(|| env(ENV_URL)),
+            opts.sha256.clone().or_else(|| env(ENV_SHA256)),
+            get,
+        )?;
+        sources.mode = match (opts.source, env(ENV_SOURCE)) {
+            (Some(mode), _) => mode,
+            (None, Some(text)) => DdiMode::parse(&text).map_err(|why| format!("${ENV_SOURCE}: {why}"))?,
+            (None, None) => DdiMode::Auto,
+        };
+        let repo = opts.repo.clone().or_else(|| env(ENV_REPO));
+        let git_ref = opts.git_ref.clone().or_else(|| env(ENV_REF));
+        let manifest = opts.sha256_manifest.clone().or_else(|| env(ENV_MANIFEST).map(PathBuf::from));
+        sources.remote = match (repo, git_ref, manifest) {
+            (None, None, None) => Remote::Pinned,
+            (Some(repo), Some(git_ref), Some(manifest)) => {
+                if sources.download.is_some() {
+                    return Err("--ddi-repo and --ddi-download-url both say where to download from: give one".into());
+                }
+                let text = read(&manifest)?;
+                let manifest = Manifest::parse(&text)
+                    .map_err(|why| format!("--ddi-sha256-manifest {}: {why}", manifest.display()))?;
+                Remote::Mirror(Mirror::new(&repo, &git_ref, manifest)?)
+            }
+            (Some(_), _, None) => {
+                return Err("--ddi-repo needs --ddi-sha256-manifest too (a `sha256sum` list of the mirror's files): scrios never uses an unchecked download".into());
+            }
+            (Some(_), None, Some(_)) => {
+                return Err("--ddi-repo needs --ddi-ref too (the commit of the mirror to read)".into());
+            }
+            (None, _, _) => {
+                return Err("--ddi-ref and --ddi-sha256-manifest are for a mirror: they need --ddi-repo".into());
+            }
+        };
         Ok(sources)
     }
 
@@ -544,7 +722,7 @@ impl DdiSources {
                 return Err("a DDI SHA-256 without a URL (--ddi-download-url, or $SCRIOS_DDI_URL)".into());
             }
         };
-        Ok(DdiSources { dir, env_dir, xcode: Vec::new(), cache: cache_dir_for(platform, get), download })
+        Ok(DdiSources { dir, env_dir, cache: cache_dir_for(platform, get), download, ..DdiSources::default() })
     }
 
     /// The first DDI folder there is, of either variant (what a report says it would use when the device's way of
@@ -586,8 +764,13 @@ impl DdiSources {
                 .map(|folder| Found { folder, origin: Origin::Env })
                 .map_err(|why| format!("${ENV_DIR}: {why}"));
         }
-        let tried =
-            self.xcode.iter().map(|dir| (dir, Origin::Xcode)).chain(self.cache.iter().map(|dir| (dir, Origin::Cache)));
+        let archive = self.cache.as_ref().map(|cache| cache.join(ARCHIVE_DIR));
+        let tried = self
+            .xcode
+            .iter()
+            .map(|dir| (dir, Origin::Xcode))
+            .chain(self.cache.iter().map(|dir| (dir, Origin::Cache)))
+            .chain(archive.iter().map(|dir| (dir, Origin::Cache)));
         let mut unusable = Vec::new();
         for (dir, origin) in tried {
             match open(dir) {
@@ -600,6 +783,11 @@ impl DdiSources {
                     }
                 }
             }
+        }
+        // The files that were downloaded before, which are checked again (their size and SHA-256) before they are used.
+        let variants = variant.map_or_else(|| vec![Variant::Cryptex, Variant::Personalized], |v| vec![v]);
+        if let Some(folder) = variants.into_iter().find_map(|variant| self.fetched(variant)) {
+            return Ok(Found { folder, origin: Origin::Cache });
         }
         let mut why = self.not_found();
         if !unusable.is_empty() {
@@ -620,10 +808,85 @@ impl DdiSources {
         let mut looked = vec!["--ddi-dir".to_string(), format!("${ENV_DIR}")];
         looked.extend(self.xcode.iter().map(|p| p.display().to_string()));
         looked.push(cache.clone());
+        let way_out = match self.mode {
+            DdiMode::Auto => " or let scrios download it (it does when nothing is found, unless the download fails)",
+            DdiMode::Local => ", or let scrios download it (--ddi-source auto, the default: --ddi-source local is on)",
+            DdiMode::None => ", or let scrios download it (--ddi-source auto, the default: --ddi-source none is on)",
+        };
         format!(
-            "no developer disk image (DDI) found (looked in {}). scrios does not ship Apple's image and has no default place to download it from: copy the iOS_DDI folder from a Mac with Xcode (/Library/Developer/DeveloperDiskImages/iOS_DDI) into {cache} so that {manifest} exists, or point --ddi-dir (or ${ENV_DIR}) at it, or give --ddi-download-url with --ddi-sha256 for an archive of it you host",
+            "no developer disk image (DDI) found (looked in {}): copy the iOS_DDI folder from a Mac with Xcode (/Library/Developer/DeveloperDiskImages/iOS_DDI) into {cache} so that {manifest} exists, or point --ddi-dir (or ${ENV_DIR}) at it{way_out}",
             looked.join(", ")
         )
+    }
+
+    /// What a report says about the image when none is found locally: what scrios would do about it.
+    #[must_use]
+    pub fn fallback_line(&self, variant: Variant) -> String {
+        match self.mode {
+            DdiMode::None => "none locally (--ddi-source none: scrios installs nothing)".to_string(),
+            DdiMode::Local => "none locally (--ddi-source local: scrios does not download it)".to_string(),
+            DdiMode::Auto => match (&self.download, self.plan_for(variant)) {
+                (Some(download), _) => {
+                    format!(
+                        "none locally (scrios downloads the archive from {} when it installs the image)",
+                        host_of(&download.url)
+                    )
+                }
+                (None, Ok(plan)) => format!(
+                    "none locally (scrios downloads {}from {} into {} when it installs the image)",
+                    plan.build.as_ref().map_or_else(String::new, |build| format!("Xcode {build}'s, ")),
+                    plan.source,
+                    self.cache.as_ref().map_or_else(|| "its cache folder".to_string(), |c| c.display().to_string())
+                ),
+                (None, Err(why)) => format!("none locally ({why})"),
+            },
+        }
+    }
+
+    /// The plan to download `variant` from where [`DdiSources::remote`] says.
+    ///
+    /// # Errors
+    ///
+    /// A message if the mirror's manifest does not list the files of the variant.
+    pub fn plan_for(&self, variant: Variant) -> Result<Plan, String> {
+        match &self.remote {
+            Remote::Pinned => Plan::pinned(variant),
+            Remote::Mirror(mirror) => Plan::mirror(mirror, variant),
+        }
+    }
+
+    /// The downloaded files of `variant` in the cache, if they are all there and are what they must be.
+    fn fetched(&self, variant: Variant) -> Option<DdiFolder> {
+        let cache = self.cache.as_ref()?;
+        match self.plan_for(variant) {
+            Ok(plan) => plan.cached(cache),
+            Err(why) => {
+                debug!("no plan to look for downloaded files by: {why}");
+                None
+            }
+        }
+    }
+
+    /// Downloads the files of `variant` into the cache (the pinned image, or the mirror's), checks every one against
+    /// its size and SHA-256, and returns the folder: what [`DdiSources::obtain`] does when nothing is found locally,
+    /// without looking for anything locally first. A cache that is good already is used without any download.
+    ///
+    /// # Errors
+    ///
+    /// A message that says which file failed and why, or that there is no cache folder to keep the files in.
+    pub async fn fetch_to_cache(
+        &self,
+        variant: Variant,
+        events: &mut (dyn FnMut(DdiEvent) + Send),
+    ) -> Result<Found, String> {
+        let Some(cache) = &self.cache else {
+            return Err("there is no cache folder to download into: HOME or LOCALAPPDATA is not set".into());
+        };
+        let plan = self.plan_for(variant)?;
+        let https = Https;
+        let fetcher: &dyn Fetch = self.fetcher.as_deref().unwrap_or(&https);
+        let folder = Box::pin(plan.fetch(cache, fetcher, &mut |event| events(DdiEvent::Fetch(event)))).await?;
+        Ok(Found { folder, origin: Origin::Cache })
     }
 
     /// [`DdiSources::locate`], and if there is none and a download is configured, the download into the cache
@@ -633,7 +896,12 @@ impl DdiSources {
     ///
     /// The reason there is no usable DDI folder: what [`DdiSources::locate`] says, or why the download failed.
     pub async fn find_or_download(&self, downloading: &mut (dyn FnMut(&str) + Send)) -> Result<Found, String> {
-        Box::pin(self.find_or_download_by(None, downloading)).await
+        Box::pin(self.obtain_by(None, &mut |event| {
+            if let DdiEvent::Archive { host } = event {
+                downloading(&host);
+            }
+        }))
+        .await
     }
 
     /// [`DdiSources::find_or_download`] for a folder that has what `variant` needs ([`DdiSources::locate_for`]).
@@ -646,31 +914,68 @@ impl DdiSources {
         variant: Variant,
         downloading: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Found, String> {
-        Box::pin(self.find_or_download_by(Some(variant), downloading)).await
+        Box::pin(self.obtain_by(Some(variant), &mut |event| {
+            if let DdiEvent::Archive { host } = event {
+                downloading(&host);
+            }
+        }))
+        .await
     }
 
-    async fn find_or_download_by(
+    /// The image in the form `variant`: the first local source that has it ([`DdiSources::locate_for`]) and, if there
+    /// is none and the mode is [`DdiMode::Auto`], a download into the cache: of the archive, if one was configured,
+    /// else of the pinned image (or the mirror's), every file checked against its size and SHA-256. `events` says what
+    /// is downloaded and how far it is. A folder that was asked for by name (`--ddi-dir`, `$SCRIOS_DDI_DIR`) that does
+    /// not work is an error, never replaced by a download.
+    ///
+    /// # Errors
+    ///
+    /// The reason there is no usable folder: what [`DdiSources::locate_for`] says, that downloading is off, or why
+    /// the download failed.
+    pub async fn obtain(&self, variant: Variant, events: &mut (dyn FnMut(DdiEvent) + Send)) -> Result<Found, String> {
+        Box::pin(self.obtain_by(Some(variant), events)).await
+    }
+
+    async fn obtain_by(
         &self,
         variant: Option<Variant>,
-        downloading: &mut (dyn FnMut(&str) + Send),
+        events: &mut (dyn FnMut(DdiEvent) + Send),
     ) -> Result<Found, String> {
         let first = self.locate_by(variant);
-        let (Err(why), Some(download)) = (&first, &self.download) else { return first };
+        let Err(why) = &first else { return first };
+        if self.dir.is_some() || self.env_dir.is_some() {
+            return first; // an explicit folder that does not work is not replaced by a download
+        }
+        match self.mode {
+            DdiMode::Auto => {}
+            DdiMode::Local => return Err(format!("{why} (downloading is off: --ddi-source local)")),
+            DdiMode::None => return Err(format!("{why} (--ddi-source none: scrios installs nothing)")),
+        }
         let Some(cache) = &self.cache else {
             return Err(format!(
                 "{why} (and there is no cache folder to download into: HOME or LOCALAPPDATA is not set)"
             ));
         };
-        if self.dir.is_some() || self.env_dir.is_some() {
-            return first; // an explicit folder that does not work is not replaced by a download
+        if let Some(download) = &self.download {
+            events(DdiEvent::Archive { host: host_of(&download.url) });
+            let folder = Box::pin(fetch(download, &cache.join(ARCHIVE_DIR))).await?;
+            if let Some(variant) = variant {
+                folder.check(variant).map_err(|why| format!("the downloaded archive is no use: {why}"))?;
+            }
+            return Ok(Found { folder, origin: Origin::Cache });
         }
-        downloading(&host_of(&download.url));
-        let folder = Box::pin(fetch(download, cache)).await?;
-        if let Some(variant) = variant {
-            folder.check(variant).map_err(|why| format!("the downloaded archive is no use: {why}"))?;
-        }
-        Ok(Found { folder, origin: Origin::Cache })
+        Box::pin(self.fetch_to_cache(variant.unwrap_or(Variant::Cryptex), events)).await
     }
+}
+
+/// Reads the manifest of a mirror's SHA-256 values: a text file of at most [`manifest::MAX_BYTES`].
+fn read_manifest_file(path: &Path) -> Result<String, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot read the SHA-256 manifest {}: {e}", path.display()))?;
+    if meta.len() > manifest::MAX_BYTES as u64 {
+        return Err(format!("the SHA-256 manifest {} is larger than {} bytes", path.display(), manifest::MAX_BYTES));
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("cannot read the SHA-256 manifest {}: {e}", path.display()))
 }
 
 // ---- the download -----------------------------------------------------------------------------
@@ -910,7 +1215,7 @@ mod tests {
             env_dir: Some(env.path().into()),
             xcode: vec![PathBuf::from("/nonexistent/xcode"), xcode.path().into()],
             cache: Some(cache.path().into()),
-            download: None,
+            ..DdiSources::default()
         };
         assert_eq!(sources.locate().unwrap().origin, Origin::Option);
         let sources = DdiSources { dir: None, ..sources };
@@ -1117,6 +1422,7 @@ mod tests {
         let sources = |sha256: String| DdiSources {
             cache: Some(dest.clone()),
             download: Some(Download { url: url.clone(), sha256 }),
+            mode: DdiMode::Auto,
             ..DdiSources::default()
         };
         let mut said = Vec::new();
@@ -1124,13 +1430,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.origin, Origin::Cache);
-        assert_eq!(found.folder.root(), dest.join("Restore"));
+        // The archive is unpacked under archive/, so that it never replaces the files that were downloaded by build.
+        assert_eq!(found.folder.root(), dest.join("archive").join("Restore"));
         assert_eq!(said, vec![format!("127.0.0.1:{port}")], "only the host is said");
         // The wrong hash is refused, and the cache keeps nothing of it.
         let _ = std::fs::remove_dir_all(&dest);
         let why = Box::pin(sources("0".repeat(64)).find_or_download(&mut |_| {})).await.unwrap_err();
         assert!(why.contains("not used"), "{why}");
-        assert!(!dest.exists());
+        assert!(!dest.join("archive").exists());
     }
 
     #[tokio::test]
@@ -1281,6 +1588,362 @@ mod tests {
         assert_eq!(Variant::Cryptex.folder(), "Xcode_iOS_DDI_Cryptex");
         assert_eq!(Variant::Personalized.folder(), "Xcode_iOS_DDI_Personalized");
         assert_ne!(Variant::Cryptex.label(), Variant::Personalized.label());
+    }
+
+    // ---- where the image comes from: the mode, a mirror, the download ----------------------------
+
+    use crate::testnet::FakeFetch;
+
+    use crate::testddi::mirror_world;
+
+    async fn obtained(sources: &DdiSources, variant: Variant) -> (Result<Found, String>, Vec<DdiEvent>) {
+        let mut events = Vec::new();
+        let found = sources.obtain(variant, &mut |event| events.push(event)).await;
+        (found, events)
+    }
+
+    #[tokio::test]
+    async fn with_nothing_local_the_image_is_downloaded_once_checked_and_then_found_in_the_cache() {
+        let (sources, fake, _cache) = mirror_world();
+        assert!(sources.locate_for(Variant::Cryptex).is_err());
+        let (found, events) = obtained(&sources, Variant::Cryptex).await;
+        let found = found.unwrap();
+        assert_eq!(found.origin, Origin::Cache);
+        assert!(found.folder.root().starts_with(sources.cache.as_ref().unwrap()));
+        assert!(found.folder.root().ends_with("Xcode_iOS_DDI_Cryptex"));
+        assert_eq!(fake.asked().len(), 5);
+        assert!(
+            fake.asked().iter().all(|url| url.starts_with("https://mirror.example/ddi/abc123/PersonalizedImages/"))
+        );
+        // What was said: from where, how far, and that it is verified.
+        assert!(
+            matches!(&events[0], DdiEvent::Fetch(FetchEvent::Downloading { source, .. }) if source == "mirror.example/ddi")
+        );
+        assert_eq!(events.last(), Some(&DdiEvent::Fetch(FetchEvent::Verified)));
+        // The files are found from then on without the network, by locate (a report) and by obtain (an install).
+        assert_eq!(sources.locate_for(Variant::Cryptex).unwrap().origin, Origin::Cache);
+        let (again, events) = obtained(&sources, Variant::Cryptex).await;
+        assert!(again.is_ok());
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(fake.asked().len(), 5, "nothing was asked for the second time");
+        // A file of the cache that is damaged is not found, and is downloaded again.
+        std::fs::write(found.folder.root().join("Image.dmg"), b"damaged").unwrap();
+        assert!(sources.locate_for(Variant::Cryptex).is_err());
+        assert!(obtained(&sources, Variant::Cryptex).await.0.is_ok());
+        assert_eq!(fake.asked().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn the_mode_decides_whether_anything_is_downloaded() {
+        // local: never; none: never, and says that nothing is installed.
+        let (auto, fake, _cache) = mirror_world();
+        let local = DdiSources { mode: DdiMode::Local, ..auto.clone() };
+        let why = obtained(&local, Variant::Cryptex).await.0.unwrap_err();
+        assert!(
+            why.contains("no developer disk image") && why.contains("downloading is off: --ddi-source local"),
+            "{why}"
+        );
+        let none = DdiSources { mode: DdiMode::None, ..auto.clone() };
+        let why = obtained(&none, Variant::Cryptex).await.0.unwrap_err();
+        assert!(why.contains("--ddi-source none: scrios installs nothing"), "{why}");
+        assert!(fake.asked().is_empty());
+        // The local copies are used in every mode, and no mode downloads over one.
+        let xcode = TempDir::new("ddi-mode-xcode");
+        testddi::cryptex_folder(&xcode);
+        for mode in [DdiMode::Auto, DdiMode::Local, DdiMode::None] {
+            let sources = DdiSources { mode, xcode: vec![xcode.path().into()], ..auto.clone() };
+            assert_eq!(obtained(&sources, Variant::Cryptex).await.0.unwrap().origin, Origin::Xcode, "{mode:?}");
+        }
+        assert!(fake.asked().is_empty());
+        // A folder from an Xcode that has no cryptex does not stop the download of one.
+        let old = TempDir::new("ddi-mode-old");
+        testddi::personalized_folder(&old);
+        let sources = DdiSources { xcode: vec![old.path().into()], ..auto.clone() };
+        assert_eq!(obtained(&sources, Variant::Cryptex).await.0.unwrap().origin, Origin::Cache);
+        assert_eq!(fake.asked().len(), 5);
+        // A folder that was asked for by name and does not work is an error, whatever the mode: no download.
+        let (auto, fake, _cache) = mirror_world();
+        let explicit = DdiSources { dir: Some("/nonexistent/ddi".into()), ..auto };
+        let why = obtained(&explicit, Variant::Cryptex).await.0.unwrap_err();
+        assert!(why.starts_with("--ddi-dir: "), "{why}");
+        assert!(fake.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_download_that_is_not_what_the_manifest_says_is_refused_and_nothing_is_kept() {
+        let (sources, fake, cache) = mirror_world();
+        let url = "https://mirror.example/ddi/abc123/PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg";
+        fake.answer(url, Ok(b"not the image".to_vec()));
+        let (found, events) = obtained(&sources, Variant::Cryptex).await;
+        let why = found.unwrap_err();
+        assert!(why.contains("Image.dmg has the SHA-256") && why.contains("not used"), "{why}");
+        assert!(!events.contains(&DdiEvent::Fetch(FetchEvent::Verified)));
+        assert!(sources.locate_for(Variant::Cryptex).is_err());
+        let mut kept = Vec::new();
+        let mut stack = vec![cache.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    kept.push(path.file_name().unwrap().to_string_lossy().to_string());
+                }
+            }
+        }
+        assert!(!kept.iter().any(|name| name == "Image.dmg" || name.contains("partial")), "{kept:?}");
+        // The other form of the image is not in the manifest: said, and nothing is guessed or asked for.
+        let asked = fake.asked().len();
+        let why = obtained(&sources, Variant::Personalized).await.0.unwrap_err();
+        assert!(why.contains("no entry for PersonalizedImages/Xcode_iOS_DDI_Personalized"), "{why}");
+        assert_eq!(fake.asked().len(), asked);
+    }
+
+    #[tokio::test]
+    async fn the_pinned_image_is_downloaded_from_the_pinned_commit_and_only_accepted_if_it_matches_the_pin() {
+        let fake = Arc::new(FakeFetch::default());
+        let cache = TempDir::new("ddi-pinned-cache");
+        let sources = DdiSources {
+            cache: Some(cache.path().join("ddi")),
+            mode: DdiMode::Auto,
+            fetcher: Some(fake.clone()),
+            ..DdiSources::default()
+        };
+        assert_eq!(sources.remote, Remote::Pinned);
+        // A server that answers with something else for everything (what a wrong host or a replaced file is).
+        for file in pin::CRYPTEX_FILES {
+            let url = format!(
+                "https://{}/{}/{}/PersonalizedImages/Xcode_iOS_DDI_Cryptex/{}",
+                pin::HOST,
+                pin::REPO,
+                pin::COMMIT,
+                file.name
+            );
+            fake.answer(&url, Ok(b"something else".to_vec()));
+        }
+        let why = obtained(&sources, Variant::Cryptex).await.0.unwrap_err();
+        assert!(why.contains("BuildManifest.plist is 14 bytes, not the 804097 that were expected"), "{why}");
+        assert_eq!(fake.asked().len(), 1, "the first file that is wrong ends it");
+        assert!(
+            fake.asked()[0].starts_with(&format!(
+                "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/{}/",
+                pin::COMMIT
+            ))
+        );
+        assert!(sources.locate_for(Variant::Cryptex).is_err());
+        // The report says what scrios would do.
+        let line = sources.fallback_line(Variant::Cryptex);
+        assert!(line.contains("Xcode 27B52") && line.contains("github.com/doronz88/DeveloperDiskImage"), "{line}");
+        // With no cache folder to keep files in there is no download.
+        let nowhere = DdiSources { cache: None, ..sources };
+        let why = obtained(&nowhere, Variant::Cryptex).await.0.unwrap_err();
+        assert!(why.contains("no cache folder"), "{why}");
+    }
+
+    #[test]
+    fn what_a_report_says_when_nothing_is_found_depends_on_the_mode() {
+        let sources = DdiSources { cache: Some("/c/scrios/ddi".into()), ..DdiSources::default() };
+        let auto = DdiSources { mode: DdiMode::Auto, ..sources.clone() };
+        let line = auto.fallback_line(Variant::Cryptex);
+        assert!(
+            line.starts_with(
+                "none locally (scrios downloads Xcode 27B52's, from github.com/doronz88/DeveloperDiskImage into "
+            ),
+            "{line}"
+        );
+        assert!(line.contains(&Path::new("/c/scrios/ddi").display().to_string()), "{line}");
+        assert!(sources.fallback_line(Variant::Cryptex).contains("--ddi-source local"));
+        assert!(
+            DdiSources { mode: DdiMode::None, ..sources.clone() }
+                .fallback_line(Variant::Cryptex)
+                .contains("installs nothing")
+        );
+        let archive = DdiSources {
+            download: Some(Download::new("https://user:pw@example.com/ddi.tar.gz?t=1", &"0".repeat(64)).unwrap()),
+            ..auto
+        };
+        let line = archive.fallback_line(Variant::Cryptex);
+        assert!(line.contains("archive from example.com") && !line.contains("pw") && !line.contains("t=1"), "{line}");
+        // The instruction when nothing is found says how to get an image in each mode.
+        assert!(sources.not_found().contains("--ddi-source auto"));
+        assert!(archive.not_found().contains("download it"));
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn no_file(path: &Path) -> Result<String, String> {
+        Err(format!("cannot read {}", path.display()))
+    }
+
+    #[test]
+    fn the_options_become_sources_and_the_environment_fills_in_what_they_leave_out() {
+        let build = |opts: &DdiOptions, env: &'static [(&str, &str)]| {
+            DdiSources::from_options_with(
+                Platform::Other,
+                opts,
+                &move |name| {
+                    env.iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| (*v).to_string())
+                        .or_else(|| (name == "HOME").then(|| "/home/me".to_string()))
+                },
+                &no_file,
+            )
+        };
+        // Nothing given: the command line's own mode, the pinned image, the cache.
+        let default = build(&DdiOptions::default(), &[]).unwrap();
+        assert_eq!((default.mode, default.remote.clone()), (DdiMode::Auto, Remote::Pinned));
+        assert!(default.download.is_none() && default.fetcher.is_none());
+        assert_eq!(default.cache, Some(PathBuf::from("/home/me/.cache/scrios/ddi")));
+        // The mode: the option, else the environment, else auto; and a bad word says where it came from.
+        let given = |mode| DdiOptions { source: Some(mode), ..DdiOptions::default() };
+        assert_eq!(build(&given(DdiMode::None), &[]).unwrap().mode, DdiMode::None);
+        assert_eq!(build(&DdiOptions::default(), &[("SCRIOS_DDI_SOURCE", "Local")]).unwrap().mode, DdiMode::Local);
+        assert_eq!(build(&given(DdiMode::Auto), &[("SCRIOS_DDI_SOURCE", "none")]).unwrap().mode, DdiMode::Auto);
+        let why = build(&DdiOptions::default(), &[("SCRIOS_DDI_SOURCE", "sometimes")]).unwrap_err();
+        assert!(why.starts_with("$SCRIOS_DDI_SOURCE: ") && why.contains("auto, local or none"), "{why}");
+        assert_eq!(DdiMode::default(), DdiMode::Local, "the type never downloads unless it is told to");
+        assert!(DdiSources::default().fetcher.is_none() && DdiSources::default().remote == Remote::Pinned);
+    }
+
+    #[test]
+    fn a_mirror_needs_its_revision_and_its_manifest_and_is_not_an_archive() {
+        let hash = "ab".repeat(32);
+        let manifest_text: String = [
+            "BuildManifest.plist",
+            "Image.dmg",
+            "Image.dmg.trustcache",
+            "Image.dmg.cryptex_info",
+            "Image.dmg.root_hash",
+        ]
+        .iter()
+        .map(|n| format!("{hash}  PersonalizedImages/Xcode_iOS_DDI_Cryptex/{n}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+        let read_ok = |path: &Path| {
+            assert_eq!(path, Path::new("/m/ddi.sha256"));
+            Ok(manifest_text.clone())
+        };
+        let build = |opts: DdiOptions, env: &'static [(&str, &str)]| {
+            DdiSources::from_options_with(
+                Platform::Other,
+                &opts,
+                &move |name| {
+                    env.iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| (*v).to_string())
+                        .or_else(|| (name == "HOME").then(|| "/home/me".to_string()))
+                },
+                &read_ok,
+            )
+        };
+        let all = DdiOptions {
+            repo: Some("https://mirror.example/ddi".into()),
+            git_ref: Some("abc123".into()),
+            sha256_manifest: Some("/m/ddi.sha256".into()),
+            ..DdiOptions::default()
+        };
+        let mirror = build(all.clone(), &[]).unwrap();
+        assert!(matches!(&mirror.remote, Remote::Mirror(m) if m.label() == "mirror.example/ddi"));
+        // The environment says the same things as the options.
+        let env = build(
+            DdiOptions::default(),
+            &[
+                ("SCRIOS_DDI_REPO", "https://mirror.example/ddi"),
+                ("SCRIOS_DDI_REF", "abc123"),
+                ("SCRIOS_DDI_SHA256_MANIFEST", "/m/ddi.sha256"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(env.remote, mirror.remote);
+        // A mirror without its manifest or its revision, and a manifest or a revision without a mirror, are refused.
+        let without = |f: fn(&mut DdiOptions)| {
+            let mut opts = all.clone();
+            f(&mut opts);
+            build(opts, &[]).unwrap_err()
+        };
+        assert!(without(|o| o.sha256_manifest = None).contains("--ddi-sha256-manifest"));
+        assert!(without(|o| o.git_ref = None).contains("--ddi-ref"));
+        assert!(without(|o| o.repo = None).contains("need --ddi-repo"));
+        assert!(
+            build(DdiOptions { git_ref: Some("abc".into()), ..DdiOptions::default() }, &[])
+                .unwrap_err()
+                .contains("need --ddi-repo")
+        );
+        assert!(
+            build(DdiOptions { repo: Some("https://mirror.example/ddi".into()), ..DdiOptions::default() }, &[])
+                .unwrap_err()
+                .contains("never uses an unchecked download")
+        );
+        // A mirror and an archive are two answers to one question.
+        let both = DdiOptions {
+            download_url: Some("https://example.com/x.tgz".into()),
+            sha256: Some(hash.clone()),
+            ..all.clone()
+        };
+        assert!(build(both, &[]).unwrap_err().contains("give one"));
+        // The mirror itself: https, a plain revision.
+        assert!(without(|o| o.repo = Some("http://mirror.example/ddi".into())).contains("--ddi-repo"));
+        assert!(without(|o| o.git_ref = Some("main/../x".into())).contains("--ddi-ref"));
+        // A manifest that cannot be read or is not one.
+        let unreadable = DdiSources::from_options_with(Platform::Other, &all, &no_env, &no_file).unwrap_err();
+        assert!(unreadable.contains("cannot read /m/ddi.sha256"), "{unreadable}");
+        let garbage = DdiSources::from_options_with(Platform::Other, &all, &no_env, &|_| Ok("not a manifest\n".into()))
+            .unwrap_err();
+        assert!(garbage.starts_with("--ddi-sha256-manifest /m/ddi.sha256: "), "{garbage}");
+        // The file reader itself: a file that is too large is not read.
+        let dir = TempDir::new("ddi-manifest-file");
+        let big = dir.write("big", &vec![b'#'; manifest::MAX_BYTES + 1]);
+        assert!(read_manifest_file(&big).unwrap_err().contains("larger than"));
+        let ok = dir.write("ok", format!("{hash}  a\n").as_bytes());
+        assert!(read_manifest_file(&ok).unwrap().contains("  a"));
+        assert!(read_manifest_file(&dir.path().join("missing")).is_err());
+    }
+
+    #[tokio::test]
+    async fn every_source_is_tried_in_its_place_down_to_the_download() {
+        let (sources, fake, _cache) = mirror_world();
+        let cache_root = sources.cache.clone().unwrap();
+        let (flag, env, xcode, copied, archive) = (
+            TempDir::new("ddi-o-flag"),
+            TempDir::new("ddi-o-env"),
+            TempDir::new("ddi-o-x"),
+            TempDir::new("ddi-o-copy"),
+            TempDir::new("ddi-o-archive"),
+        );
+        for dir in [&flag, &env, &xcode, &copied, &archive] {
+            testddi::cryptex_folder(dir);
+        }
+        let find = |sources: &DdiSources| {
+            sources.locate_for(Variant::Cryptex).map(|found| (found.origin, found.folder.root().to_path_buf()))
+        };
+        // Downloaded files are the last of the local sources.
+        obtained(&sources, Variant::Cryptex).await.0.unwrap();
+        let fetched = find(&sources).unwrap();
+        assert_eq!(fetched.0, Origin::Cache);
+        assert!(fetched.1.starts_with(&cache_root) && fetched.1.ends_with("Xcode_iOS_DDI_Cryptex"));
+        // ... after an archive that was downloaded (cache/archive), which is after a folder copied into the cache.
+        std::fs::create_dir_all(cache_root.join("archive")).unwrap();
+        for entry in std::fs::read_dir(archive.path()).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, cache_root.join("archive").join(path.file_name().unwrap())).unwrap();
+        }
+        assert_eq!(find(&sources).unwrap().1, cache_root.join("archive"));
+        for entry in std::fs::read_dir(copied.path()).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, cache_root.join(path.file_name().unwrap())).unwrap();
+        }
+        assert_eq!(find(&sources).unwrap().1, cache_root);
+        // ... after Xcode's, after $SCRIOS_DDI_DIR, after --ddi-dir.
+        let sources = DdiSources { xcode: vec![xcode.path().into()], ..sources };
+        assert_eq!(find(&sources).unwrap(), (Origin::Xcode, xcode.path().to_path_buf()));
+        let sources = DdiSources { env_dir: Some(env.path().into()), ..sources };
+        assert_eq!(find(&sources).unwrap(), (Origin::Env, env.path().to_path_buf()));
+        let sources = DdiSources { dir: Some(flag.path().into()), ..sources };
+        assert_eq!(find(&sources).unwrap(), (Origin::Option, flag.path().to_path_buf()));
+        assert_eq!(fake.asked().len(), 5, "only the first obtain downloaded");
     }
 
     /// For a person: `SCRIOS_TEST_CRYPTEX_DIR=<a real DDI folder> cargo test --lib real_cryptex_folder -- --ignored`

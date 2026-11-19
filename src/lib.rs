@@ -48,4 +48,6 @@ mod testdir;
 #[cfg(test)]
 mod testmux;
 #[cfg(test)]
+mod testnet;
+#[cfg(test)]
 mod testops;

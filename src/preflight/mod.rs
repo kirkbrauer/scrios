@@ -13,7 +13,8 @@
 //! 5. the **developer disk image** is in place: the device offers the display service, which is the one sure sign (not:
 //!    the image is installed from [`DdiSources`], never over one that is there. On iOS 17.4 and later it is installed
 //!    as a cryptex through `cryptexd`, as Xcode does; on iOS 17.0 to 17.3.1, and where `cryptexd` is not offered, it
-//!    is mounted through the image mounter. Either needs internet for Apple's signing server).
+//!    is mounted through the image mounter. Either needs internet for Apple's signing server. The image is the first
+//!    of the local sources, and when there is none it is downloaded and checked, unless the mode says not to).
 //!
 //! It returns a [`ReadyDevice`], which carries what a stream needs ([`ReadyDevice::stream_options`]), and reports what
 //! it does through a callback of [`PreflightStep`]s: the command line prints their [`line`](PreflightStep::line), a
@@ -28,7 +29,8 @@ use tracing::debug;
 
 use idevice::cryptexd::Cryptex1Assets;
 
-use crate::ddi::{DdiSources, Found, Variant};
+use crate::ddi::fetch::FetchEvent;
+use crate::ddi::{DdiEvent, DdiMode, DdiSources, Found, Variant};
 use crate::mux::{Choice, Mux, PairLookup, choose, usbmuxd_hint};
 use crate::ops::{DevError, Device, InstalledImage, Mounted, Route};
 use crate::stream::StreamOptions;
@@ -155,6 +157,9 @@ pub enum PreflightStep {
     DeveloperModeRevealed,
     /// The developer disk image is being downloaded (from this host: the rest of a URL can carry a secret).
     Downloading { host: String },
+    /// The files of the developer disk image are being downloaded from the repository (the pinned commit, or a
+    /// mirror): where from, how far, and that they were checked against their SHA-256.
+    Fetching(FetchEvent),
     /// The developer disk image is being mounted through the image mounter, from this folder.
     Mounting { from: String },
     /// The upload of the image is this far (percent, in tens).
@@ -183,6 +188,7 @@ impl PreflightStep {
             PreflightStep::Downloading { host } => {
                 Some(format!("Downloading the developer disk image from {host} (checked against the SHA-256 you gave)"))
             }
+            PreflightStep::Fetching(event) => Some(event.line()),
             PreflightStep::Mounting { from } => Some(format!(
                 "Mounting the developer disk image from {from} (the first mount after each restart of the device needs internet, for Apple's signing server)"
             )),
@@ -209,9 +215,10 @@ pub struct PreflightOptions {
     pub target: Target,
     /// Wait for what is missing (and say so), instead of failing at once.
     pub wait: bool,
-    /// Mount the developer disk image when it is not mounted (else that is an error).
+    /// Install the developer disk image when it is not in place (else that is an error).
     pub mount_ddi: bool,
-    /// Where to find the image to mount.
+    /// Where the image to install comes from, and whether it may be downloaded (`DdiSources::default()` has no source
+    /// and never downloads; the command line builds [`DdiSources::from_options`], which does).
     pub ddi: DdiSources,
     /// How often to look again while waiting.
     pub poll: Duration,
@@ -512,8 +519,21 @@ async fn install_image<O: Ops>(
     debug!("the developer disk image goes onto {udid} by {route:?}");
     match route {
         Route::Cryptexd => Box::pin(install_cryptex(on_device, ddi, progress, udid)).await,
-        Route::ImageMounter(_) => Box::pin(mount_personalized(on_device, ddi, progress, udid)).await,
+        Route::ImageMounter(_) => {
+            refuse_if_nothing_may_be_installed(ddi, udid)?;
+            Box::pin(mount_personalized(on_device, ddi, progress, udid)).await
+        }
     }
+}
+
+/// `--ddi-source none`: scrios reports and installs nothing, so a device that has no image is an error that says so.
+fn refuse_if_nothing_may_be_installed(ddi: &DdiSources, udid: &str) -> Result<(), PreflightError> {
+    if ddi.mode == DdiMode::None {
+        return Err(PreflightError::Failed(format!(
+            "the developer disk image is not installed on {udid}, and --ddi-source none says that scrios installs nothing: install it with Xcode, or run `scrios mount-ddi` without --ddi-source none"
+        )));
+    }
+    Ok(())
 }
 
 /// The cryptex route: `cryptexd` installs the image of the first source that has a cryptex.
@@ -528,6 +548,7 @@ async fn install_cryptex<O: Ops>(
         progress(&PreflightStep::AlreadyInstalled { image });
         return Ok(Mounted::Already);
     }
+    refuse_if_nothing_may_be_installed(ddi, udid)?;
     let found = find_image(ddi, Variant::Cryptex, progress).await?;
     progress(&PreflightStep::Installing { from: found.describe() });
     let assets = found.folder.cryptex_assets().await.map_err(PreflightError::Failed)?;
@@ -571,8 +592,11 @@ async fn find_image(
     variant: Variant,
     progress: &mut (dyn FnMut(&PreflightStep) + Send),
 ) -> Result<Found, PreflightError> {
-    Box::pin(ddi.find_or_download_for(variant, &mut |host: &str| {
-        progress(&PreflightStep::Downloading { host: host.to_string() });
+    Box::pin(ddi.obtain(variant, &mut |event| {
+        progress(&match event {
+            DdiEvent::Archive { host } => PreflightStep::Downloading { host },
+            DdiEvent::Fetch(event) => PreflightStep::Fetching(event),
+        });
     }))
     .await
     .map_err(PreflightError::Failed)
@@ -613,7 +637,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ddi::DdiSources;
+    use crate::ddi::{DdiMode, DdiSources};
     use crate::ops::MounterWhy;
     use crate::testddi;
     use crate::testdir::TempDir;
@@ -1005,6 +1029,76 @@ mod tests {
         assert!(said.contains(&"Unlock the device and tap Trust".to_string()), "{said:?}");
         assert!(said.contains(&"Unlock the device".to_string()), "{said:?}");
         assert_eq!(device.with(|s| s.installs.len()), 2, "the locked attempt, then the one that worked");
+    }
+
+    #[tokio::test]
+    async fn with_no_local_image_the_cryptex_is_downloaded_checked_and_installed_one_line_for_each_step() {
+        let fake = trusted();
+        let (ddi, net, _cache) = testddi::mirror_world();
+        let device = cryptexd_device();
+        let (result, steps) = go(&PreflightOptions { ddi, ..options(&fake, true) }, &device).await;
+        assert!(result.is_ok(), "{result:?}");
+        let said = lines(&steps);
+        assert_eq!(said.len(), 4, "{said:?}");
+        assert_eq!(said[0], "Downloading the developer disk image from mirror.example/ddi");
+        assert!(said[1].starts_with("Verified: every file has the size and SHA-256"), "{said:?}");
+        assert!(
+            said[2].starts_with("Installing the developer disk image from ") && said[2].contains("scrios's cache"),
+            "{said:?}"
+        );
+        assert_eq!(said[3], "The developer disk image is installed (com.apple.MobileAsset.DDI 27.2.52.0)");
+        assert_eq!(net.asked().len(), 5);
+        // What was downloaded is what cryptexd was given.
+        let installs = device.with(|s| s.installs.clone());
+        assert_eq!(installs.len(), 1);
+        assert_eq!(installs[0].image, testddi::CRYPTEX_IMAGE);
+        assert_eq!(installs[0].nonce_domain, Some(testddi::NONCE_DOMAIN));
+    }
+
+    #[tokio::test]
+    async fn the_download_that_is_refused_is_the_error_and_nothing_is_installed() {
+        let fake = trusted();
+        let (ddi, net, _cache) = testddi::mirror_world();
+        net.answer(
+            "https://mirror.example/ddi/abc123/PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg",
+            Ok(b"not the image".to_vec()),
+        );
+        let device = cryptexd_device();
+        let (result, steps) = go(&PreflightOptions { ddi, ..options(&fake, true) }, &device).await;
+        let PreflightError::Failed(why) = result.unwrap_err() else { panic!() };
+        assert!(why.contains("Image.dmg has the SHA-256") && why.contains("not used"), "{why}");
+        assert!(device.with(|s| s.installs.is_empty()));
+        assert!(
+            !lines(&steps).iter().any(|l| l.starts_with("Installing") || l.starts_with("Verified")),
+            "{:?}",
+            lines(&steps)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_source_mode_says_whether_the_network_is_asked_and_whether_anything_is_installed() {
+        let fake = trusted();
+        let (auto, net, _cache) = testddi::mirror_world();
+        // local: no download, the error says why; none: nothing is installed, the error says that.
+        for (mode, want) in [(DdiMode::Local, "--ddi-source local"), (DdiMode::None, "--ddi-source none")] {
+            for route in [Route::Cryptexd, Route::ImageMounter(MounterWhy::NotOffered)] {
+                let device = cryptexd_device();
+                device.with(|s| s.route = VecDeque::from([Ok(route)]));
+                let ddi = DdiSources { mode, ..auto.clone() };
+                let (result, _) = go(&PreflightOptions { ddi, ..options(&fake, true) }, &device).await;
+                let PreflightError::Failed(why) = result.unwrap_err() else { panic!() };
+                assert!(why.contains(want), "{mode:?} {route:?}: {why}");
+                assert_eq!((device.with(|s| s.installs.len()), device.with(|s| s.mounts)), (0, 0));
+            }
+        }
+        assert!(net.asked().is_empty(), "{:?}", net.asked());
+        // An image that is installed is the one thing none has nothing against: it is reported.
+        let device = cryptexd_device();
+        device.with(|s| s.installed = VecDeque::from([Ok(Some(crate::testops::fake_cryptex()))]));
+        let none = DdiSources { mode: DdiMode::None, ..auto };
+        let (result, steps) = go(&PreflightOptions { ddi: none, ..options(&fake, true) }, &device).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(lines(&steps)[0].contains("already installed"));
     }
 
     #[tokio::test]

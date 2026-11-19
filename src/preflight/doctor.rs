@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 
 use super::{Blocker, Ops, Target, listed_or_nothing};
-use crate::ddi::DdiSources;
+use crate::ddi::{DdiMode, DdiSources, Variant};
 use crate::mux::{Choice, Mux, PairLookup, choose, usbmuxd_hint};
 use crate::ops::{DevError, Device, Route};
 
@@ -322,6 +322,9 @@ fn image_source(ddi: &DdiSources, mounted: Option<bool>, route: Option<Route>) -
             let explicit = ddi.dir.is_some() || ddi.env_dir.is_some();
             if explicit {
                 Check::fail("image source", why, "point --ddi-dir (or $SCRIOS_DDI_DIR) at the iOS_DDI folder of Xcode")
+            } else if ddi.mode == DdiMode::Auto {
+                // Nothing local, and scrios downloads the image when it installs it: that is a source, not a failure.
+                Check::ok("image source", ddi.fallback_line(route.map_or(Variant::Cryptex, Route::variant)))
             } else {
                 Check::fail("image source", "none found", why)
             }

@@ -445,51 +445,9 @@ mod tests {
         clippy::arithmetic_side_effects,
         reason = "test code: a panic is a failed test, and the inputs are small, fixed values"
     )]
-    use std::collections::HashMap;
-    use std::sync::{Mutex, PoisonError};
-
     use super::*;
     use crate::testdir::TempDir;
-
-    /// A transport with the answers given, that remembers what it was asked for. It never touches a network.
-    #[derive(Debug, Default)]
-    struct FakeFetch {
-        answers: Mutex<HashMap<String, Result<Vec<u8>, HttpError>>>,
-        asked: Mutex<Vec<String>>,
-    }
-
-    impl FakeFetch {
-        fn answer(&self, url: &str, body: Result<Vec<u8>, HttpError>) {
-            self.answers.lock().unwrap_or_else(PoisonError::into_inner).insert(url.to_string(), body);
-        }
-
-        fn asked(&self) -> Vec<String> {
-            self.asked.lock().unwrap_or_else(PoisonError::into_inner).clone()
-        }
-    }
-
-    impl Fetch for FakeFetch {
-        fn get<'a>(
-            &'a self,
-            url: &'a Url,
-            max_bytes: u64,
-            progress: &'a mut (dyn FnMut(u64) + Send),
-        ) -> BoxFuture<'a, Result<Vec<u8>, HttpError>> {
-            Box::pin(async move {
-                self.asked.lock().unwrap_or_else(PoisonError::into_inner).push(url.as_text());
-                let answer = self.answers.lock().unwrap_or_else(PoisonError::into_inner).get(&url.as_text()).cloned();
-                let body = answer.unwrap_or(Err(HttpError::Status(404)))?;
-                // A real client refuses what is larger than the cap, and tells its progress as it reads.
-                if body.len() as u64 > max_bytes {
-                    return Err(HttpError::TooLarge { limit: max_bytes });
-                }
-                for step in 1..=4_u64 {
-                    progress(body.len() as u64 * step / 4);
-                }
-                Ok(body)
-            })
-        }
-    }
+    use crate::testnet::FakeFetch;
 
     /// A plan of the cryptex folder with small content: the manifest (a real one, from `testddi`) and the image.
     fn small_plan() -> (Plan, Vec<(String, Vec<u8>)>) {

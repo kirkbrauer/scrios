@@ -6,10 +6,10 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use tracing::error;
 
-use scrios::ddi::DdiSources;
+use scrios::ddi::{DdiEvent, DdiMode, DdiOptions, DdiSources, Variant};
 use scrios::ops::{DevError, Device, Mounted, Removed};
 use scrios::preflight::doctor::{self, DoctorOptions};
 use scrios::preflight::{
@@ -50,27 +50,87 @@ impl TargetArgs {
     }
 }
 
+/// Where the developer disk image may come from (`--ddi-source`).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdiSourceArg {
+    /// Local copies first (--ddi-dir, Xcode, the cache); if there is none, download the image
+    Auto,
+    /// Local copies only: never download
+    Local,
+    /// Install nothing: only report what is found
+    None,
+}
+
+impl DdiSourceArg {
+    fn mode(self) -> DdiMode {
+        match self {
+            DdiSourceArg::Auto => DdiMode::Auto,
+            DdiSourceArg::Local => DdiMode::Local,
+            DdiSourceArg::None => DdiMode::None,
+        }
+    }
+}
+
 /// Where to find the developer disk image.
 #[derive(Args, Debug, Clone, Default)]
 pub struct DdiArgs {
     #[arg(
         long = "ddi-dir",
         value_name = "DIR",
-        help = "The developer disk image folder to mount: the iOS_DDI folder of Xcode (or a copy of it)",
-        long_help = "The developer disk image folder to mount: the iOS_DDI folder of Xcode (or a copy of it), with its \
+        help = "The developer disk image folder to install: the iOS_DDI folder of Xcode (or a copy of it)",
+        long_help = "The developer disk image folder to install: the iOS_DDI folder of Xcode (or a copy of it), with its \
 BuildManifest.plist in it or in Restore/. Default: $SCRIOS_DDI_DIR, then Xcode's folders (macOS), then scrios's cache \
 folder (~/Library/Caches/scrios/ddi on macOS, $XDG_CACHE_HOME/scrios/ddi or ~/.cache/scrios/ddi on Linux, \
-%LOCALAPPDATA%\\scrios\\ddi on Windows)"
+%LOCALAPPDATA%\\scrios\\ddi on Windows), then a download (see --ddi-source)"
     )]
     pub dir: Option<PathBuf>,
+
+    #[arg(
+        long = "ddi-source",
+        value_enum,
+        value_name = "MODE",
+        help = "Where the image may come from: auto (local copies, else download it), local (never download), none (install nothing). Default: auto",
+        long_help = "Where the developer disk image may come from. auto (the default): a local copy (--ddi-dir, Xcode, the \
+cache), and if there is none, a download of Apple's image from the DeveloperDiskImage repository (GitHub), pinned to one \
+commit and checked against its SHA-256 before it is used. local: local copies only, never the network. none: scrios \
+installs nothing, it only reports (also $SCRIOS_DDI_SOURCE)"
+    )]
+    pub source: Option<DdiSourceArg>,
+
+    #[arg(
+        long = "ddi-repo",
+        value_name = "URL",
+        help = "Download from this mirror of the DeveloperDiskImage repository instead of GitHub's (needs --ddi-ref and --ddi-sha256-manifest)",
+        long_help = "Download the image from this mirror of the DeveloperDiskImage repository (an https URL; a \
+github.com/<owner>/<repo> URL is read from GitHub's raw file service) instead of the pinned GitHub commit. Needs --ddi-ref \
+and --ddi-sha256-manifest: a mirror's files are never used unchecked. The files are read from \
+<URL>/<ref>/PersonalizedImages/<folder>/<name> (also $SCRIOS_DDI_REPO)"
+    )]
+    pub repo: Option<String>,
+
+    #[arg(
+        long = "ddi-ref",
+        value_name = "COMMIT",
+        help = "The commit (or tag) of --ddi-repo to read (also $SCRIOS_DDI_REF)"
+    )]
+    pub git_ref: Option<String>,
+
+    #[arg(
+        long = "ddi-sha256-manifest",
+        value_name = "FILE",
+        help = "A `sha256sum` list (`<sha256>  <path>`) of the files of --ddi-repo: what each must be (also $SCRIOS_DDI_SHA256_MANIFEST)",
+        long_help = "A list of the SHA-256 of the files of --ddi-repo, one `<sha256>  <path>` line each (what `sha256sum` \
+writes), with the paths from the root of the repository: PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg and so on. \
+Without it a mirror is refused (also $SCRIOS_DDI_SHA256_MANIFEST)"
+    )]
+    pub sha256_manifest: Option<PathBuf>,
 
     #[arg(
         long = "ddi-download-url",
         value_name = "URL",
         help = "Download the image from this URL if none is found (a .tar.gz of the iOS_DDI folder; needs --ddi-sha256)",
         long_help = "Where to download the image from if none is found: the URL of a .tar.gz of the iOS_DDI folder, which \
-goes into the cache folder. Needs --ddi-sha256. There is no default URL: scrios does not host Apple's image (also \
-$SCRIOS_DDI_URL)"
+goes into the cache folder, instead of the DeveloperDiskImage repository. Needs --ddi-sha256 (also $SCRIOS_DDI_URL)"
     )]
     pub download_url: Option<String>,
 
@@ -85,7 +145,15 @@ $SCRIOS_DDI_URL)"
 impl DdiArgs {
     /// The places to look for the image, with the environment's say where the options leave it open.
     pub fn sources(&self) -> Result<DdiSources, String> {
-        DdiSources::from_host(self.dir.clone(), self.download_url.as_deref(), self.sha256.as_deref())
+        DdiSources::from_options(&DdiOptions {
+            dir: self.dir.clone(),
+            download_url: self.download_url.clone(),
+            sha256: self.sha256.clone(),
+            source: self.source.map(DdiSourceArg::mode),
+            repo: self.repo.clone(),
+            git_ref: self.git_ref.clone(),
+            sha256_manifest: self.sha256_manifest.clone(),
+        })
     }
 }
 
@@ -219,13 +287,18 @@ pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
         if let Some(route) = route {
             report.line("Install route", route.describe());
         }
-        let located = match route {
-            Some(route) => sources.locate_for(route.variant()),
+        let variant = route.map(scrios::ops::Route::variant);
+        let located = match variant {
+            Some(variant) => sources.locate_for(variant),
             None => sources.locate(),
         };
         match located {
             Ok(found) => report.line("Image to install", &found.describe()),
-            Err(why) => report.line("Image to install", &format!("none ({why})")),
+            // Nothing is found locally: an explicit folder that does not work is said, else what scrios would do.
+            Err(why) if sources.dir.is_some() || sources.env_dir.is_some() => {
+                report.line("Image to install", &format!("none ({why})"));
+            }
+            Err(_) => report.line("Image to install", &sources.fallback_line(variant.unwrap_or(Variant::Cryptex))),
         }
         out(&report.0);
         if failed {
@@ -236,6 +309,99 @@ pub fn run_ddi_status(target: &TargetArgs, ddi: &DdiArgs) -> i32 {
             EXIT_MISSING
         }
     })
+}
+
+/// Which form of the image `scrios ddi-fetch` downloads (`--variant`).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FetchVariantArg {
+    /// What cryptexd installs (iOS 17.4 and later)
+    #[default]
+    Cryptex,
+    /// What the image mounter mounts (iOS 17.0 to 17.3.1)
+    Personalized,
+    /// Both
+    All,
+}
+
+impl FetchVariantArg {
+    fn variants(self) -> Vec<Variant> {
+        match self {
+            FetchVariantArg::Cryptex => vec![Variant::Cryptex],
+            FetchVariantArg::Personalized => vec![Variant::Personalized],
+            FetchVariantArg::All => vec![Variant::Cryptex, Variant::Personalized],
+        }
+    }
+}
+
+/// `scrios ddi-fetch`: downloads the developer disk image into the cache and checks it, without a device: every file
+/// against its size and SHA-256, then that the folder loads the way the install reads it. Prints the folder on
+/// standard output. Exit status 0 if the files are in the cache and good, 2 if not.
+pub fn run_ddi_fetch(ddi: &DdiArgs, variant: FetchVariantArg) -> i32 {
+    let sources = match ddi.sources() {
+        Ok(s) => s,
+        Err(why) => {
+            error!("{why}");
+            return EXIT_START_FAILED;
+        }
+    };
+    if let Err(why) = fetch_refusal(ddi, &sources) {
+        error!("{why}");
+        return EXIT_START_FAILED;
+    }
+    run_async(async {
+        for variant in variant.variants() {
+            let found = match Box::pin(sources.fetch_to_cache(variant, &mut |event: DdiEvent| say(&event.line()))).await
+            {
+                Ok(found) => found,
+                Err(why) => {
+                    error!("{why}");
+                    return EXIT_START_FAILED;
+                }
+            };
+            // What the install reads must be what is there: the files load, with the parameters the install sends.
+            let loaded = match variant {
+                Variant::Cryptex => match found.folder.cryptex_assets().await {
+                    Ok(assets) => match (assets.nonce_domain(), assets.cryptex1_properties()) {
+                        (Ok(domain), Ok(_)) => Ok(format!(
+                            "the cryptex loads: image {} bytes, trust cache {}, nonce domain {domain}",
+                            assets.image.len(),
+                            assets.trustcache.len()
+                        )),
+                        (Err(e), _) | (_, Err(e)) => Err(format!("the cryptex does not load for the install: {e}")),
+                    },
+                    Err(why) => Err(why),
+                },
+                Variant::Personalized => found.folder.read_manifest().map(|_| "the manifest reads".to_string()),
+            };
+            match loaded {
+                Ok(note) => say(&format!(
+                    "The developer disk image ({}) is in the cache, verified: {} ({note})",
+                    variant.label(),
+                    found.describe()
+                )),
+                Err(why) => {
+                    error!("{why}");
+                    return EXIT_START_FAILED;
+                }
+            }
+            out(&format!("{}\n", found.folder.root().display()));
+        }
+        0
+    })
+}
+
+/// What `scrios ddi-fetch` cannot do: it downloads the repository's files into the cache, from nothing else.
+fn fetch_refusal(ddi: &DdiArgs, sources: &DdiSources) -> Result<(), String> {
+    if ddi.dir.is_some() {
+        return Err("scrios ddi-fetch fills the cache: --ddi-dir has no use here".into());
+    }
+    if sources.mode != DdiMode::Auto {
+        return Err("scrios ddi-fetch downloads: it needs --ddi-source auto (the default)".into());
+    }
+    if sources.download.is_some() {
+        return Err("scrios ddi-fetch downloads the files of the DeveloperDiskImage repository (pinned, or a mirror): an archive (--ddi-download-url) is for `scrios mount-ddi`".into());
+    }
+    Ok(())
 }
 
 /// `scrios mount-ddi`: puts the developer disk image on the device, the way the device takes it: as a cryptex through
@@ -510,5 +676,41 @@ mod tests {
             ..DdiArgs::default()
         };
         assert!(both.sources().unwrap().download.is_some());
+    }
+
+    #[test]
+    fn the_source_options_become_a_mode_and_the_option_wins_over_the_environment() {
+        for (arg, mode) in [
+            (DdiSourceArg::Auto, DdiMode::Auto),
+            (DdiSourceArg::Local, DdiMode::Local),
+            (DdiSourceArg::None, DdiMode::None),
+        ] {
+            let args = DdiArgs { source: Some(arg), ..DdiArgs::default() };
+            assert_eq!(args.sources().unwrap().mode, mode);
+        }
+        // A mirror that is half given is refused before anything is read or asked.
+        let half = DdiArgs { repo: Some("https://mirror.example/ddi".into()), ..DdiArgs::default() };
+        assert!(half.sources().unwrap_err().contains("--ddi-sha256-manifest"));
+        let ref_only = DdiArgs { git_ref: Some("abc".into()), ..DdiArgs::default() };
+        assert!(ref_only.sources().unwrap_err().contains("--ddi-repo"));
+    }
+
+    #[test]
+    fn ddi_fetch_downloads_into_the_cache_and_nothing_else() {
+        let auto = DdiSources { mode: DdiMode::Auto, ..DdiSources::default() };
+        assert!(fetch_refusal(&DdiArgs::default(), &auto).is_ok());
+        let dir = DdiArgs { dir: Some("/x".into()), ..DdiArgs::default() };
+        assert!(fetch_refusal(&dir, &auto).unwrap_err().contains("--ddi-dir"));
+        for mode in [DdiMode::Local, DdiMode::None] {
+            let why = fetch_refusal(&DdiArgs::default(), &DdiSources { mode, ..DdiSources::default() }).unwrap_err();
+            assert!(why.contains("--ddi-source auto"), "{why}");
+        }
+        let archive = DdiSources {
+            download: Some(scrios::ddi::Download::new("https://example.com/x.tar.gz", &"0".repeat(64)).unwrap()),
+            ..auto
+        };
+        assert!(fetch_refusal(&DdiArgs::default(), &archive).unwrap_err().contains("mount-ddi"));
+        assert_eq!(FetchVariantArg::All.variants(), vec![Variant::Cryptex, Variant::Personalized]);
+        assert_eq!(FetchVariantArg::default().variants(), vec![Variant::Cryptex]);
     }
 }

@@ -1,7 +1,13 @@
 //! Folders of the developer disk image for the tests: a cryptex folder (what `cryptexd` installs) and a personalized
 //! one (what the image mounter mounts), small enough to write for each test, with the shape of the real ones.
 
+use std::sync::Arc;
+
+use crate::ddi::fetch::Mirror;
+use crate::ddi::manifest::Manifest;
+use crate::ddi::{DdiMode, DdiSources, Remote, sha256_hex};
 use crate::testdir::TempDir;
+use crate::testnet::FakeFetch;
 
 /// The payloads of the cryptex folder, by the name of the file that holds each.
 pub(crate) const CRYPTEX_IMAGE: &[u8] = b"cryptex image";
@@ -89,4 +95,39 @@ pub(crate) fn personalized_folder(dir: &TempDir) {
     dir.write("BuildManifest.plist", &manifest(Some(("Image.dmg", "Image.dmg.trustcache")), None));
     dir.write("Image.dmg", b"personalized image");
     dir.write("Image.dmg.trustcache", b"personalized trust cache");
+}
+
+/// The content of the cryptex folder, as a mirror would serve it: `(path in the repository, bytes)`.
+fn mirror_content() -> Vec<(String, Vec<u8>)> {
+    let dir = TempDir::new("ddi-mirror-content");
+    cryptex_folder(&dir);
+    ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache", "Image.dmg.cryptex_info", "Image.dmg.root_hash"]
+        .iter()
+        .map(|name| {
+            (format!("PersonalizedImages/Xcode_iOS_DDI_Cryptex/{name}"), std::fs::read(dir.path().join(name)).unwrap())
+        })
+        .collect()
+}
+
+/// Sources that download the cryptex (`DdiMode::Auto`) from a mirror at `https://mirror.example/ddi`, revision
+/// `abc123`, that a fake serves, into a cache of their own (which the third value keeps alive). Nothing else is
+/// found locally.
+pub(crate) fn mirror_world() -> (DdiSources, Arc<FakeFetch>, TempDir) {
+    let content = mirror_content();
+    let manifest: String =
+        content.iter().map(|(path, bytes)| format!("{}  {path}\n", sha256_hex(bytes))).collect::<Vec<_>>().concat();
+    let fake = Arc::new(FakeFetch::default());
+    for (path, bytes) in &content {
+        fake.answer(&format!("https://mirror.example/ddi/abc123/{path}"), Ok(bytes.clone()));
+    }
+    let mirror = Mirror::new("https://mirror.example/ddi", "abc123", Manifest::parse(&manifest).unwrap()).unwrap();
+    let cache = TempDir::new("ddi-mirror-cache");
+    let sources = DdiSources {
+        cache: Some(cache.path().join("ddi")),
+        mode: DdiMode::Auto,
+        remote: Remote::Mirror(mirror),
+        fetcher: Some(fake.clone()),
+        ..DdiSources::default()
+    };
+    (sources, fake, cache)
 }
