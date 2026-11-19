@@ -1,0 +1,3 @@
+# Text files are LF on every platform. A Windows checkout would otherwise turn them into CRLF (git's autocrlf, which is
+# on by default there), which breaks the shell scripts that CI runs in Git Bash.
+* text=auto eol=lf
