@@ -299,7 +299,7 @@ they connect and has not been tried on a device.
 
 ## The viewer
 
-`scrios` (with no subcommand, in a build with the viewer) opens a window with the device's screen. The [README](../README.md#the-window)
+`scrios` (with no subcommand, in a build with the viewer) opens a window with the device's screen. The [README](../README.md#run-it)
 has the overview; the details:
 
 * **Before the window.** The window opens when the device is ready: the same set-up as `scrios stream` runs first, on
@@ -366,7 +366,7 @@ has the overview; the details:
 
 ## On Windows
 
-What a Windows host needs is in the [README](../README.md#requirements): the Apple Devices app or iTunes (their Apple Mobile
+What a Windows host needs is in the [README](../README.md#before-you-start): the Apple Devices app or iTunes (their Apple Mobile
 Device Service is usbmuxd, on `127.0.0.1:27015`), a trusted device, Developer Mode, and a DDI folder copied from a Mac with
 Xcode. A first session, in PowerShell, from the folder `scrios.exe` was unzipped to (nothing here has been tried on a
 device yet; `doctor` shows where it stops):

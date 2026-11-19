@@ -112,3 +112,13 @@ same client.
 A tag `vX.Y.Z` (it must equal `version` in `Cargo.toml`) runs `.github/workflows/release.yml`: the static musl
 binaries, the macOS one and the Windows zip (`scrios-x86_64-pc-windows-msvc.zip`, and an arm64 one if its cross-build
 works), `SHA256SUMS`, a GitHub release, and `cargo publish` to crates.io.
+
+## Development
+
+```
+cargo fmt --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-features --locked
+```
+
+The tests need no device and no network.
