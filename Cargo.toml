@@ -68,6 +68,9 @@ serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+# The host's own trust store, and $SSL_CERT_FILE / $SSL_CERT_DIR, added to the Mozilla roots for that download: a
+# corporate proxy that inspects TLS signs with a CA that only the host knows.
+rustls-native-certs = "0.8"
 # Already in the tree through idevice's mounter: the SHA-256 that a downloaded developer disk image is checked against.
 sha2 = "0.10"
 # Unpacks a downloaded developer disk image (a .tar.gz); no extended attributes.

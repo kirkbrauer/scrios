@@ -237,8 +237,14 @@ MB), or the three of `PersonalizedImages/Xcode_iOS_DDI_Personalized/`.
   change under the pin.
 * **Limits.** https only (a `http://` URL, or a redirect to one, is refused); a redirect only to the same host or to
   GitHub's raw file hosts (`raw.githubusercontent.com`, `objects.githubusercontent.com`), at most three; a file may not be
-  larger than 64 MB (and not larger than its pinned size); 20 s to connect, 30 s of silence, 15 minutes per file. HTTP
-  proxy variables are not used.
+  larger than 64 MB (and not larger than its pinned size); 20 s to connect, 30 s of silence, 15 minutes per file.
+* **Certificates and proxies.** A server's certificate may be signed by a built-in (Mozilla) root or by any authority
+  the host trusts: the system's trust store (the keychain on macOS, the certificate store on Windows, the OpenSSL
+  folders on Linux), and the PEM files that `SSL_CERT_FILE` and `SSL_CERT_DIR` name. So behind a proxy that inspects
+  TLS, install the proxy's CA on the host or run `SSL_CERT_FILE=/path/to/ca.pem scrios ...`; an "UnknownIssuer" error
+  says the same. An https archive (`--ddi-download-url`) is checked the same way. The proxy variables (`HTTPS_PROXY`)
+  are **not** used: the download connects to the host directly, so a network that only lets a proxy out needs a local
+  copy (`--ddi-dir`) or a mirror or archive it can reach.
 * **Cached.** The checked files are kept under `<cache>/<build>/<folder>/` (`27B52/Xcode_iOS_DDI_Cryptex/`), each written to
   a temporary name and renamed into place, so that a download that stops half way is never mistaken for a file. They are
   checked again (size and SHA-256) every time they are used: a good cache needs no network at all, and a file that was
@@ -467,6 +473,7 @@ service that did not connect is answered with an `ok: false` event.
 | `SCRIOS_DDI_SOURCE` | `auto`, `local` or `none`, when `--ddi-source` is not given |
 | `SCRIOS_DDI_REPO`, `SCRIOS_DDI_REF`, `SCRIOS_DDI_SHA256_MANIFEST` | the mirror to download the DDI from, its commit, and the manifest of SHA-256 values of its files |
 | `SCRIOS_DDI_URL`, `SCRIOS_DDI_SHA256` | the archive to download the DDI from, and its SHA-256 |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | certificate authorities (PEM) to trust for the download of the DDI, besides the built-in roots and the system's trust store: the CA of a proxy that inspects TLS |
 | `RUST_LOG` | the log level (the default is `info`) |
 
 ## Exit status and logs

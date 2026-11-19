@@ -100,6 +100,13 @@ Mozilla roots (`webpki-roots`): the three crates are in the tree already through
 dependencies of scrios itself only so that the download can have limits that idevice's own HTTP client has not (https
 only, a redirect only to the same host or GitHub's raw hosts, a size cap, timeouts).
 
+The download also trusts what the host trusts: `rustls-native-certs` adds the host's trust store (the keychain on macOS,
+the certificate store on Windows, the OpenSSL folders on Linux) and the files that `SSL_CERT_FILE` and `SSL_CERT_DIR`
+name to the Mozilla roots, so a network whose proxy inspects TLS with the company's CA works once that CA is installed
+on the host or named in `SSL_CERT_FILE`. It is the one crate the download adds (with `openssl-probe`, and
+`security-framework` on macOS and `schannel` on Windows). An https archive (`--ddi-download-url`) is downloaded by the
+same client.
+
 ## Releases
 
 A tag `vX.Y.Z` (it must equal `version` in `Cargo.toml`) runs `.github/workflows/release.yml`: the static musl

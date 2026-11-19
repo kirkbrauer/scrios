@@ -64,6 +64,8 @@ pub const ENV_MANIFEST: &str = "SCRIOS_DDI_SHA256_MANIFEST";
 
 /// The largest archive that is unpacked (its entries' sizes added up): the image itself is some tens of MB.
 const MAX_UNPACKED: u64 = 2 * 1024 * 1024 * 1024;
+/// The largest archive that is downloaded (the image is some tens of MB; an archive of the whole folder some hundreds).
+const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
 /// The manifest's file name.
 const MANIFEST: &str = "BuildManifest.plist";
 /// The folder of the cache that a downloaded archive is unpacked into.
@@ -993,14 +995,25 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Downloads `download`, checks its hash, unpacks it and puts it in `dest` (replacing what is there), and opens it.
 async fn fetch(download: &Download, dest: &Path) -> Result<DdiFolder, String> {
     let host = host_of(&download.url);
-    let response = Box::pin(idevice::http::get(download.url.clone()))
-        .await
-        .map_err(|e| format!("cannot download the DDI from {host}: {e:?}"))?;
-    if response.status != 200 {
-        return Err(format!("cannot download the DDI from {host}: the server answered {}", response.status));
-    }
-    info!("downloaded {} bytes from {host}", response.body.len());
-    install_archive(&response.body, &download.sha256, dest)
+    // An https archive goes through scrios's own client: the host's trust store and $SSL_CERT_FILE count (an archive
+    // on a company's own server is signed by the company's CA), and the download is bounded. Its redirects stay on
+    // the archive's host. Plain http has no certificate to check: idevice's client, as before.
+    let body = if download.url.starts_with("https://") {
+        let url = http::Url::parse(&download.url).map_err(|e| format!("cannot download the DDI from {host}: {e}"))?;
+        Box::pin(http::get(&url, &http::Limits::for_file(MAX_ARCHIVE), &mut |_| {}))
+            .await
+            .map_err(|e| format!("cannot download the DDI from {host}: {e}"))?
+    } else {
+        let response = Box::pin(idevice::http::get(download.url.clone()))
+            .await
+            .map_err(|e| format!("cannot download the DDI from {host}: {e:?}"))?;
+        if response.status != 200 {
+            return Err(format!("cannot download the DDI from {host}: the server answered {}", response.status));
+        }
+        response.body
+    };
+    info!("downloaded {} bytes from {host}", body.len());
+    install_archive(&body, &download.sha256, dest)
 }
 
 /// Checks that `archive` has the hash `sha256`, unpacks it next to `dest` and moves it into place.

@@ -4,8 +4,9 @@
 //! idevice has an HTTP client of its own (it is what Apple's signing server is asked through), but it follows a
 //! redirect to any host and any scheme, reads a body of any size into memory and has no timeout; that is not what is
 //! wanted for a file that scrios will hand to a device. This one is the few hundred lines that are: a `GET`, a status
-//! line and headers read within a bound, a body read within a bound, TLS by `rustls` (the Mozilla roots, as idevice
-//! uses) on the same `ring` backend. It speaks `HTTP/1.1` with `Connection: close`, no compression, no cookies, no
+//! line and headers read within a bound, a body read within a bound, TLS by `rustls` on the same `ring` backend, with
+//! the Mozilla roots (as idevice uses) and the host's own trust store and `$SSL_CERT_FILE` (so a proxy that inspects
+//! TLS with a CA the host trusts is not an error). It speaks `HTTP/1.1` with `Connection: close`, no compression, no cookies, no
 //! proxy settings.
 //!
 //! What is checked is not what is trusted: the files are checked against SHA-256 values that are in the program (or in
@@ -26,11 +27,12 @@
 )]
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::debug;
 
 /// The hosts of GitHub's raw file service: a request to one may be answered with a redirect to the other.
 pub const GITHUB_RAW_HOSTS: [&str; 2] = ["raw.githubusercontent.com", "objects.githubusercontent.com"];
@@ -626,16 +628,60 @@ fn find_blank_line(buf: &[u8]) -> Option<usize> {
 
 // ---- the connection -----------------------------------------------------------------------------
 
-/// The TLS settings: the Mozilla roots, the protocol versions `rustls` takes by default, on the `ring` provider.
+/// The certificate authorities a server may be signed by: the Mozilla roots that are built in, and with them the ones
+/// the host trusts (its trust store: the keychain on macOS, the certificate store on Windows, the OpenSSL folders on
+/// Linux; and the files that `$SSL_CERT_FILE` and `$SSL_CERT_DIR` name, on every host). A proxy that inspects TLS
+/// signs with a CA of its own, which only the host knows. A host with no trust store at all still has the built-in
+/// roots, so GitHub is reached from a bare container too.
+fn root_store() -> rustls::RootCertStore {
+    let native = rustls_native_certs::load_native_certs();
+    for e in &native.errors {
+        debug!("reading the host's trusted certificates: {e}");
+    }
+    let roots = roots_with(native.certs);
+    debug!("TLS roots: {} ({} built in)", roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+    roots
+}
+
+/// The built-in roots and `extra` (those of `extra` that are not certificates a chain can end at are left out).
+fn roots_with(extra: Vec<rustls::pki_types::CertificateDer<'static>>) -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let (_, ignored) = roots.add_parsable_certificates(extra);
+    if ignored > 0 {
+        debug!("{ignored} of the host's trusted certificates are not usable as roots");
+    }
+    roots
+}
+
+/// The TLS settings: the roots of [`root_store`], the protocol versions `rustls` takes by default, on the `ring`
+/// provider. Made once: reading the host's trust store is not free.
 fn tls_config() -> Result<Arc<rustls::ClientConfig>, HttpError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| HttpError::Connect(format!("TLS: {e}")))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
+    static CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, HttpError>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| HttpError::Connect(format!("TLS: {e}")))?
+                .with_root_certificates(root_store())
+                .with_no_client_auth();
+            Ok(Arc::new(config))
+        })
+        .clone()
+}
+
+/// What a failed TLS handshake is reported as. A certificate signed by nobody the host trusts is, on a network that
+/// inspects TLS, the proxy's: the message says how to make its CA known.
+fn tls_error(e: &std::io::Error) -> HttpError {
+    let text = e.to_string();
+    if text.contains("UnknownIssuer") {
+        return HttpError::Connect(format!(
+            "TLS: {text}: the server's certificate is signed by an authority this host does not trust. If a proxy on \
+             this network inspects TLS, add its CA certificate to the system's trust store, or point SSL_CERT_FILE at \
+             a PEM file that holds it"
+        ));
+    }
+    HttpError::Connect(format!("TLS: {text}"))
 }
 
 /// Connects to `url`, sends the request and reads the answer.
@@ -660,7 +706,7 @@ async fn request(url: &Url, limits: &Limits, progress: &mut (dyn FnMut(u64) + Se
     let mut tls = tokio::time::timeout(limits.connect, connector.connect(server_name, tcp))
         .await
         .map_err(|_| HttpError::Timeout("the TLS handshake"))?
-        .map_err(|e| HttpError::Connect(format!("TLS: {e}")))?;
+        .map_err(|e| tls_error(&e))?;
     exchange(&mut tls, url, limits, progress).await
 }
 
@@ -1184,9 +1230,24 @@ mod tests {
     }
 
     #[test]
-    fn the_tls_settings_build_with_the_mozilla_roots() {
+    fn the_tls_settings_build_with_the_mozilla_roots_and_the_hosts() {
         let config = tls_config().unwrap();
         assert!(config.alpn_protocols.is_empty());
-        assert!(webpki_roots::TLS_SERVER_ROOTS.len() > 100);
+        let built_in = webpki_roots::TLS_SERVER_ROOTS.len();
+        assert!(built_in > 100);
+        // The host's roots are added to the built-in ones, never instead of them.
+        assert!(root_store().len() >= built_in);
+        // What the host lists that is not a certificate is left out, and is not an error.
+        let junk = rustls::pki_types::CertificateDer::from(vec![0x30, 0x03, 0x01, 0x01, 0xff]);
+        assert_eq!(roots_with(vec![junk]).len(), built_in);
+    }
+
+    #[test]
+    fn an_unknown_issuer_says_how_to_make_a_proxys_ca_known() {
+        let unknown = std::io::Error::other("invalid peer certificate: UnknownIssuer");
+        let HttpError::Connect(why) = tls_error(&unknown) else { panic!("not a connection error") };
+        assert!(why.contains("SSL_CERT_FILE") && why.contains("trust store"), "{why}");
+        let HttpError::Connect(other) = tls_error(&std::io::Error::other("handshake failure")) else { panic!() };
+        assert_eq!(other, "TLS: handshake failure");
     }
 }
