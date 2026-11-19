@@ -68,6 +68,7 @@ scrios stream --format framed | my-program   # video, events and control for a p
 - [Commands and options](docs/cli.md)
 - [Stream format and control commands](docs/protocol.md), for programs such as
   [Jumpstarter](https://github.com/jumpstarter-dev/jumpstarter)
+- [The developer disk image](docs/developer-disk-image.md): where it comes from, offline use, proxies
 - [What has been tested](docs/status.md)
 - [How it works](docs/internals.md)
 - [Building](BUILD.md)
