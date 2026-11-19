@@ -15,6 +15,8 @@ pub(crate) struct Script {
     pub(crate) mount: VecDeque<Result<Mounted, DevError>>,
     pub(crate) display_service: VecDeque<Result<bool, DevError>>,
     pub(crate) reveals: u32,
+    /// How many times Developer Mode was asked for.
+    pub(crate) developer_mode_asked: u32,
     pub(crate) mounts: u32,
     /// A mount here succeeded.
     pub(crate) mounted_here: bool,
@@ -35,7 +37,10 @@ fn next<T: Clone>(queue: &mut VecDeque<T>, if_empty: T) -> T {
 
 impl Ops for FakeDevice {
     async fn developer_mode(&self) -> Result<bool, DevError> {
-        self.with(|s| next(&mut s.developer_mode, Ok(true)))
+        self.with(|s| {
+            s.developer_mode_asked += 1;
+            next(&mut s.developer_mode, Ok(true))
+        })
     }
 
     async fn reveal_developer_mode(&self) -> Result<(), DevError> {

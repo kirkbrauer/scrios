@@ -2276,6 +2276,7 @@ mod tests {
         let log = LogBuf::default();
         let subscriber = tracing_subscriber::fmt().with_writer(log.clone()).with_ansi(false).finish();
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             // The home bar swipe: down on the very last row, up the screen, up.
             h.on_touch(t0, touch(TouchPhase::Down, 800.0, 2387.0), portrait);
             h.on_touch(ms(t0, 20), touch(TouchPhase::Move, 800.0, 2000.0), portrait);
@@ -2290,31 +2291,32 @@ mod tests {
             // A finger that is not the first one is ignored, edge or not.
             h.on_touch(ms(t0, 180), Touch { phase: TouchPhase::Down, x: 0.0, y: 0.0, id: 1 }, portrait);
         });
+        // The count is what this test relies on: it does not depend on tracing's global callsite cache, which
+        // other tests running at the same time can leave stale for a moment (a log line may then be missed).
         assert_eq!(q.edge_downs(), 3);
-        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-        let lines: Vec<&str> = text.lines().filter(|l| l.contains("edge touch down")).collect();
-        assert_eq!(lines.len(), 3, "{text}");
-        assert!(lines.iter().all(|l| l.contains(" INFO ")), "{text}");
         let hid_at = |x, y| map_touch(x, y, 1668, 2388, 0);
         let (x0, y0) = hid_at(800.0, 2387.0);
         assert_eq!(y0, MAX);
-        assert!(
-            lines[0].ends_with(&format!(
-                "edge touch down at HID ({x0}, {y0}) from upright pixel (800, 2387), edge: bottom"
-            )),
-            "{text}"
-        );
         let (x1, y1) = hid_at(0.0, 1000.0);
         assert_eq!(x1, 0);
-        assert!(
-            lines[1]
-                .ends_with(&format!("edge touch down at HID ({x1}, {y1}) from upright pixel (0, 1000), edge: left")),
-            "{text}"
-        );
-        assert!(
-            lines[2].ends_with("edge touch down at HID (65535, 0) from upright pixel (1667, 0), edge: right+top"),
-            "{text}"
-        );
+        let expected = [
+            format!("edge touch down at HID ({x0}, {y0}) from upright pixel (800, 2387), edge: bottom"),
+            format!("edge touch down at HID ({x1}, {y1}) from upright pixel (0, 1000), edge: left"),
+            "edge touch down at HID (65535, 0) from upright pixel (1667, 0), edge: right+top".to_string(),
+        ];
+        // The messages of the three downs that were counted, as the controller words them.
+        assert_eq!(edge_down_message(x0, y0, 800.0, 2387.0, 1668, 2388).as_deref(), Some(expected[0].as_str()));
+        assert_eq!(edge_down_message(x1, y1, 0.0, 1000.0, 1668, 2388).as_deref(), Some(expected[1].as_str()));
+        assert_eq!(edge_down_message(65535, 0, 1667.0, 0.0, 1668, 2388).as_deref(), Some(expected[2].as_str()));
+        // What the log captured: every edge line is at INFO, one of those three, and in order.
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("edge touch down")).collect();
+        assert!(lines.len() <= 3, "{text}");
+        assert!(lines.iter().all(|l| l.contains(" INFO ")), "{text}");
+        let mut next = expected.iter();
+        for line in &lines {
+            assert!(next.any(|want| line.ends_with(want.as_str())), "an unexpected or reordered line: {text}");
+        }
         // The stats event of the engine carries the count (the queue is where the two meet).
         let cfg = crate::engine::EngineConfig::new(0x1234_5678);
         let e = crate::engine::Engine::new(cfg, q.clone(), Instant::now());

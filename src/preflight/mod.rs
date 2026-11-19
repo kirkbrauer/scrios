@@ -600,14 +600,31 @@ mod tests {
         assert!(matches!(result.unwrap_err(), PreflightError::Failed(why) if why.contains("scrios mount-ddi")));
     }
 
+    /// Waits (on a test thread) until `seen` holds, with a deadline far beyond any normal run: the scripted changes
+    /// below happen after the preflight has looked at the state before them, never after a guessed time.
+    fn wait_until(what: &str, seen: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !seen() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// How many requests of `kind` the fake usbmuxd has answered.
+    fn asked(fake: &FakeMux, kind: &str) -> usize {
+        fake.requests().iter().filter(|m| m.as_str() == kind).count()
+    }
+
     #[tokio::test]
     async fn no_device_is_waited_for_with_one_line_until_one_is_plugged_in_and_trusted() {
         let fake = Arc::new(FakeMux::tcp());
         let plug = fake.clone();
         let plugger = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            // Plugged in once the empty list has been seen twice (so the wait was said), trusted once the missing
+            // record has been seen twice.
+            wait_until("two empty device lists", || asked(&plug, "ListDevices") >= 2);
             plug.attach_usb(UDID, 1);
-            std::thread::sleep(Duration::from_millis(100));
+            wait_until("two pair-record reads", || asked(&plug, "ReadPairRecord") >= 2);
             plug.set_pair_record(UDID, pair_record_bytes(UDID));
         });
         let (result, steps) = go(&options(&fake, true), &FakeDevice::default()).await;
@@ -627,7 +644,7 @@ mod tests {
         opts.target.udid = Some(OTHER.into());
         let plug = fake.clone();
         let plugger = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+            wait_until("two device lists without it", || asked(&plug, "ListDevices") >= 2);
             plug.attach_usb(OTHER, 2);
             plug.set_pair_record(OTHER, pair_record_bytes(OTHER));
         });
@@ -688,11 +705,17 @@ mod tests {
         device.with(|s| s.developer_mode = VecDeque::from([Ok(false)]));
         let (unplug, answers) = (fake.clone(), device.clone());
         let restarter = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(80));
+            // Each change after the preflight has seen the state before it: Developer Mode off (asked twice), the
+            // device away (two lists without it), the device back and still off (asked twice more).
+            wait_until("Developer Mode asked twice", || answers.with(|s| s.developer_mode_asked) >= 2);
             unplug.detach_all();
-            std::thread::sleep(Duration::from_millis(100));
+            let lists = asked(&unplug, "ListDevices");
+            wait_until("two lists without the device", || asked(&unplug, "ListDevices") >= lists + 2);
+            let before = answers.with(|s| s.developer_mode_asked);
             unplug.attach_usb(UDID, 1);
-            std::thread::sleep(Duration::from_millis(80));
+            wait_until("Developer Mode asked after the restart", || {
+                answers.with(|s| s.developer_mode_asked) >= before + 2
+            });
             answers.with(|s| s.developer_mode = VecDeque::from([Ok(true)]));
         });
         let (result, steps) = go(&options(&fake, true), &device).await;

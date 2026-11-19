@@ -905,11 +905,20 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming().take(2) {
                 let mut stream = stream.unwrap();
-                let mut request = [0u8; 1024];
-                let _ = stream.read(&mut request);
+                // Read the whole request head before answering: closing with request bytes unread would reset the
+                // connection, and the client could see the reset before the body.
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    request.push(byte[0]);
+                }
                 let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(&body);
+                let _ = stream.flush();
+                // Close our side and let the client close its own (no unread data, so no reset).
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let _ = stream.read_to_end(&mut Vec::new());
             }
         });
         let url = format!("http://127.0.0.1:{port}/ddi.tar.gz");
