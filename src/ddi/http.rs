@@ -27,6 +27,8 @@
 )]
 
 use std::fmt;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -48,6 +50,11 @@ const MAX_SIZE_LINE: usize = 64;
 const MAX_TRAILER: usize = 8 * 1024;
 /// How much a read takes at once.
 const READ_SIZE: usize = 64 * 1024;
+/// How long one address of a host is given before the next one is tried as well (RFC 8305's "connection attempt
+/// delay"): a host's addresses are raced, not tried one after the other.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+/// The longest one address is given to connect.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a download failed (never with the part of a URL that can be a secret: only the host is named).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,17 +691,136 @@ fn tls_error(e: &std::io::Error) -> HttpError {
     HttpError::Connect(format!("TLS: {text}"))
 }
 
+/// A host's addresses in the order RFC 8305 tries them: IPv6 and IPv4 taking turns, starting with the family of the
+/// first address the resolver gave (the order within each family is the resolver's).
+fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut first, mut second): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first_v6);
+    let mut out = Vec::with_capacity(first.len().saturating_add(second.len()));
+    loop {
+        match (first.pop_front(), second.pop_front()) {
+            (None, None) => return out,
+            (a, b) => out.extend(a.into_iter().chain(b)),
+        }
+    }
+}
+
+/// How the attempts at a host's addresses went, for the error when none connected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Attempts {
+    /// Addresses tried.
+    tried: usize,
+    /// Of those, the ones that took longer than [`ATTEMPT_TIMEOUT`].
+    timed_out: usize,
+    /// Of those, the ones that failed (refused, unreachable, ...).
+    failed: usize,
+}
+
+impl Attempts {
+    fn describe(self, host: &str, total: usize) -> String {
+        format!(
+            "none of the {total} address(es) of {host} answered: {} tried, {} timed out, {} failed",
+            self.tried, self.timed_out, self.failed
+        )
+    }
+}
+
+/// Connects to the first of `addrs` that answers, racing them in the manner of RFC 8305 ("Happy Eyeballs"): the
+/// first is started, and each next one when the one before has failed or after `delay`, whichever is first; each has
+/// `per_attempt`; the first connection wins and the others are dropped. On a network where only some of a host's
+/// addresses can be reached (GitHub's raw host has four, and a network may reach one), a dead address costs `delay`,
+/// not the whole budget. `budget` bounds it all.
+///
+/// `connect` is the connection itself (the real one is `TcpStream::connect`; the tests give a scripted one).
+async fn connect_any<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    connect: F,
+    delay: Duration,
+    per_attempt: Duration,
+    budget: Duration,
+) -> Result<T, (Attempts, bool)>
+where
+    T: Send + 'static,
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = std::io::Result<T>> + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now().checked_add(budget).unwrap_or_else(tokio::time::Instant::now);
+    let mut queue = addrs.into_iter();
+    let mut running = tokio::task::JoinSet::new();
+    let mut attempts = Attempts::default();
+    let mut start = |running: &mut tokio::task::JoinSet<_>, attempts: &mut Attempts| match queue.next() {
+        Some(addr) => {
+            attempts.tried = attempts.tried.saturating_add(1);
+            running.spawn(tokio::time::timeout(per_attempt, connect(addr)));
+            true
+        }
+        None => false,
+    };
+    let mut more = start(&mut running, &mut attempts);
+    loop {
+        if running.is_empty() && !more {
+            return Err((attempts, false));
+        }
+        tokio::select! {
+            done = running.join_next(), if !running.is_empty() => match done {
+                Some(Ok(Ok(Ok(stream)))) => {
+                    running.abort_all();
+                    return Ok(stream);
+                }
+                Some(Ok(Ok(Err(e)))) => {
+                    debug!("an address failed to connect: {}", e.kind());
+                    attempts.failed = attempts.failed.saturating_add(1);
+                    more = more && start(&mut running, &mut attempts);
+                }
+                Some(Ok(Err(_))) => {
+                    attempts.timed_out = attempts.timed_out.saturating_add(1);
+                    more = more && start(&mut running, &mut attempts);
+                }
+                Some(Err(_)) | None => {
+                    attempts.failed = attempts.failed.saturating_add(1);
+                    more = more && start(&mut running, &mut attempts);
+                }
+            },
+            () = tokio::time::sleep(delay), if more => {
+                more = start(&mut running, &mut attempts);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                running.abort_all();
+                return Err((attempts, true));
+            }
+        }
+    }
+}
+
+/// Resolves `host` and connects to one of its addresses within `budget` ([`connect_any`]).
+async fn connect_host(host: &str, port: u16, budget: Duration) -> Result<TcpStream, HttpError> {
+    let resolved = tokio::time::timeout(budget, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| HttpError::Timeout("resolving the host"))?
+        .map_err(|e| HttpError::Connect(format!("cannot resolve {host}: {}", e.kind())))?;
+    let addrs = interleave(resolved.collect());
+    let total = addrs.len();
+    if total == 0 {
+        return Err(HttpError::Connect(format!("{host} has no address")));
+    }
+    connect_any(addrs, TcpStream::connect, ATTEMPT_DELAY, ATTEMPT_TIMEOUT, budget).await.map_err(
+        |(attempts, out_of_time)| {
+            let what = attempts.describe(host, total);
+            if out_of_time {
+                HttpError::Connect(format!("connecting took too long ({what})"))
+            } else {
+                HttpError::Connect(what)
+            }
+        },
+    )
+}
+
 /// Connects to `url`, sends the request and reads the answer.
 async fn request(url: &Url, limits: &Limits, progress: &mut (dyn FnMut(u64) + Send)) -> Result<Reply, HttpError> {
     // A bracketed IPv6 address is connected to without its brackets.
     let host = url.host().trim_start_matches('[').trim_end_matches(']').to_string();
-    let connect = async {
-        tokio::time::timeout(limits.connect, TcpStream::connect((host.as_str(), url.port())))
-            .await
-            .map_err(|_| HttpError::Timeout("connecting"))?
-            .map_err(|e| HttpError::Connect(e.kind().to_string()))
-    };
-    let tcp = connect.await?;
+    let tcp = connect_host(&host, url.port(), limits.connect).await?;
     #[cfg(test)]
     if !url.is_secure() {
         let mut tcp = tcp;
@@ -1220,6 +1346,102 @@ mod tests {
         assert_eq!(cut, HttpError::Truncated { got: 13, want: 100 });
         assert_eq!(get(&server.url("/d"), &limits, &mut |_| {}).await.unwrap(), b"abc");
         assert_eq!(server.finish().len(), 4);
+    }
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn the_addresses_take_turns_by_family_starting_with_the_resolvers_first() {
+        let v4 = [addr("192.0.2.1:443"), addr("192.0.2.2:443"), addr("192.0.2.3:443")];
+        let v6 = [addr("[2001:db8::1]:443"), addr("[2001:db8::2]:443")];
+        assert_eq!(interleave(vec![v4[0], v4[1], v4[2], v6[0], v6[1]]), vec![v4[0], v6[0], v4[1], v6[1], v4[2]]);
+        assert_eq!(interleave(vec![v6[0], v4[0], v6[1], v4[1], v4[2]]), vec![v6[0], v4[0], v6[1], v4[1], v4[2]]);
+        assert_eq!(interleave(vec![v6[0], v6[1], v4[0]]), vec![v6[0], v4[0], v6[1]]);
+        assert_eq!(interleave(vec![v4[0], v4[1]]), vec![v4[0], v4[1]]);
+        assert!(interleave(Vec::new()).is_empty());
+    }
+
+    /// A scripted connection: the addresses in `dead` never answer, those in `refused` are refused at once, the rest
+    /// connect at once (and say which address they are).
+    fn scripted(
+        dead: Vec<SocketAddr>,
+        refused: Vec<SocketAddr>,
+    ) -> impl Fn(SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<SocketAddr>> + Send>> {
+        move |a| {
+            if dead.contains(&a) {
+                Box::pin(std::future::pending())
+            } else if refused.contains(&a) {
+                Box::pin(async { Err(std::io::ErrorKind::ConnectionRefused.into()) })
+            } else {
+                Box::pin(async move { Ok(a) })
+            }
+        }
+    }
+
+    const DELAY: Duration = Duration::from_millis(250);
+    const PER_ATTEMPT: Duration = Duration::from_secs(5);
+    const BUDGET: Duration = Duration::from_secs(20);
+
+    #[tokio::test(start_paused = true)]
+    async fn addresses_that_never_answer_cost_the_attempt_delay_each_not_the_budget() {
+        // A host with four addresses on a network where only the last one can be reached (documentation addresses).
+        let all = [addr("192.0.2.10:443"), addr("192.0.2.11:443"), addr("192.0.2.12:443")];
+        let good = addr("192.0.2.13:443");
+        let start = tokio::time::Instant::now();
+        let got =
+            connect_any(vec![all[0], all[1], all[2], good], scripted(all.to_vec(), vec![]), DELAY, PER_ATTEMPT, BUDGET)
+                .await
+                .unwrap();
+        assert_eq!(got, good);
+        // Three dead addresses, each given the attempt delay before the next starts: 750 ms on the (paused) clock.
+        assert_eq!(start.elapsed(), DELAY * 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_address_that_is_refused_moves_on_at_once() {
+        let (a, b, c) = (addr("192.0.2.1:443"), addr("192.0.2.2:443"), addr("192.0.2.3:443"));
+        let start = tokio::time::Instant::now();
+        let got = connect_any(vec![a, b, c], scripted(vec![], vec![a, b]), DELAY, PER_ATTEMPT, BUDGET).await.unwrap();
+        assert_eq!(got, c);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn when_no_address_answers_the_error_counts_the_attempts() {
+        let addrs = vec![addr("192.0.2.1:443"), addr("192.0.2.2:443"), addr("[2001:db8::1]:443")];
+        let refused = vec![addrs[2]];
+        let dead = vec![addrs[0], addrs[1]];
+        // Each dead one times out after its own 5 s, well inside the budget.
+        let (attempts, out_of_time) =
+            connect_any(addrs.clone(), scripted(dead.clone(), refused.clone()), DELAY, PER_ATTEMPT, BUDGET)
+                .await
+                .unwrap_err();
+        assert_eq!(attempts, Attempts { tried: 3, timed_out: 2, failed: 1 });
+        assert!(!out_of_time);
+        // A budget shorter than an attempt: out of time, with what was tried by then.
+        let start = tokio::time::Instant::now();
+        let (attempts, out_of_time) =
+            connect_any(addrs, scripted(dead, refused), DELAY, PER_ATTEMPT, Duration::from_secs(2)).await.unwrap_err();
+        assert!(out_of_time);
+        assert_eq!(attempts.tried, 3);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        let text = attempts.describe("raw.githubusercontent.com", 3);
+        assert!(text.contains("raw.githubusercontent.com") && text.contains("3 tried"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_real_connection_gets_past_an_address_that_cannot_be_reached() {
+        // 192.0.2.1 (TEST-NET-1) is not routed: the attempt either hangs or fails at once, and the loopback listener,
+        // bound for the whole test, is the one that connects.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        let unreachable = SocketAddr::new(std::net::Ipv4Addr::new(192, 0, 2, 1).into(), good.port());
+        let stream =
+            connect_any(vec![unreachable, good], TcpStream::connect, DELAY, PER_ATTEMPT, BUDGET).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        drop(listener);
     }
 
     #[tokio::test]
