@@ -936,11 +936,12 @@ mod tests {
         assert_eq!(queue.push_unit(Frame::unit(2, false, false, vec![1])), crate::outqueue::Pushed::Closed);
     }
 
-    /// The address of a usbmuxd that is not there: a TCP port of 127.0.0.1 that was free a moment ago. TCP, not a
-    /// unix socket, so that these tests are the same on every platform (`mux` tests the unix socket).
+    /// The address of a usbmuxd that is not there: port 1 of 127.0.0.1, which nothing listens on (binding it needs
+    /// privileges no test has). Not "a port that was free a moment ago": another test running at the same time may bind
+    /// that port next (its fake usbmuxd, its HTTP server), and this test would then talk to it and disturb its counts.
+    /// TCP, not a unix socket, so that these tests are the same on every platform (`mux` tests the unix socket).
     fn unreachable_usbmuxd() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
+        "127.0.0.1:1".to_string()
     }
 
     #[test]
