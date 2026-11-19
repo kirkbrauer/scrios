@@ -27,8 +27,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Every `run` is bash (Git Bash on Windows): one syntax on the three hosts, and a command that fails in a
+    # multi-line step stops it (PowerShell would go on to the next line).
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -45,9 +50,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      # What these two check does not depend on the host: once, not on every one.
       - name: idevice is pinned exactly
+        if: runner.os == 'Linux'
         run: scripts/check-pins.sh
       - name: cargo fmt
+        if: runner.os == 'Linux'
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -57,13 +65,52 @@ jobs:
           cargo test --doc --all-features --locked
       - name: cargo doc
         run: cargo doc --no-deps --all-features --locked
-      - name: smoke test (release build, no device)
-        run: |
-          cargo build --release --locked
-          scripts/smoke.sh target/release/scrios
+      - name: build (release)
+        run: cargo build --release --locked
+      # smoke.sh needs python3, unix sockets and signals: unix only. smoke-minimal.sh needs none of them and runs on
+      # all three, so that it is what Windows is checked with and cannot rot on the other two.
+      - name: smoke test (no device)
+        if: runner.os != 'Windows'
+        run: scripts/smoke.sh target/release/scrios
+      - name: smoke test, minimal (no device)
+        run: scripts/smoke-minimal.sh "target/release/scrios${{ runner.os == 'Windows' && '.exe' || '' }}"
       - name: fuzz harnesses build
+        if: runner.os != 'Windows'
         working-directory: fuzz
         run: cargo build --locked
+
+  windows-artifact:
+    name: Windows build (scrios-x86_64-pc-windows-msvc.zip)
+    # What is on main, and by hand: the checks of a pull request are the `check` job's (windows-latest is in it).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+      - name: build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: smoke test (no device)
+        run: scripts/smoke-minimal.sh target/x86_64-pc-windows-msvc/release/scrios.exe
+      - name: zip scrios.exe with the README, LICENSE and NOTICE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Force -DestinationPath dist/scrios-x86_64-pc-windows-msvc.zip `
+            -Path target/x86_64-pc-windows-msvc/release/scrios.exe, README.md, LICENSE, NOTICE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: scrios-x86_64-pc-windows-msvc
+          path: dist/scrios-x86_64-pc-windows-msvc.zip
+          retention-days: 30
+          if-no-files-found: error
 
   msrv:
     name: MSRV (rust-version from Cargo.toml)

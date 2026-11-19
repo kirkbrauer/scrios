@@ -2,8 +2,10 @@ name: Release
 
 # A tag `vX.Y.Z` (equal to `version` in Cargo.toml) releases scrios:
 #   1. checks the tag against Cargo.toml and runs the tests;
-#   2. builds scrios-x86_64-linux-musl, scrios-aarch64-linux-musl (static, any Linux distribution) and
-#      scrios-aarch64-apple-darwin, with SHA256SUMS;
+#   2. builds scrios-x86_64-linux-musl, scrios-aarch64-linux-musl (static, any Linux distribution),
+#      scrios-aarch64-apple-darwin and, for Windows, scrios-x86_64-pc-windows-msvc.zip (scrios.exe with the README,
+#      LICENSE and NOTICE; also scrios-aarch64-pc-windows-msvc.zip if its cross-build works: it is optional), with
+#      SHA256SUMS;
 #   3. creates the GitHub release with them;
 #   4. publishes the crate to crates.io, with Trusted Publishing (OIDC) if it is configured for this repository,
 #      else with the CARGO_REGISTRY_TOKEN secret (the first publish of a crate needs the token).
@@ -89,9 +91,51 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  # Windows: scrios.exe, linked with MSVC, in a zip with the documents. The ARM64 build is a cross-build on the x64
+  # runner that nobody has run yet: if it fails, the release goes on without it.
+  build-windows:
+    name: build ${{ matrix.asset }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, asset: scrios-x86_64-pc-windows-msvc.zip, smoke: true, optional: false }
+          - { target: aarch64-pc-windows-msvc, asset: scrios-aarch64-pc-windows-msvc.zip, smoke: false, optional: true }
+    continue-on-error: ${{ matrix.optional }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      # The x64 build runs on this runner; the ARM64 one cannot.
+      - name: smoke test (no device)
+        if: matrix.smoke
+        run: scripts/smoke-minimal.sh "target/${{ matrix.target }}/release/scrios.exe"
+      - name: zip scrios.exe with the README, LICENSE and NOTICE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Force -DestinationPath "dist/${{ matrix.asset }}" `
+            -Path "target/${{ matrix.target }}/release/scrios.exe", README.md, LICENSE, NOTICE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.target }}-zip
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
   github-release:
     name: GitHub release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
