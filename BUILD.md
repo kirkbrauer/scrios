@@ -77,9 +77,28 @@ because its API changes between releases. A bump is deliberate: change it in `Ca
 `rsd` and `xpc`, and for the device set-up `mobile_image_mounter` (mounting the developer disk image on iOS 17.0 to
 17.3.1), `cryptexd` (installing it as a cryptex, what Xcode does on iOS 17.4 and later; it adds no crate: it is `xpc`, `rsd`
 and `tss`), `tss` (the
-request to Apple's signing server that mounting makes; it brings idevice's small HTTP client, `webpki-roots` for https
-downloads of a DDI archive, and its CDLA-Permissive-2.0 licence, which `deny.toml` allows for that crate only) and
+request to Apple's signing server that mounting makes; it brings idevice's small HTTP client, `webpki-roots` for https,
+and its CDLA-Permissive-2.0 licence, which `deny.toml` allows for that crate only; scrios's own download of the developer
+disk image uses `webpki-roots` too, see [below](#the-developer-disk-image-pin)) and
 `amfi` (revealing and, on request, turning on Developer Mode).
+
+### The developer disk image pin
+
+scrios downloads Apple's developer disk image, when the host has none, from **one commit** of the pymobiledevice3
+project's [`DeveloperDiskImage`](https://github.com/doronz88/DeveloperDiskImage) repository, and uses a file only if its size
+and SHA-256 are the ones in `src/ddi/pin.rs` (the commit, the Xcode build, and a table of the five files of
+`PersonalizedImages/Xcode_iOS_DDI_Cryptex` and the three of `PersonalizedImages/Xcode_iOS_DDI_Personalized`). Updating it is
+a deliberate change of that file, when a device on a newer iOS wants a newer image; the steps are in the comment at the
+top of the file: find the commit (`gh api 'repos/doronz88/DeveloperDiskImage/commits?path=PersonalizedImages/Xcode_iOS_DDI_Cryptex&per_page=3'`),
+download its files into an empty folder, check each against the repository's own blob hash (`git hash-object`), put the
+commit, the build, and each file's size and `shasum -a 256` in the tables, then run `scrios ddi-fetch --variant all` with an
+empty cache (`XDG_CACHE_HOME=$(mktemp -d)`). `.github/workflows/ddi-pin.yml` runs that every week, and says when the
+repository has a newer commit than the pin.
+
+The https client that downloads (`src/ddi/http.rs`) is scrios's own, on `rustls` (the `ring` backend, as idevice's) and the
+Mozilla roots (`webpki-roots`): the three crates are in the tree already through idevice, at these features, and are
+dependencies of scrios itself only so that the download can have limits that idevice's own HTTP client has not (https
+only, a redirect only to the same host or GitHub's raw hosts, a size cap, timeouts).
 
 ## Releases
 

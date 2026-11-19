@@ -10,7 +10,7 @@
 //! * [`list`] lists the devices usbmuxd knows; [`mux`] is the address of the usbmuxd to ask (usbmuxd is the only way
 //!   scrios reaches a device).
 //! * [`preflight`], [`ddi`] and [`ops`] check what a device needs for the display service (it trusts this host,
-//!   the developer disk image is mounted) and mount the image.
+//!   the developer disk image is installed) and install the image: downloaded and checked if the host has none.
 //!
 //! The `scrios` binary is a thin command line over these. The other modules are public too, so that other programs
 //! can use the pieces (depacketizers, SPS parsers, the HID controller, ...); their API is not stable yet (0.x).

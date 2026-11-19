@@ -5,10 +5,10 @@ usbmuxd and the device's CoreDevice tunnel. It is a command line in the manner o
 **window** that shows the screen and takes your mouse and keyboard (see [the viewer](#the-viewer)); `scrios stream`
 writes the video where you say, a player or a program reads it, and commands come in on standard input.
 
-The device needs the CoreDevice display service (iOS 27, with Developer Mode on and the developer disk image mounted)
+The device needs the CoreDevice display service (iOS 27, with Developer Mode on and the developer disk image installed)
 and must trust the host (usbmuxd holds the pair record). scrios gets there the way scrcpy does, with no extra steps: it
-waits for the device, for Trust and for Developer Mode, and mounts the developer disk image itself ([what happens before
-the stream](#what-scrios-does-before-the-stream)). usbmuxd is its only way to a device (as adb is scrcpy's): it reads
+waits for the device, for Trust and for Developer Mode, and installs the developer disk image itself, downloading it if
+the host has none ([what happens before the stream](#what-scrios-does-before-the-stream)). usbmuxd is its only way to a device (as adb is scrcpy's): it reads
 the pair record from usbmuxd, never from a file of the host, and a usbmuxd on another machine works as well
 ([a remote usbmuxd](#a-remote-usbmuxd)).
 
@@ -17,9 +17,10 @@ scrios [OPTIONS]            the viewer window (in a build without the viewer: th
 scrios stream [OPTIONS]     stream the screen to a pipe or a file, headless
 scrios list [--usbmuxd ADDR]   list the devices usbmuxd knows       (also: scrios --list-devices)
 scrios doctor               check everything the stream needs, and say how to fix what is missing
-scrios ddi-status           Developer Mode, the mounted developer disk image, the image scrios would mount
-scrios mount-ddi            mount the developer disk image (iOS 17 and later)
-scrios unmount-ddi          unmount it
+scrios ddi-status           Developer Mode, the developer disk image (mounted or installed), how it would be installed, from where
+scrios mount-ddi            install the developer disk image (a cryptex through cryptexd, or the image mounter's image)
+scrios unmount-ddi          remove it (uninstall the cryptex, or unmount the image)
+scrios ddi-fetch            download the developer disk image into the cache and check it, with no device
 scrios developer-mode       is Developer Mode on? reveal its switch; --enable --yes turns it on
 ```
 
@@ -127,7 +128,7 @@ takes):
 | a device (`--udid`, else the only one usbmuxd lists) | `Plug in and unlock your iPhone or iPad`, and it waits. Several devices and no `--udid` is an error that lists their UDIDs |
 | trust: usbmuxd holds a pair record for the device | `Unlock the device and tap Trust`, and it waits |
 | Developer Mode is on | the Developer Mode switch is revealed in Settings and the steps are printed (`Settings > Privacy & Security > Developer Mode > On`, then restart the device and confirm); it waits through the restart. scrios **never turns Developer Mode on by itself** |
-| the developer disk image is mounted | it is mounted from the [DDI folder](#the-developer-disk-image) (Apple's signing server needs internet for it the first time after each restart of the device); no folder is an error that says where to put one |
+| the developer disk image is in place (the device offers the display service) | it is [installed](#the-developer-disk-image): as a cryptex through cryptexd on iOS 17.4 and later, through the image mounter before (Apple's signing server needs internet for it the first time after each restart of the device), from a local copy or from a download that is checked first. Never over an image that is there. With `--ddi-source local` and no local copy, or `--ddi-source none`, it is an error that says so |
 
 Then the stream starts on the device that was checked. The waiting is for a person at a terminal:
 
@@ -143,8 +144,9 @@ All of them take `-s, --udid` and `--usbmuxd` like the stream, and none of them 
 says what to do.
 
 * **`scrios doctor`** runs the checks of the list above one by one and prints `ok`, `FAIL` or `skip` for each, with the fix
-  under each failure: usbmuxd, device, pairing, Developer Mode, developer disk image (mounted), image source (where one
-  would be mounted from), display service (the device's CoreDevice tunnel offers it). Exit status 0 if nothing failed, 1
+  under each failure: usbmuxd, device, pairing, Developer Mode, developer disk image (mounted, and the cryptex that
+  cryptexd lists if there is one), image source (where one would be installed from: a local copy, or the download that
+  scrios would make), display service (the device's CoreDevice tunnel offers it). Exit status 0 if nothing failed, 1
   if something did.
 
   ```
@@ -155,15 +157,24 @@ says what to do.
                               fix: Turn Developer Mode on: Settings > Privacy & Security > Developer Mode > On, then restart the device (...)
   ```
 
-* **`scrios ddi-status`** prints Developer Mode, whether the developer disk image is mounted (and what the device lists
-  as mounted), and the folder scrios would mount from. Exit status 0 if Developer Mode is on and the image is mounted, 1
-  if one is not, 2 if the device could not be asked.
-* **`scrios mount-ddi`** mounts the personalized developer disk image: it reads the image, its trust cache and the build
-  manifest from the DDI folder, picks the build identity of the device's board and chip, asks Apple's signing server
-  (TSS, plain HTTP to `gs.apple.com`, which needs internet; HTTP proxy variables are not used) for the device's ticket
-  unless the device holds one, uploads the image and mounts it. It does nothing if an image is mounted already.
-  iOS 17 and later only (the display service needs iOS 27); an older iOS gets an error that says so.
-* **`scrios unmount-ddi`** unmounts the developer disk image.
+* **`scrios ddi-status`** prints Developer Mode, whether the developer disk image is in place (what the device lists as
+  mounted, and the cryptex that `cryptexd` lists as installed), how the image would be installed on this device (the
+  install route, below) and from where. Exit status 0 if Developer Mode is on and the image is in place, 1 if one is
+  not, 2 if the device could not be asked.
+* **`scrios mount-ddi`** installs the developer disk image, the way the device takes it (the [install route](#how-the-image-is-installed)),
+  from the first source that has it, or from a download (see [the developer disk image](#the-developer-disk-image)). It
+  asks Apple's signing server (TSS, plain HTTP to `gs.apple.com`, which needs internet; HTTP proxy variables are not
+  used) for the device's ticket, and never installs over an image that is there (it says it is already mounted or
+  installed). With `--ddi-source none` it refuses. An older iOS than 17 gets an error that says so (the display
+  service needs iOS 27).
+* **`scrios unmount-ddi`** removes the developer disk image: it uninstalls the cryptex through `cryptexd` where the image
+  is one, else unmounts it through the image mounter.
+* **`scrios ddi-fetch [--variant cryptex|personalized|all]`** downloads the image into the cache folder and checks it,
+  **with no device and without installing anything**: every file against its size and SHA-256, then that the folder
+  loads the way the install reads it (the payloads, the build identity's nonce domain and the install's parameters).
+  It prints the folder on standard output and what it does on standard error, and exits 2 if a file is not what it must
+  be. It downloads from the pinned image or the mirror you name (`--ddi-repo`), not from an archive. It is also how to
+  warm the cache of a host that will be offline later.
 * **`scrios developer-mode`** says whether Developer Mode is on. If it is off it reveals the switch in the device's
   Settings (AMFI) and prints the steps. **`--enable --yes`** is the explicit opt-in that turns it on (AMFI): **the device
   restarts**, and it works only on a device **without a passcode**; `--enable` without `--yes` refuses and says why.
@@ -171,9 +182,9 @@ says what to do.
 
 ## The developer disk image
 
-The display service is only offered when the developer disk image is mounted. scrios mounts the personalized image of iOS
-17 and later from a **DDI folder**: the `iOS_DDI` folder that Xcode installs. **scrios does not ship, host or download
-Apple's image by default.** It looks, in this order, at:
+The display service is only offered when the developer disk image is installed. The image is **Apple's**: the one Xcode
+installs on a device. **scrios does not ship or host Apple's files.** It finds the image in one of these places, in this
+order:
 
 1. `--ddi-dir DIR`
 2. `$SCRIOS_DDI_DIR`
@@ -182,11 +193,77 @@ Apple's image by default.** It looks, in this order, at:
    `/Applications/Xcode.app`). The first was seen on a Mac with Xcode installed; the second is from what Xcode is known
    to do and was not found on that Mac: they are tried, and used only where they exist.
 4. scrios's cache folder: `~/Library/Caches/scrios/ddi` (macOS), `$XDG_CACHE_HOME/scrios/ddi` or `~/.cache/scrios/ddi`
-   (Linux), `%LOCALAPPDATA%\scrios\ddi` (Windows).
+   (Linux), `%LOCALAPPDATA%\scrios\ddi` (Windows). It holds, in this order: a folder copied there (so that
+   `<cache>/Restore/BuildManifest.plist` exists), an archive that was downloaded (`<cache>/archive/`), and the files that
+   scrios downloaded before (`<cache>/<build>/<folder>/`, see below), which are checked again every time they are used.
+5. **a download** (`--ddi-source auto`, the default), if none of the above has the image.
 
-A folder asked for with `--ddi-dir` or `$SCRIOS_DDI_DIR` must be a DDI folder (an error says what is wrong); Xcode's and
-the cache are skipped if they are not there. With none found, scrios says so and how to provide one: **copy the `iOS_DDI`
-folder from a Mac with Xcode into the cache folder**, so that `<cache>/Restore/BuildManifest.plist` exists:
+A folder asked for with `--ddi-dir` or `$SCRIOS_DDI_DIR` must be a DDI folder that has what the device needs (an error
+says what is wrong, and it is never replaced by a download); Xcode's and the cache are skipped if they are not there or
+have no image of the form the device takes.
+
+### How the image is installed
+
+The device's iOS version decides (`scrios ddi-status` and `scrios doctor` say which, and why):
+
+| The device | The image is | From the folder's |
+| --- | --- | --- |
+| iOS 17.4 or later, and its RSD handshake lists `com.apple.security.cryptexd.remote` | **installed as a cryptex through `cryptexd`** over the CoreDevice tunnel (idevice's `install_ddi`: the device's chip identifiers and the cryptex nonce are read, Apple's signing server signs a ticket for them, and the image, trust cache, ticket, cryptex info and volume hash are pushed). This is what Xcode does, and the only way for the newest devices, which have no personalized build identity | the cryptex identity of the manifest (`Cryptex1,*`: `Image.dmg`, `Image.dmg.trustcache`, `Image.dmg.cryptex_info`, `Image.dmg.root_hash` in the downloaded folder) |
+| iOS 17.0 to 17.3.1, or `cryptexd` is not offered (or its tunnel cannot be opened) | **mounted through the image mounter**, as the personalized image: the build identity of the device's board and chip names the image and trust cache; Apple's signing server gives the ticket | `Xcode_iOS_DDI_Personalized`'s files (`Image.dmg`, `Image.dmg.trustcache`), or Xcode's `Restore/<name>.dmg` and `Restore/Firmware/<name>.dmg.trustcache` |
+
+On the cryptex route the installed cryptex is `com.apple.MobileAsset.DDI`; `cryptexd`'s own list of installed cryptexes
+is asked before anything is looked for or downloaded, and an image that is there is never installed over
+("The developer disk image is already installed"). `scrios unmount-ddi` uninstalls that cryptex through `cryptexd`.
+
+Inside a folder, the build manifest is looked for in the folder, in `Restore/`, and under an `iOS_DDI/` folder in either.
+Xcode's layout is `Restore/BuildManifest.plist`, `Restore/<name>.dmg` and `Restore/Firmware/<name>.dmg.trustcache`; a flat
+folder with `Image4.dmg` (or `Image.dmg`, `DeveloperDiskImage.dmg`) and its `.trustcache` next to a manifest works for the
+image mounter too. A manifest with no build identity for the device (the image is from an Xcode older than the device's
+iOS), or with no cryptex identity on the cryptex route, is an error that says so. The paths a manifest names must stay
+inside the folder.
+
+### The download
+
+With nothing local (and `--ddi-source auto`, the default), scrios downloads the image from the **`DeveloperDiskImage`
+repository of the pymobiledevice3 project** (<https://github.com/doronz88/DeveloperDiskImage>), which publishes the image
+that Xcode ships as plain files (scrios does not host them, and the repository has no licence file of its own: they are
+Apple's). The form the device takes is downloaded: the five files of `PersonalizedImages/Xcode_iOS_DDI_Cryptex/` (about 18
+MB), or the three of `PersonalizedImages/Xcode_iOS_DDI_Personalized/`.
+
+* **Pinned.** The URL is `https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/<commit>/PersonalizedImages/<folder>/<file>`
+  with the commit that is written in the program (`src/ddi/pin.rs`, today the image of Xcode build 27B52), together with the
+  size and SHA-256 of every file. A file is used only if both match; **a file that does not is refused before it is written
+  to the cache or sent to a device**, and nothing of it is kept. A commit does not change, so what is downloaded cannot
+  change under the pin.
+* **Limits.** https only (a `http://` URL, or a redirect to one, is refused); a redirect only to the same host or to
+  GitHub's raw file hosts (`raw.githubusercontent.com`, `objects.githubusercontent.com`), at most three; a file may not be
+  larger than 64 MB (and not larger than its pinned size); 20 s to connect, 30 s of silence, 15 minutes per file. HTTP
+  proxy variables are not used.
+* **Cached.** The checked files are kept under `<cache>/<build>/<folder>/` (`27B52/Xcode_iOS_DDI_Cryptex/`), each written to
+  a temporary name and renamed into place, so that a download that stops half way is never mistaken for a file. They are
+  checked again (size and SHA-256) every time they are used: a good cache needs no network at all, and a file that was
+  damaged since is downloaded again alone.
+* **What is said.** One plain line each: `Downloading the developer disk image (Xcode 27B52) from
+  github.com/doronz88/DeveloperDiskImage: 18 MB`, `Downloading: 10%` in tens, `Verified: every file has the size and
+  SHA-256 that were expected`, then the install's own lines.
+* **Updating the pin** is a deliberate change of `src/ddi/pin.rs` ([BUILD.md](../BUILD.md#the-developer-disk-image-pin));
+  the weekly `DDI pin` workflow checks that the pinned files are what GitHub serves and says when the repository has a
+  newer image.
+
+The options:
+
+| Option | |
+| --- | --- |
+| `--ddi-source auto\|local\|none` (`$SCRIOS_DDI_SOURCE`) | `auto` (default): local copies, else the download. `local`: local copies only, never the network. `none`: scrios installs nothing, it only reports (a device that has no image is an error that says so; `ddi-status` and `doctor` still work) |
+| `--ddi-dir DIR` (`$SCRIOS_DDI_DIR`) | a folder of your own: the `iOS_DDI` folder of Xcode, copied anywhere |
+| `--ddi-repo URL --ddi-ref COMMIT --ddi-sha256-manifest FILE` (`$SCRIOS_DDI_REPO`, `$SCRIOS_DDI_REF`, `$SCRIOS_DDI_SHA256_MANIFEST`) | a **mirror** of the repository instead of GitHub's pinned commit: the files are read from `<URL>/<COMMIT>/PersonalizedImages/<folder>/<file>` (a `https://github.com/<owner>/<repo>` URL is read from GitHub's raw file service). All three are required: the manifest lists each file's SHA-256 in `sha256sum`'s format (`<64 hex>  <path>`, paths from the root of the repository, `#` comments allowed; a path that leaves the repository is refused), and a mirror is refused without it. The same limits apply |
+| `--ddi-download-url URL --ddi-sha256 HEX` (`$SCRIOS_DDI_URL`, `$SCRIOS_DDI_SHA256`) | an **archive** you host instead of the repository: a `.tar.gz` of the folder (`tar czf ddi.tar.gz -C iOS_DDI .`), unpacked under `<cache>/archive/`. The SHA-256 is required: an archive that does not match is never unpacked, and an entry that would leave the folder is an error. Not combined with `--ddi-repo` |
+
+To make a manifest for a mirror of your own: `cd DeveloperDiskImage && sha256sum PersonalizedImages/Xcode_iOS_DDI_Cryptex/* PersonalizedImages/Xcode_iOS_DDI_Personalized/* > ddi.sha256`.
+
+To have no download at all (a host that must never reach out): `--ddi-source local` (or `export SCRIOS_DDI_SOURCE=local`),
+with the image from `--ddi-dir`, Xcode, or a cache that `scrios ddi-fetch` filled where there was internet. On Linux or
+Windows a folder copied from a Mac with Xcode into the cache folder works too:
 
 ```
 # on a Linux host (from a Mac with Xcode)
@@ -194,19 +271,6 @@ mkdir -p ~/.cache/scrios && scp -r mac:/Library/Developer/DeveloperDiskImages/iO
 # on a Windows host, in PowerShell
 scp -r mac:/Library/Developer/DeveloperDiskImages/iOS_DDI $env:LOCALAPPDATA\scrios\ddi
 ```
-
-(Anywhere else works too: `scrios mount-ddi --ddi-dir C:\path\to\iOS_DDI`, or `$SCRIOS_DDI_DIR`.)
-
-Inside a folder, the build manifest is looked for in the folder, in `Restore/`, and under an `iOS_DDI/` folder in either.
-The image and trust cache are the files the manifest names for the device's board and chip (Xcode's layout is
-`Restore/BuildManifest.plist`, `Restore/<name>.dmg` and `Restore/Firmware/<name>.dmg.trustcache`); a flat folder with
-`Image4.dmg` (or `Image.dmg`, `DeveloperDiskImage.dmg`) and its `.trustcache` next to a manifest works too. A manifest
-with no build identity for the device (the image is from an Xcode older than the device's iOS) is an error that says so.
-
-**A download**, for a fleet that has no Mac to copy from: if you host a `.tar.gz` of the folder yourself
-(`tar czf ddi.tar.gz -C iOS_DDI .`), `--ddi-download-url URL --ddi-sha256 HEX` (or `$SCRIOS_DDI_URL` and
-`$SCRIOS_DDI_SHA256`) downloads it into the cache folder when no folder is found. The SHA-256 is required: an archive
-that does not match is never unpacked, and an entry that would leave the folder is an error. There is no default URL.
 
 ## A remote usbmuxd
 
@@ -353,9 +417,11 @@ needs an SSH server there).
 | `--format raw\|framed` | what is written to the output (default raw) |
 | `-n`, `--no-control` | do not connect touch and keys: a stream that only watches |
 | `--no-wait` | fail at once when the device is not ready (not plugged in, not trusted, Developer Mode off), instead of waiting |
-| `--no-preflight` | do not check Developer Mode and the developer disk image first, and never mount one |
-| `--ddi-dir DIR` | the developer disk image folder to mount from (see [the developer disk image](#the-developer-disk-image)) |
-| `--ddi-download-url URL`, `--ddi-sha256 HEX` | download the image (a `.tar.gz` of the folder, checked against the hash) when no folder is found; no default URL |
+| `--no-preflight` | do not check Developer Mode and the developer disk image first, and never install one |
+| `--ddi-dir DIR` | the developer disk image folder to install from (see [the developer disk image](#the-developer-disk-image)) |
+| `--ddi-source auto\|local\|none` | where the image may come from: local copies, else a download (`auto`, the default); local copies only; or install nothing |
+| `--ddi-repo URL`, `--ddi-ref COMMIT`, `--ddi-sha256-manifest FILE` | download from a mirror of the DeveloperDiskImage repository instead of GitHub's pinned commit; all three are required |
+| `--ddi-download-url URL`, `--ddi-sha256 HEX` | download the image from an archive you host (a `.tar.gz` of the folder, checked against the hash) when no folder is found |
 | `--decoder auto\|platform\|software`, `--window-title`, `--window-width`, `--window-height`, `--edge-margin`, `--bottom-swipe`, `--show-stats`, `--lock-shortcut` | the viewer's (see above); `scrios` without a subcommand only |
 | `--list-devices` | the same as `scrios list` |
 
@@ -398,6 +464,8 @@ service that did not connect is answered with an `ok: false` event.
 | --- | --- |
 | `USBMUXD_SOCKET_ADDRESS` | the usbmuxd to ask when `--usbmuxd` is not given (`UNIX:/path`, `/path`, `host:port`, `TCP:host:port`, the first two not on Windows; the variable libimobiledevice and go-ios read) |
 | `SCRIOS_DDI_DIR` | the DDI folder, when `--ddi-dir` is not given |
+| `SCRIOS_DDI_SOURCE` | `auto`, `local` or `none`, when `--ddi-source` is not given |
+| `SCRIOS_DDI_REPO`, `SCRIOS_DDI_REF`, `SCRIOS_DDI_SHA256_MANIFEST` | the mirror to download the DDI from, its commit, and the manifest of SHA-256 values of its files |
 | `SCRIOS_DDI_URL`, `SCRIOS_DDI_SHA256` | the archive to download the DDI from, and its SHA-256 |
 | `RUST_LOG` | the log level (the default is `info`) |
 
@@ -408,7 +476,8 @@ if the stream failed while running, 2 if it could not be started or the options 
 error. Ctrl-C (SIGINT) and SIGTERM stop the stream cleanly (on Windows: Ctrl-C and Ctrl-Break; closing the console window
 or `taskkill /f` ends the process at once), which can take up to about 8 seconds. A device that is not
 ready (and `--no-wait`, or a command that does not wait) is exit status 2. `scrios doctor` and `scrios developer-mode`
-exit with 1 when something is missing, and `scrios ddi-status` when the image is not mounted or Developer Mode is off.
+exit with 1 when something is missing, and `scrios ddi-status` when the image is not in place or Developer Mode is off.
+`scrios ddi-fetch` exits 0 when the files are in the cache and checked, 2 when they could not be.
 
 ## As a library
 
@@ -422,6 +491,8 @@ What happens before the stream is one function, `scrios::preflight::ensure_ready
 which returns a `ReadyDevice` (its `stream_options` gives the `StreamOptions` for the device that was checked) and
 tells `progress` what it does and waits for as `PreflightStep`s (each has a plain line). `scrios::preflight::doctor`
 is the same checks as a `Report`, to which a program can add its own (`scrios doctor` adds the viewer's decoder).
-`scrios::mux::Mux` is the usbmuxd address (`--usbmuxd`, `$USBMUXD_SOCKET_ADDRESS`, the platform's), `scrios::ddi` finds
-and unpacks the developer disk image, and `scrios::ops::Device` has the operations on a device (Developer Mode,
-mounting).
+`scrios::mux::Mux` is the usbmuxd address (`--usbmuxd`, `$USBMUXD_SOCKET_ADDRESS`, the platform's), `scrios::ddi` finds,
+downloads (`scrios::ddi::fetch`, with the pinned image in `scrios::ddi::pin`) and checks the developer disk image, and
+`scrios::ops::Device` has the operations on a device (Developer Mode, the route the image takes, installing it as a
+cryptex or mounting it, removing it). `DdiSources::default()` never downloads; `DdiSources::from_options` is what the
+command line builds (`auto`).

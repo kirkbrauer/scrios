@@ -1,0 +1,88 @@
+name: DDI pin
+
+# scrios downloads Apple's developer disk image from one pinned commit of the pymobiledevice3 project's
+# DeveloperDiskImage repository and uses it only if every file has the size and SHA-256 that src/ddi/pin.rs says.
+# This workflow, weekly and on demand:
+#   1. downloads both forms of the pinned image (what `scrios ddi-fetch --variant all` does: the program's own client,
+#      into an empty cache) and fails if a file is not what the pin says, or the build in its manifest is not the
+#      pinned build;
+#   2. says, as a warning and in the run's summary, when the repository has a newer commit that touched the images than
+#      the pinned one. That does not fail the run: updating the pin is a deliberate change of src/ddi/pin.rs (the steps
+#      are at the top of that file).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.96.0
+
+jobs:
+  verify:
+    name: the pinned files are what GitHub serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ddi-pin-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ddi-pin-
+      # The headless build: no window, no GPU, no decoder, and nothing of the viewer to compile.
+      - name: build scrios (headless)
+        run: cargo build --release --locked --no-default-features
+      - name: download both forms of the image into an empty cache, and check every file
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/ddi-cache
+        run: target/release/scrios ddi-fetch --variant all
+      - name: the build in the downloaded manifest is the pinned build
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/ddi-cache
+        run: |
+          build="$(sed -n -E 's/^pub const BUILD: &str = "([A-Za-z0-9]+)";/\1/p' src/ddi/pin.rs)"
+          [ -n "$build" ] || { echo "::error::no BUILD in src/ddi/pin.rs"; exit 1; }
+          for folder in Xcode_iOS_DDI_Cryptex Xcode_iOS_DDI_Personalized; do
+            got="$(python3 -I -c 'import plistlib, sys; print(plistlib.load(open(sys.argv[1], "rb"))["ProductBuildVersion"])' "$XDG_CACHE_HOME/scrios/ddi/$build/$folder/BuildManifest.plist")"
+            [ "$got" = "$build" ] || { echo "::error::$folder is build $got, the pin says $build"; exit 1; }
+          done
+          echo "both forms are build $build"
+
+  upstream:
+    name: is there a newer image upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: compare the pin with the newest commit that touched the images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo="$(sed -n -E 's/^pub const REPO: &str = "([^"]+)";/\1/p' src/ddi/pin.rs)"
+          pinned="$(sed -n -E 's/^pub const COMMIT: &str = "([0-9a-f]{40})";/\1/p' src/ddi/pin.rs)"
+          [ -n "$repo" ] && [ -n "$pinned" ] || { echo "::error::no REPO or COMMIT in src/ddi/pin.rs"; exit 1; }
+          latest="$(gh api "repos/$repo/commits?path=PersonalizedImages&per_page=1" --jq '.[0].sha')"
+          message="$(gh api "repos/$repo/commits?path=PersonalizedImages&per_page=1" --jq '.[0].commit.message | split("\n")[0]')"
+          {
+            echo "### DDI pin"
+            echo "- pinned: \`$pinned\`"
+            echo "- newest upstream commit that touched PersonalizedImages: \`$latest\` ($message)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$latest" = "$pinned" ]; then
+            echo "the pin is the newest commit that touched the images"
+          else
+            echo "::warning title=A newer developer disk image upstream::$repo has a newer commit that touched the images ($latest: $message) than the pin ($pinned). Update src/ddi/pin.rs when a device needs the newer image (the steps are at the top of that file)."
+            echo "- **newer than the pin**: update \`src/ddi/pin.rs\` when a device needs it" >> "$GITHUB_STEP_SUMMARY"
+          fi

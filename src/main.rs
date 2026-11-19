@@ -126,7 +126,8 @@ writes the video instead, headless: by default a raw Annex-B H.264 stream on std
 (access units and JSON events) for programs. Touch and keys are sent to the device through the window, or through the \
 commands on stdin of `scrios stream` (see below), unless --no-control. Logs go to stderr.\n\n\
 `scrios list` (or --list-devices) lists the devices usbmuxd knows. `scrios ddi-status`, `scrios mount-ddi` and \
-`scrios unmount-ddi` manage the developer disk image that the display service needs, `scrios doctor` checks everything \
+`scrios unmount-ddi` manage the developer disk image that the display service needs (scrios downloads Apple's image by \
+itself when the host has none; `scrios ddi-fetch` does that without a device), `scrios doctor` checks everything \
 the stream needs, and `scrios developer-mode` shows and reveals the Developer Mode switch."
 } else {
     "Mirror and control an iOS device's screen. Connects to the device through usbmuxd (with the pair record \
@@ -137,7 +138,8 @@ as well, --output FILE writes it to a file instead of stdout, and --format frame
 below), unless --no-control. Logs go to stderr.\n\n\
 Without a subcommand, `scrios` is `scrios stream`. `scrios list` (or --list-devices) lists the devices usbmuxd knows. \
 `scrios ddi-status`, `scrios mount-ddi` and `scrios unmount-ddi` manage the developer disk image that the display \
-service needs, `scrios doctor` checks everything the stream needs, and `scrios developer-mode` shows and reveals the \
+service needs (scrios downloads Apple's image by itself when the host has none; `scrios ddi-fetch` does that without a \
+device), `scrios doctor` checks everything the stream needs, and `scrios developer-mode` shows and reveals the \
 Developer Mode switch."
 };
 
