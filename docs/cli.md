@@ -43,7 +43,7 @@ For `scrios` only.
 | `--window-title TITLE` | The window title. |
 | `--window-width N`, `--window-height N` | The largest size the window opens at. |
 | `--show-stats` | Show the frame rate and delay in the title. |
-| `--decoder auto\|platform\|software` | The H.264 decoder. `platform` is [VideoToolbox](https://developer.apple.com/documentation/videotoolbox) on macOS. `software` is [OpenH264](https://www.openh264.org/). `auto` tries the platform decoder first. |
+| `--decoder auto\|platform\|software` | The H.264 decoder. `platform` is [VideoToolbox](https://developer.apple.com/documentation/videotoolbox) on macOS and [Media Foundation](https://learn.microsoft.com/windows/win32/medfound/h-264-video-decoder) on Windows. `software` is [OpenH264](https://www.openh264.org/). `auto` tries the platform decoder first. |
 | `--edge-margin N` | Add a band around the picture. A press in the band lands on the very edge of the screen, which makes edge swipes easier. Try 24. |
 | `--bottom-swipe keys\|touch` | What a drag up from the bottom edge does. See [the bottom swipe](#the-bottom-swipe). |
 | `--lock-shortcut` | Let `MOD+P` lock the device. Off by default so you cannot lock yourself out by accident. |

@@ -2,7 +2,8 @@
 //!
 //! `scrios` without a subcommand opens it (`scrios stream` stays headless). The pieces:
 //!
-//! * [`decode`]: H.264 access units to pictures: `VideoToolbox` on macOS, `OpenH264` in software anywhere;
+//! * [`decode`]: H.264 access units to pictures: `VideoToolbox` on macOS, Media Foundation on Windows, `OpenH264` in software
+//!   anywhere;
 //! * [`render`]: wgpu draws the picture, turned upright and letterboxed, from its two planes (NV12);
 //! * [`geometry`] and [`input`]: where the picture is in the window and what a click or a key on it means for the
 //!   device (touch id 0, HID keys, the shortcut keys);

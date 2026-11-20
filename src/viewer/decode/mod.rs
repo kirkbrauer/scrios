@@ -7,7 +7,7 @@
 //!
 //! * `videotoolbox` (macOS only, so not linked to): Apple's `VideoToolbox`, the hardware decoder.
 //! * [`software`]: `OpenH264`, Cisco's decoder, built into the binary; it runs anywhere.
-//! * [`mediafoundation`] (Windows): not written yet; it says so and the software decoder is used.
+//! * `mediafoundation` (Windows only, so not linked to): Media Foundation's H.264 decoder, on the GPU where it can.
 //!
 //! [`create`] chooses: the platform's decoder where there is one, the software one otherwise, and the software one
 //! again if the platform's fails.
@@ -18,6 +18,7 @@ use crate::codec::CodecKind;
 use crate::stream::AccessUnit;
 
 pub mod annexb;
+#[cfg(windows)]
 pub mod mediafoundation;
 pub mod software;
 #[cfg(target_os = "macos")]
@@ -133,8 +134,8 @@ pub trait Decoder: Send {
 /// Which decoder to use (`--decoder`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecoderChoice {
-    /// The platform's decoder where there is one (`VideoToolbox` on macOS), the software decoder otherwise or if the
-    /// platform's fails.
+    /// The platform's decoder where there is one (`VideoToolbox` on macOS, Media Foundation on Windows), the software
+    /// decoder otherwise or if the platform's fails.
     #[default]
     Auto,
     /// The platform's decoder, and no other: it is an error if there is none.
@@ -146,7 +147,7 @@ pub enum DecoderChoice {
 /// Whether this build has a decoder of the platform's own.
 #[must_use]
 pub fn has_platform_decoder() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", windows))
 }
 
 /// The platform's decoder.

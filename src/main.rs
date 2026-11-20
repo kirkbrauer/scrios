@@ -273,9 +273,10 @@ impl Cli {
 #[cfg(feature = "viewer")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DecoderArg {
-    /// The platform's decoder if it has one (`VideoToolbox` on macOS), else `OpenH264`; `OpenH264` too if the platform's fails.
+    /// The platform's decoder if it has one (`VideoToolbox` on macOS, Media Foundation on Windows), else `OpenH264`;
+    /// `OpenH264` too if the platform's fails.
     Auto,
-    /// The platform's decoder, and no other (an error where there is none: Linux, and Windows for now).
+    /// The platform's decoder, and no other (an error where there is none: Linux).
     Platform,
     /// `OpenH264`, in software.
     Software,
@@ -317,8 +318,8 @@ impl BottomSwipeArg {
 #[cfg(feature = "viewer")]
 #[derive(Args, Debug)]
 struct ViewerArgs {
-    /// The H.264 decoder: auto (the platform's: `VideoToolbox` on macOS; `OpenH264` where there is none, or if the
-    /// platform's fails), platform (the platform's only), software (`OpenH264`)
+    /// The H.264 decoder: auto (the platform's: `VideoToolbox` on macOS, Media Foundation on Windows; `OpenH264` where
+    /// there is none, or if the platform's fails), platform (the platform's only), software (`OpenH264`)
     #[arg(long, value_enum, value_name = "DECODER", default_value_t = DecoderArg::Auto)]
     decoder: DecoderArg,
 
