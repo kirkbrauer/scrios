@@ -27,6 +27,7 @@ viewer = [
   "dep:objc2-core-media",
   "dep:objc2-core-video",
   "dep:objc2-video-toolbox",
+  "dep:windows",
 ]
 
 [lib]
@@ -99,6 +100,16 @@ libc = "0.2"
 # `SetStdHandle`, the Windows form of the same (see `take_stdout` in main.rs). Already in the tree through tokio, mio
 # and socket2, at this version: it adds no crate.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+# The Windows decoder: Media Foundation's H.264 transform, on a Direct3D 11 device (src/viewer/decode/mediafoundation.rs).
+# Already in the tree through wgpu's Direct3D 12 backend, at this version: it adds no crate.
+windows = { version = "0.62", optional = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+] }
 
 # The macOS hardware decoder: VideoToolbox, through the objc2 project's bindings (generated from Apple's headers).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -158,3 +169,13 @@ expect_used = "warn"
 opt-level = 2
 lto = "thin"
 strip = true
+
+# OpenH264 (the software decoder) is C++ that the profile's level is passed on to. A phone's picture is 3 megapixels,
+# 60 times a second: at -O0 it takes 40 ms to decode (a debug build then shows a stream that freezes: the decoder falls
+# behind, the queue overflows and the view waits for a keyframe), at -O3 half of that; in a release build -O3 over -O2
+# is 12 ms for 14.
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.release.package.openh264-sys2]
+opt-level = 3
