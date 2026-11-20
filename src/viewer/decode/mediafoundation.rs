@@ -21,20 +21,24 @@
 #![allow(unsafe_code)]
 
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Query, ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264DecoderMFT, CODECAPI_AVLowLatencyMode, IMF2DBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
-    IMFSample, IMFTransform, MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE, MF_VERSION,
-    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFNominalRange_0_255, MFSTARTUP_LITE, MFShutdown, MFStartup, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    CLSID_MSH264DecoderMFT, CODECAPI_AVLowLatencyMode, IMF2DBuffer, IMFDXGIBuffer, IMFDXGIDeviceManager,
+    IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX,
+    MF_SA_D3D11_AWARE, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFNominalRange_0_255, MFSTARTUP_LITE, MFShutdown, MFStartup, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_MixedInterlaceOrProgressive, MFVideoTransferMatrix_BT601,
@@ -42,7 +46,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CO_MTA_USAGE_COOKIE, CoCreateInstance, CoDecrementMTAUsage, CoIncrementMTAUsage,
 };
-use windows::core::Interface;
+use windows::core::{BOOL, Interface};
 
 use super::{ColorMatrix, ColorRange, DecodeError, Decoder, Picture, Plane};
 use crate::stream::AccessUnit;
@@ -53,6 +57,8 @@ const SOFTWARE_ENV: &str = "SCRIOS_MF_SOFTWARE";
 const INPUT_RETRIES: usize = 8;
 /// How many times in a row the transform may say its output changed before it is taken to be broken.
 const STREAM_CHANGES: usize = 4;
+/// How long the GPU may take to finish a picture before it is read anyway.
+const GPU_WAIT: Duration = Duration::from_millis(250);
 
 /// COM and Media Foundation, for as long as this lives. It is the last field of [`MediaFoundation`], so that every
 /// object of theirs is released before it.
@@ -101,8 +107,8 @@ struct Layout {
 /// The Media Foundation decoder.
 pub struct MediaFoundation {
     transform: IMFTransform,
-    /// The transform decodes on the GPU. The device manager is kept for as long as the transform uses it.
-    gpu: Option<IMFDXGIDeviceManager>,
+    /// The transform decodes on the GPU: its device, and what reads its pictures back.
+    gpu: Option<Gpu>,
     /// The layout of the output, once the output type is set.
     layout: Option<Layout>,
     /// The sample the transform writes to when it does not bring its own (the CPU decoder): made when first needed and
@@ -228,7 +234,11 @@ impl MediaFoundation {
                         self.layout = Some(layout);
                         layout
                     };
-                    return copy_out(&sample, layout).map(Some);
+                    let picture = match self.gpu.as_mut() {
+                        Some(gpu) => gpu.read(&sample, layout),
+                        None => copy_out(&sample, layout),
+                    };
+                    return picture.map(Some);
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => self.set_output_type()?,
@@ -290,7 +300,7 @@ impl Decoder for MediaFoundation {
 }
 
 /// The H.264 decoder transform, set up and streaming: with a Direct3D 11 device of its own if `gpu`.
-fn open(gpu: bool) -> Result<(IMFTransform, Option<IMFDXGIDeviceManager>), String> {
+fn open(gpu: bool) -> Result<(IMFTransform, Option<Gpu>), String> {
     // Safety: the class id is a constant of the bindings, there is no outer object, and the interface asked for is the
     // one the result is typed as.
     let transform: IMFTransform = unsafe { CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER) }
@@ -303,12 +313,12 @@ fn open(gpu: bool) -> Result<(IMFTransform, Option<IMFDXGIDeviceManager>), Strin
             if attributes.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
                 return Err("the decoder does not work with Direct3D 11".to_owned());
             }
-            let manager = device_manager()?;
+            let gpu = Gpu::new()?;
             // The message's parameter is the manager's `IUnknown` pointer, which the transform takes a reference to.
             transform
-                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, gpu.manager.as_raw() as usize)
                 .map_err(|e| format!("the decoder does not take the graphics device: {e}"))?;
-            Some(manager)
+            Some(gpu)
         } else {
             None
         };
@@ -336,42 +346,157 @@ fn open(gpu: bool) -> Result<(IMFTransform, Option<IMFDXGIDeviceManager>), Strin
     }
 }
 
-/// A Direct3D 11 device that can decode video, in the device manager the transform takes it from.
-fn device_manager() -> Result<IMFDXGIDeviceManager, String> {
-    let mut device: Option<ID3D11Device> = None;
-    // Safety: the default adapter, no software rasteriser, the default feature levels; `device` outlives the call and
-    // is the only output asked for.
-    unsafe {
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            None,
-            D3D11_SDK_VERSION,
-            Some(&raw mut device),
-            None,
-            None,
-        )
-    }
-    .map_err(|e| format!("no graphics device that decodes video: {e}"))?;
-    let device = device.ok_or("no graphics device")?;
-    // The decoder uses the device from threads of its own.
-    let multithread: ID3D11Multithread =
-        device.cast().map_err(|e| format!("the graphics device cannot be shared between threads: {e}"))?;
-    // Safety: a call on the live device; what it returns is the setting it had before.
-    let _ = unsafe { multithread.SetMultithreadProtected(true) };
+/// The Direct3D 11 device the transform decodes on, and what reads a decoded picture back from it.
+///
+/// A decoded picture is one slice of a texture array of the decoder's. It is copied to a staging texture (one the CPU
+/// can map), the GPU is waited for (some drivers hand a picture over before it is decoded: read then, it is all zeros,
+/// which is green), and the staging texture is mapped and copied out.
+struct Gpu {
+    /// Kept for as long as the transform uses it.
+    manager: IMFDXGIDeviceManager,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    /// The staging texture, and the size it was made for.
+    staging: Option<(ID3D11Texture2D, (u32, u32))>,
+    /// The query that says the GPU has done everything it was given.
+    query: Option<ID3D11Query>,
+}
 
-    let mut token = 0u32;
-    let mut manager: Option<IMFDXGIDeviceManager> = None;
-    // Safety: both outputs are locals that outlive the call.
-    unsafe { MFCreateDXGIDeviceManager(&raw mut token, &raw mut manager) }
-        .map_err(|e| format!("cannot make a device manager: {e}"))?;
-    let manager = manager.ok_or("no device manager")?;
-    // Safety: the device is live and the token is the one the manager was made with.
-    unsafe { manager.ResetDevice(&device, token) }
-        .map_err(|e| format!("the device manager refused the device: {e}"))?;
-    Ok(manager)
+impl Gpu {
+    /// A Direct3D 11 device that can decode video, in the device manager the transform takes it from.
+    fn new() -> Result<Gpu, String> {
+        let mut device: Option<ID3D11Device> = None;
+        // Safety: the default adapter, no software rasteriser, the default feature levels; `device` outlives the call and
+        // is the only output asked for.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                None,
+            )
+        }
+        .map_err(|e| format!("no graphics device that decodes video: {e}"))?;
+        let device = device.ok_or("no graphics device")?;
+        // The decoder uses the device from threads of its own.
+        let multithread: ID3D11Multithread =
+            device.cast().map_err(|e| format!("the graphics device cannot be shared between threads: {e}"))?;
+        // Safety: a call on the live device; what it returns is the setting it had before.
+        let _ = unsafe { multithread.SetMultithreadProtected(true) };
+
+        let mut token = 0u32;
+        let mut manager: Option<IMFDXGIDeviceManager> = None;
+        // Safety: both outputs are locals that outlive the call.
+        unsafe { MFCreateDXGIDeviceManager(&raw mut token, &raw mut manager) }
+            .map_err(|e| format!("cannot make a device manager: {e}"))?;
+        let manager = manager.ok_or("no device manager")?;
+        // Safety: the device is live and the token is the one the manager was made with.
+        unsafe { manager.ResetDevice(&device, token) }
+            .map_err(|e| format!("the device manager refused the device: {e}"))?;
+        // Safety: a call on the live device.
+        let context =
+            unsafe { device.GetImmediateContext() }.map_err(|e| format!("the graphics device has no context: {e}"))?;
+        Ok(Gpu { manager, device, context, staging: None, query: None })
+    }
+
+    /// Copies the picture of a decoded sample into a [`Picture`].
+    fn read(&mut self, sample: &IMFSample, layout: Layout) -> Result<Picture, String> {
+        let failed = |e: windows::core::Error| format!("cannot read the picture from the GPU: {e}");
+        // Safety: a call on the live sample.
+        let buffer = unsafe { sample.GetBufferByIndex(0) }.map_err(failed)?;
+        // A picture that is in memory after all (the transform decoded it on the CPU).
+        let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>() else { return copy_out(sample, layout) };
+        let mut raw = std::ptr::null_mut();
+        // Safety: the interface asked for is the one the pointer is then taken as, and `raw` outlives the call; the
+        // reference the call gives is owned by `texture`.
+        let texture = unsafe {
+            dxgi.GetResource(&ID3D11Texture2D::IID, &raw mut raw).map_err(failed)?;
+            ID3D11Texture2D::from_raw(raw)
+        };
+        // Safety: a call on the live buffer.
+        let slice = unsafe { dxgi.GetSubresourceIndex() }.map_err(failed)?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // Safety: `desc` outlives the call.
+        unsafe { texture.GetDesc(&raw mut desc) };
+        if desc.Format != DXGI_FORMAT_NV12 || desc.Width == 0 || desc.Height == 0 {
+            return Err(format!(
+                "the GPU's picture is {}x{} of format {}, not NV12",
+                desc.Width, desc.Height, desc.Format.0
+            ));
+        }
+        let size = (desc.Width, desc.Height);
+        if self.staging.as_ref().is_none_or(|(_, made_for)| *made_for != size) {
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                MipLevels: 1,
+                ArraySize: 1,
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0.cast_unsigned(),
+                MiscFlags: 0,
+                ..desc
+            };
+            let mut staging = None;
+            // Safety: the description and the output are locals that outlive the call.
+            unsafe { self.device.CreateTexture2D(&raw const staging_desc, None, Some(&raw mut staging)) }
+                .map_err(failed)?;
+            self.staging = Some((staging.ok_or("no staging texture")?, size));
+            debug!(
+                "Media Foundation reads back {}x{} pictures (the decoder's textures have {} slices)",
+                size.0, size.1, desc.ArraySize
+            );
+        }
+        let Some((staging, _)) = self.staging.as_ref() else { return Err("no staging texture".to_owned()) };
+        if self.query.is_none() {
+            let query_desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+            let mut query = None;
+            // Safety: the description and the output are locals that outlive the call.
+            // Without the query the picture is read without the wait: not an error.
+            let _ = unsafe { self.device.CreateQuery(&raw const query_desc, Some(&raw mut query)) };
+            self.query = query;
+        }
+        // Safety: both textures are live, of the same device, format and size; the slice is the buffer's own.
+        unsafe { self.context.CopySubresourceRegion(staging, 0, 0, 0, 0, &texture, slice, None) };
+        if let Some(query) = &self.query {
+            // Safety: calls on the live context with the live query; `done` outlives each call and is of the size given.
+            unsafe {
+                self.context.End(query);
+                self.context.Flush();
+                let started = Instant::now();
+                let mut done = BOOL(0);
+                while self.context.GetData(query, Some((&raw mut done).cast()), 4, 0).is_ok()
+                    && !done.as_bool()
+                    && started.elapsed() < GPU_WAIT
+                {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // Safety: the staging texture is CPU-readable; `mapped` outlives the call; unmapped below on every path.
+        unsafe { self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped)) }.map_err(failed)?;
+        let stride = mapped.RowPitch as usize;
+        let (width, height) = (desc.Width as usize, desc.Height as usize);
+        let chroma_w = width.div_ceil(2) * 2;
+        let result = if mapped.pData.is_null() || stride < chroma_w {
+            Err(format!("the GPU's picture is mapped with rows of {stride} bytes for a width of {width}"))
+        } else {
+            // The luma rows, then the chroma rows, each `stride` apart; the last row is taken to end at the picture's
+            // edge.
+            let length = stride * (height + height.div_ceil(2) - 1) + chroma_w;
+            // Safety: a mapped NV12 staging texture is that many readable bytes, which nothing writes while it is
+            // mapped; the slice does not outlive the mapping.
+            let bytes = unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>().cast_const(), length) };
+            planes(bytes, Layout { width: desc.Width, height: desc.Height, stride, ..layout })
+        };
+        // Safety: balances the `Map` above.
+        unsafe { self.context.Unmap(staging, 0) };
+        result
+    }
 }
 
 /// Sets the transform's output to the NV12 type it offers, and returns that type.
