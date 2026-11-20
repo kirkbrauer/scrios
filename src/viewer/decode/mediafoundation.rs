@@ -29,14 +29,14 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
 };
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264DecoderMFT, CODECAPI_AVLowLatencyMode, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFTransform, MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE, MF_VERSION, MFCreateDXGIDeviceManager,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFNominalRange_0_255, MFSTARTUP_LITE,
-    MFShutdown, MFStartup, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_H264, MFVideoFormat_NV12,
+    CLSID_MSH264DecoderMFT, CODECAPI_AVLowLatencyMode, IMF2DBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
+    IMFSample, IMFTransform, MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE, MF_VERSION,
+    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFNominalRange_0_255, MFSTARTUP_LITE, MFShutdown, MFStartup, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_MixedInterlaceOrProgressive, MFVideoTransferMatrix_BT601,
 };
 use windows::Win32::System::Com::{
@@ -462,10 +462,20 @@ fn copy_out(sample: &IMFSample, layout: Layout) -> Result<Picture, String> {
     // back.
     // Safety: a call on the live sample.
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(|e| format!("cannot read the picture: {e}"))?;
-    // Safety: a call on the live buffer.
-    let length = unsafe { buffer.GetCurrentLength() }.map_err(|e| format!("cannot read the picture: {e}"))? as usize;
+    // How long the picture is. A memory buffer says (the decoder set it); a buffer that is a texture says 0, and its
+    // length is that of the copy the lock makes: what it says as a 2-D buffer, or else all of what the lock gives.
+    // Safety (both): calls on the live buffer.
+    let current = unsafe { buffer.GetCurrentLength() }.unwrap_or(0) as usize;
+    let contiguous =
+        buffer.cast::<IMF2DBuffer>().ok().and_then(|b| unsafe { b.GetContiguousLength() }.ok()).unwrap_or(0) as usize;
     let picture = with_bytes(&buffer, |bytes| {
-        let bytes = bytes.get(..length).ok_or("the picture is longer than its buffer")?;
+        let length = [current, contiguous, bytes.len()].into_iter().find(|l| *l > 0).unwrap_or(0);
+        let bytes = bytes.get(..length).ok_or_else(|| {
+            format!(
+                "the picture is {length} bytes ({current} current, {contiguous} contiguous) in a buffer of {}",
+                bytes.len()
+            )
+        })?;
         planes(bytes, layout)
     })?;
     // The sample is used again for the next picture if it is ours: it is empty again.
@@ -480,6 +490,11 @@ fn planes(bytes: &[u8], layout: Layout) -> Result<Picture, String> {
     let Layout { width, height, stride, range, matrix } = layout;
     let (w, h) = (width as usize, height as usize);
     let (chroma_w, chroma_h) = (w.div_ceil(2) * 2, h.div_ceil(2));
+    // The copy of a texture has rows of its own length, whatever the output type's default is: a buffer that is a whole
+    // number of rows of exactly the picture's width, or of more than the type says, is read by those rows.
+    let rows = h + chroma_h;
+    let own = bytes.len() / rows;
+    let stride = if bytes.len().is_multiple_of(rows) && (own == chroma_w || own > stride) { own } else { stride };
     let short = || format!("the picture has {} bytes, too few for {width}x{height} at {stride} a row", bytes.len());
     let (luma, chroma) = bytes.split_at_checked(stride * h).ok_or_else(short)?;
     if stride < chroma_w || chroma.len() < stride * (chroma_h.saturating_sub(1)) + chroma_w {
@@ -578,5 +593,9 @@ mod tests {
         assert!(planes(&bytes[..16], layout).is_ok());
         assert!(planes(&bytes[..15], layout).is_err());
         assert!(planes(&bytes[..11], layout).is_err());
+        // A buffer of whole rows of another length than the type says is read by its own rows (a texture's copy).
+        let tight = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13];
+        let p = planes(&tight, layout).expect("fits");
+        assert_eq!((p.y.data, p.uv.data), (vec![1, 2, 3, 4, 5, 6, 7, 8], vec![10, 11, 12, 13]));
     }
 }
