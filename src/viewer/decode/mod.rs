@@ -233,14 +233,58 @@ impl Decoder for Fallback {
                 match software::Software::new() {
                     Ok(software) => {
                         self.software = Some(software);
-                        // The software decoder starts at a key unit: this one may be it.
-                        self.decode(unit)
+                        if unit.key {
+                            return self.decode(unit);
+                        }
+                        // The software decoder starts at a key unit, and the device sends one only when asked: the
+                        // caller asks when a unit fails.
+                        Err(DecodeError::Unit("the software decoder waits for a key unit".into()))
                     }
                     Err(why) => Err(DecodeError::Fatal(why)),
                 }
             }
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::fixture_units;
+    use super::*;
+
+    /// A platform decoder that holds the first picture back and breaks at the second unit, as a hardware decoder whose
+    /// output cannot be read does.
+    struct BreaksAtTheSecond(usize);
+
+    impl Decoder for BreaksAtTheSecond {
+        fn name(&self) -> &'static str {
+            "breaks"
+        }
+        fn decode(&mut self, _: &AccessUnit) -> Result<Option<Picture>, DecodeError> {
+            self.0 += 1;
+            if self.0 == 1 { Ok(None) } else { Err(DecodeError::Fatal("no picture".into())) }
+        }
+    }
+
+    #[test]
+    fn a_platform_decoder_that_breaks_on_a_delta_unit_asks_for_a_key_unit_and_software_goes_on_from_it() {
+        let units = fixture_units();
+        let mut decoder = Fallback::new(Box::new(BreaksAtTheSecond(0)));
+        assert_eq!(decoder.decode(&units[0]), Ok(None));
+        // The software decoder cannot start at a delta unit: that is an error of the unit, which makes the caller ask
+        // the device for a key unit (it sends none by itself, and the view would stay frozen).
+        assert!(matches!(decoder.decode(&units[1]), Err(DecodeError::Unit(_))));
+        assert_eq!(decoder.name(), "OpenH264 (software)");
+        assert_eq!(decoder.decode(&units[2]), Ok(None));
+        assert!(decoder.decode(&units[3]).expect("decodes").is_some(), "the key unit starts it");
+    }
+
+    #[test]
+    fn a_platform_decoder_that_breaks_on_a_key_unit_has_it_decoded_in_software_at_once() {
+        let units = fixture_units();
+        let mut decoder = Fallback::new(Box::new(BreaksAtTheSecond(1)));
+        assert!(decoder.decode(&units[0]).expect("decodes").is_some());
     }
 }
 
