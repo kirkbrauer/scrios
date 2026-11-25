@@ -71,5 +71,5 @@ repository has a newer image.
 
 ## Releases
 
-Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds the binaries for Linux, macOS and Windows,
-creates a GitHub release, and publishes the crate.
+Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds the binaries for Linux and Windows (x64 and
+ARM64) and macOS (ARM64), creates a GitHub release, and publishes the crate.

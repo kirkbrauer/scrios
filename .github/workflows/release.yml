@@ -2,10 +2,10 @@ name: Release
 
 # A tag `vX.Y.Z` (equal to `version` in Cargo.toml) releases scrios:
 #   1. checks the tag against Cargo.toml and runs the tests;
-#   2. builds scrios-x86_64-linux-musl and scrios-aarch64-linux-musl (static, any Linux distribution, headless: built
-#      with --no-default-features, so without the viewer window), scrios-aarch64-apple-darwin (with the viewer) and, for
-#      Windows, scrios-x86_64-pc-windows-msvc.zip (scrios.exe with the README, LICENSE and NOTICE, with the viewer; also
-#      scrios-aarch64-pc-windows-msvc.zip if its cross-build works: it is optional), with SHA256SUMS;
+#   2. builds scrios-*-linux-musl for x64 and ARM64 (static, any Linux distribution, headless: built with
+#      --no-default-features, so without the viewer window), scrios-aarch64-apple-darwin (with the viewer; Intel Macs
+#      are not supported) and scrios-*-pc-windows-msvc.zip for x64 and ARM64 (scrios.exe with the README, LICENSE and
+#      NOTICE, with the viewer), with SHA256SUMS. All five are required: if one does not build, there is no release;
 #   3. creates the GitHub release with them;
 #   4. publishes the crate to crates.io, with Trusted Publishing (OIDC) if it is configured for this repository,
 #      else with the CARGO_REGISTRY_TOKEN secret (the first publish of a crate needs the token).
@@ -92,7 +92,7 @@ jobs:
           if-no-files-found: error
 
   # Windows: scrios.exe, linked with MSVC, in a zip with the documents. The ARM64 build is a cross-build on the x64
-  # runner that nobody has run yet: if it fails, the release goes on without it.
+  # runner, which cannot run it.
   build-windows:
     name: build ${{ matrix.asset }}
     needs: check
@@ -100,9 +100,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-pc-windows-msvc, asset: scrios-x86_64-pc-windows-msvc.zip, smoke: true, optional: false }
-          - { target: aarch64-pc-windows-msvc, asset: scrios-aarch64-pc-windows-msvc.zip, smoke: false, optional: true }
-    continue-on-error: ${{ matrix.optional }}
+          - { target: x86_64-pc-windows-msvc, asset: scrios-x86_64-pc-windows-msvc.zip, smoke: true }
+          - { target: aarch64-pc-windows-msvc, asset: scrios-aarch64-pc-windows-msvc.zip, smoke: false }
     runs-on: windows-latest
     defaults:
       run:

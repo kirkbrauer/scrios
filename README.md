@@ -2,7 +2,7 @@
 
 [scrcpy](https://github.com/Genymobile/scrcpy) for iOS: see and control an iPhone or iPad from your computer, over USB.
 
-- Works on Linux, macOS and Windows
+- Works on Linux, macOS (Apple silicon) and Windows
 - No jailbreak, and nothing to install on the device
 - Mouse and keyboard control
 - Recording
