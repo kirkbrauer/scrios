@@ -1,7 +1,7 @@
 name: Release
 
 # A tag `vX.Y.Z` (equal to `version` in Cargo.toml) releases scrios:
-#   1. checks the tag against Cargo.toml and runs the tests;
+#   1. checks that the tagged commit is on main and the tag against Cargo.toml, and runs the tests;
 #   2. builds scrios-*-linux-musl for x64 and ARM64 (static, any Linux distribution, headless: built with
 #      --no-default-features, so without the viewer window), scrios-aarch64-apple-darwin (with the viewer; Intel Macs
 #      are not supported) and scrios-*-pc-windows-msvc.zip for x64 and ARM64 (scrios.exe with the README, LICENSE and
@@ -28,6 +28,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # The whole history and the branches, for the check that the commit is on main.
+          fetch-depth: 0
+      # Only what went through a pull request and its checks is released.
+      - name: the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} is $(git rev-parse HEAD), which is not on main: tag a commit that is merged"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

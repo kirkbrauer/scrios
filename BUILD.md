@@ -71,5 +71,6 @@ repository has a newer image.
 
 ## Releases
 
+Change the version in `Cargo.toml` and `Cargo.lock` in a pull request, and tag the commit on `main` once it is merged.
 Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds the binaries for Linux and Windows (x64 and
 ARM64) and macOS (ARM64), creates a GitHub release, and publishes the crate.
